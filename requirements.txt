@@ -1,0 +1,13 @@
+affine
+geopandas
+GDAL
+joblib
+kornia
+numpy
+opencv-python
+pyproj
+rasterio
+scipy
+shapely
+torch
+tqdm
