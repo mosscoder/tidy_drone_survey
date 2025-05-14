@@ -35,25 +35,27 @@ gdal.UseExceptions() # Enable GDAL exceptions
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Constants that user
 DEVICE      = 'mps'
-MATCHER     = KF.LoFTR(pretrained='outdoor').to(DEVICE).eval()
 MAX_WORKERS = 10
 BATCH_SIZE  = 16
 CHUNK_SIZE  = 32 # Number of grid points to process in one full load-match-warp cycle
-POLY_ORDER  = 3
-RESAMPLE_ALG= "cubic"
 TARGET_SIZE = (480, 640)       # (H, W)
 BUFFER_FRAC = 0.1
-
-# Constants for LoFTR RANSAC
-LOFTR_REPROJ_THRESH_LEVELS_PX = [0.5, 1.0, 2.0]  # RANSAC reprojection threshold in LoFTR's input image space (pixels)
-CONFIDENCE_LEVELS = [0.999, 0.95]              # Confidence levels for RANSAC
-MIN_LOFTR_MATCHES_FOR_FUNDAMENTAL_MATRIX = 7   # Minimum number of matches required for cv2.findFundamentalMat
 
 #UNREG_URL = '/Users/kdoherty/tidy_drone_survey/data/raster/batch_5_test.tif'
 UNREG_URL   = "https://storage.googleapis.com/mpg-aerial-survey/surveys/2024_front_country/processing/dronedeploy/multispectral/front_country-batch_5-MS.tif"
 REG_URL     = "https://storage.googleapis.com/mpg-aerial-survey/surveys/2024_front_country/processing/dronedeploy/front_country_2024.tif"
 OUTPUT_PATH = "/Users/kdoherty/tidy_drone_survey/data/raster/batch_5_corrected.tif"
+
+# More baked in constants
+MATCHER     = KF.LoFTR(pretrained='outdoor').to(DEVICE).eval()
+LOFTR_REPROJ_THRESH_LEVELS_PX = [0.5, 1.0, 2.0]  # RANSAC reprojection threshold in LoFTR's input image space (pixels)
+CONFIDENCE_LEVELS = [0.999, 0.95]              # Confidence levels for RANSAC
+MIN_LOFTR_MATCHES_FOR_FUNDAMENTAL_MATRIX = 7   # Minimum number of matches required for cv2.findFundamentalMat
+RESAMPLE_ALG= "cubic"
+POLY_ORDER  = 3
+
 
 @dataclass
 class Chip:
@@ -556,9 +558,6 @@ def register_raster_with_chips(unreg_path: str, reg_path: str,
             merge_warped_chips(warped_all_chunks, output_path, buffer_w, buffer_h)
         else:
             print("⚠️  No chips were successfully warped. Output raster will not be created.")
-
-    # No final stats file to write.
-    print("ℹ️  GeoJSON chip statistics logging has been removed.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point

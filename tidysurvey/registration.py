@@ -1,867 +1,787 @@
+import os
+import sys
+import time
+import tempfile
+from dataclasses import dataclass
+from typing import Tuple, Optional, List
+
 import numpy as np
+import pandas as pd
 import rasterio
-from rasterio.windows import Window
+from rasterio.enums import Resampling as RioResamplingEnum
+from rasterio.io import MemoryFile
 from rasterio.transform import array_bounds
-from rasterio.warp import calculate_default_transform, reproject, Resampling as RioResampling
 from rasterio.vrt import WarpedVRT
-from affine import Affine
+from rasterio.windows import Window
 import geopandas as gpd
-from shapely.geometry import box
-import torch
-import kornia.feature as KF
+from shapely.geometry import Point
+from osgeo import gdal
+from affine import Affine
+
 import cv2
+import torch
+import kornia as K
+import kornia.feature as KF
 from tqdm import tqdm
 
-def plan_grid(target_ortho_path: str, cell_size_m: float) -> list[tuple[float, float]]:
-    """
-    Plan a grid of cell center coordinates over a target orthomosaic.
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    Args:
-        target_ortho_path (str): Path to the target orthomosaic GeoTIFF.
-        cell_size_m (float): Desired size of each cell in meters (unbuffered).
+@dataclass
+class Chip:
+    array: np.ndarray
+    profile: dict
+    window: object # rasterio.windows.Window
+    bounds: Tuple[float, float, float, float]
+
+def resolve_height_chip(w: float, h: Optional[float]) -> float:
+    """Helper to resolve height for chip processing if not provided."""
+    return h if h is not None else 0.75 * w
+
+def get_bbox_bounds_chip(pt: Point, width: float, height: float, buffer_w: float, buffer_h: float) -> Tuple[float, float, float, float]:
+    """Calculates bounding box with buffers for chip extraction."""
+    hw = width / 2 + buffer_w
+    hh = height / 2 + buffer_h
+    return (pt.x - hw, pt.y - hh, pt.x + hw, pt.y + hh)
+
+def generate_grid_points_chip(raster_path: str, width: float, height: float) -> gpd.GeoDataFrame:
+    """Generates a grid of points over a raster."""
+    with rasterio.open(raster_path) as src:
+        left, bottom, right, top = src.bounds
+        crs = src.crs
+    xs = np.arange(left + width / 2, right, width)
+    ys = np.arange(bottom + height / 2, top, height)
+    pts = [Point(x, y) for y in ys for x in xs]
+    return gpd.GeoDataFrame(geometry=pts, crs=crs)
+
+def load_chip_gdal(pt: Point, raster_path: str, width: float, height: float, buffer_w: float, buffer_h: float) -> Chip:
+    """Loads a single chip from a raster."""
+    bounds = get_bbox_bounds_chip(pt, width, height, buffer_w, buffer_h)
+    with rasterio.open(raster_path) as src:
+        win = rasterio.windows.from_bounds(*bounds, src.transform)
+        arr = src.read(window=win)
+        prof = src.profile.copy()
+        prof.update({
+            "height": win.height,
+            "width": win.width,
+            "transform": rasterio.windows.transform(win, src.transform)
+        })
+    return Chip(arr, prof, win, bounds)
+
+def load_chips_gdal(pt: Point, unreg_raster_path: str, reg_raster_path: str,
+                    width: float, height: float, buffer_w: float, buffer_h: float,
+                    ref_resampling_method: RioResamplingEnum = RioResamplingEnum.bilinear
+                    ) -> Tuple[Chip, Chip]:
+    """Loads a pair of chips, one from unregistered and one from registered (warped to unregistered CRS)."""
+    un_chip = load_chip_gdal(pt, unreg_raster_path, width, height, buffer_w, buffer_h)
+    
+    with rasterio.open(reg_raster_path) as src_reg, \
+         WarpedVRT(src_reg, crs=un_chip.profile["crs"], resampling=ref_resampling_method) as vrt_reg:
         
-    Returns:
-        list[tuple[float, float]]: List of (x_center, y_center) coordinates for each grid cell
-                                   in the CRS of the target_ortho_path.
-    """
-    with rasterio.open(target_ortho_path) as src:
-        bounds = src.bounds
+        win_reg = rasterio.windows.from_bounds(*un_chip.bounds, vrt_reg.transform)
+        arr_reg = vrt_reg.read(window=win_reg)
+        prof_reg = vrt_reg.profile.copy()
+        prof_reg.update({
+            "height": win_reg.height,
+            "width": win_reg.width,
+            "transform": rasterio.windows.transform(win_reg, vrt_reg.transform)
+        })
+    reg_chip = Chip(arr_reg, prof_reg, win_reg, un_chip.bounds)
+    return un_chip, reg_chip
 
-    min_x, min_y, max_x, max_y = bounds.left, bounds.bottom, bounds.right, bounds.top
-
-    n_cells_x = int(np.floor((max_x - min_x) / cell_size_m))
-    n_cells_y = int(np.floor((max_y - min_y) / cell_size_m))
-
-    if n_cells_x <= 0 or n_cells_y <= 0:
-        center_x = (min_x + max_x) / 2
-        center_y = (min_y + max_y) / 2
-        return [(center_x, center_y)]
-
-    grid_coords = []
-    for i in range(n_cells_x):
-        x_center = min_x + (i + 0.5) * cell_size_m
-        for j in range(n_cells_y):
-            y_center = min_y + (j + 0.5) * cell_size_m
-            grid_coords.append((x_center, y_center))
-
-    return grid_coords
-
-def make_paired_tiles(
-    target_ortho_path: str,
-    reference_ortho_path: str,
-    x_center: float, 
-    y_center: float, 
-    cell_size_m: float, 
-    buffer_m: float,
-    resampling_method: RioResampling = RioResampling.bilinear
-) -> tuple[np.ndarray | None, np.ndarray | None, dict | None, dict | None]:
-    """
-    Creates paired, buffered image tiles from a target and reference orthomosaic.
-    The reference tile is warped to the CRS of the target tile.
-
-    Args:
-        target_ortho_path (str): Path to the target orthomosaic.
-        reference_ortho_path (str): Path to the reference orthomosaic.
-        x_center (float): X coordinate of the unbuffered cell center (in CRS of target_ortho_path).
-        y_center (float): Y coordinate of the unbuffered cell center (in CRS of target_ortho_path).
-        cell_size_m (float): Side length of the unbuffered cell in meters.
-        buffer_m (float): Buffer distance in meters to add around the cell for tile extraction.
-        resampling_method (RioResampling): Resampling method for warping the reference tile.
-                                            Defaults to RioResampling.bilinear.
-    
-    Returns:
-        tuple:
-            - img_target_buffered (np.ndarray | None): Target image tile (bands, height, width).
-            - img_reference_buffered (np.ndarray | None): Reference image tile (bands, height, width),
-                                                       warped to target's CRS.
-            - meta_target_buffered (dict | None): Rasterio metadata for the target tile.
-            - meta_reference_buffered (dict | None): Rasterio metadata for the (warped) reference tile.
-        Returns (None, None, None, None) if a tile cannot be extracted or warping fails.
-    """
-    
-    buffered_side_length_m = cell_size_m + 2 * buffer_m
-    half_buffered_side = buffered_side_length_m / 2
-
-    # Define the geographic bounding box for the buffered tile in the target's CRS
-    left = x_center - half_buffered_side
-    bottom = y_center - half_buffered_side
-    right = x_center + half_buffered_side
-    top = y_center + half_buffered_side
-    buffered_bounds_in_target_crs = (left, bottom, right, top)
-
-    img_target_buffered, meta_target_buffered = None, None
-    img_reference_buffered, meta_reference_buffered = None, None
-
-    try:
-        with rasterio.open(target_ortho_path) as src_target:
-            target_crs = src_target.crs
-            
-            # Extract Target Tile (in its native CRS)
-            window_target = rasterio.windows.from_bounds(
-                *buffered_bounds_in_target_crs, transform=src_target.transform
-            )
-            img_target_buffered = src_target.read(window=window_target)
-            meta_target_buffered = src_target.profile.copy()
-            meta_target_buffered.update({
-                'height': img_target_buffered.shape[1],
-                'width': img_target_buffered.shape[2],
-                'transform': src_target.window_transform(window_target)
-            })
-
-            # Extract Reference Tile (warped to Target CRS)
-            with rasterio.open(reference_ortho_path) as src_reference:
-                with WarpedVRT(src_reference, crs=target_crs, resampling=resampling_method) as vrt_reference:
-                    
-                    window_ref = rasterio.windows.from_bounds(
-                        *buffered_bounds_in_target_crs, transform=vrt_reference.transform
-                    )
-                    img_reference_buffered = vrt_reference.read(window=window_ref)
-                    
-                    meta_reference_buffered = vrt_reference.profile.copy() # Profile of the VRT
-                    meta_reference_buffered.update({
-                        'height': img_reference_buffered.shape[1],
-                        'width': img_reference_buffered.shape[2],
-                        'transform': vrt_reference.window_transform(window_ref),
-                        'crs': target_crs 
-                    })
-
-    except Exception as e:
-        print(f"Error in make_paired_tiles for center ({x_center}, {y_center}): {e}")
-        return None, None, None, None
+def raster_to_tensor_chip(img_array: np.ndarray, bands: Optional[List[int]] = None) -> torch.Tensor:
+    """Converts a raster numpy array to a PyTorch tensor for LoFTR."""
+    bands_to_use = bands or list(range(img_array.shape[0]))
+    # Ensure bands_to_use are valid for the array
+    if not all(0 <= b < img_array.shape[0] for b in bands_to_use):
+        raise ValueError(f"Invalid band selection for image with shape {img_array.shape}")
+    if not bands_to_use: # Handle empty band list if it occurs
+        raise ValueError("Band selection cannot be empty.")
         
-    return img_target_buffered, img_reference_buffered, meta_target_buffered, meta_reference_buffered
+    selected_bands_array = img_array[bands_to_use]
+    return torch.from_numpy(selected_bands_array).unsqueeze(0)
 
-def check_valid_mask(
-    img_target: np.ndarray, 
-    meta_target: dict, 
-    img_reference: np.ndarray, 
-    meta_reference: dict, 
-    tol_na_frac: float = 0.25
-) -> tuple[bool, float, float]:
-    """
-    Assess what fraction of pixels are NA in the target and reference images.
 
-    Args:
-        img_target (np.ndarray): Target image tile (bands, height, width).
-        meta_target (dict): Rasterio metadata for the target tile, used to get nodata value.
-        img_reference (np.ndarray): Reference image tile (bands, height, width).
-        meta_reference (dict): Rasterio metadata for the reference tile, used to get nodata value.
-        tol_na_frac (float): Tolerance for the fraction of NA pixels. If NA fraction in *either*
-                             image exceeds this, the mask is considered invalid.
+def resize_image_chip(img_array_chw: np.ndarray, target_size_hw: Tuple[int, int] = (480, 640)
+                      ) -> Tuple[np.ndarray, Tuple[float, float]]:
+    """Resizes an image (C, H, W) to target_size (H, W) and returns scales."""
+    C, H, W = img_array_chw.shape
+    TH, TW = target_size_hw
     
-    Returns:
-        tuple:
-            - is_valid (bool): True if NA fraction in both images is <= tol_na_frac, False otherwise.
-            - targ_na_frac (float): Fraction of NA pixels in the target image.
-            - ref_na_frac (float): Fraction of NA pixels in the reference image.
+    if H == 0 or W == 0: # Cannot resize an empty image
+        # Return an empty array of the target shape and scales of 1 to avoid division by zero
+        # This signals downstream that the image was problematic.
+        return np.zeros((C, TH, TW), dtype=img_array_chw.dtype), (1.0, 1.0)
+
+    resized_chw = np.stack([
+        cv2.resize(img_array_chw[i], (TW, TH), interpolation=cv2.INTER_LINEAR)
+        for i in range(C)
+    ])
+    h_scale = H / TH if TH > 0 else 1.0
+    w_scale = W / TW if TW > 0 else 1.0
+    return resized_chw, (h_scale, w_scale)
+
+def batch_get_loftr_matches_chip(
+    chip_data_list: List[dict], # Each dict: {'id':, 'reg_img': np.ndarray, 'un_img': np.ndarray}
+    device_str: str = 'cpu',
+    batch_size_config: int = 16,
+    loftr_pretrained_model: str = 'outdoor',
+    min_matches_for_fm: int = 7,
+    loftr_reproj_thresh_px_levels: List[float] = [0.5, 1.0, 2.0], # RANSAC reproj threshold in LoFTR's input image space
+    ransac_confidence_levels: List[float] = [0.999, 0.95], # Confidence levels for RANSAC
+    target_size_hw_loftr: Tuple[int, int] = (480, 640) # Target H, W for LoFTR preprocessing
+) -> List[dict]:
     """
-    if img_target is None or img_reference is None:
-        return False, 1.0, 1.0 # Consider fully NA if image is None
-
-    def calculate_na_fraction(img: np.ndarray, meta: dict) -> float:
-        if img.size == 0:
-            return 1.0 # Empty image is fully NA
-        
-        nodata_val = meta.get('nodata')
-        
-        if nodata_val is not None:
-            if np.isnan(nodata_val):
-                na_count = np.isnan(img).sum()
-            else:
-                na_count = (img == nodata_val).sum()
-        else:
-            # If no nodata value is defined in metadata, assume no pixels are NA by this definition.
-            # This might need adjustment if NA is represented differently (e.g., all zeros for some sensors).
-            na_count = 0 
-            
-        return na_count / img.size
-
-    targ_na_frac = calculate_na_fraction(img_target, meta_target)
-    ref_na_frac = calculate_na_fraction(img_reference, meta_reference)
-
-    is_valid = (targ_na_frac <= tol_na_frac) and (ref_na_frac <= tol_na_frac)
-    
-    return is_valid, targ_na_frac, ref_na_frac
-
-def rasterio_to_torch_tensor(numpy_array: np.ndarray, target_bands: int = 3) -> torch.Tensor:
+    Performs batched LoFTR matching on pairs of image chips.
+    Initializes LoFTR model internally.
     """
-    Converts a NumPy array from rasterio window output (expected as B, H, W or H, W)
-    to a PyTorch tensor of shape (1, C, H, W), suitable for models like LoFTR.
-    It handles single-band, multi-band, and ensures the output has `target_bands` channels,
-    either by selecting/padding or converting to grayscale if target_bands is 1.
-
-    Args:
-        numpy_array (np.ndarray): Input NumPy array from rasterio.read().
-                                  Expected shapes: (bands, height, width) or (height, width).
-        target_bands (int): Desired number of channels for the output tensor (e.g., 1 for grayscale, 3 for RGB).
-
-    Returns:
-        torch.Tensor: PyTorch tensor with shape (1, target_bands, H, W), normalized to [0, 1].
-    """
-    if not isinstance(numpy_array, np.ndarray):
-        raise TypeError(f"Input must be a NumPy array, got {type(numpy_array)}")
-
-    # Ensure it's a float tensor for processing
-    tensor = torch.from_numpy(numpy_array.astype(np.float32))
-
-    # Handle (H, W) -> (1, H, W) for single band images from rasterio
-    if tensor.ndim == 2:
-        tensor = tensor.unsqueeze(0) # Add channel dimension: (H, W) -> (1, H, W)
-    
-    if tensor.ndim != 3: # Should be (C, H, W) at this point
-        raise ValueError(f"Input tensor must be 2D (H, W) or 3D (C, H, W), got {tensor.shape}")
-
-    # Normalize to [0, 1] - assuming input is in typical image range (e.g., 0-255, 0-65535, etc.)
-    # A more robust normalization might require min/max from data or specific sensor ranges.
-    # For now, simple division assuming 0-255 range for typical visual bands.
-    # If data is already float [0,1] this might be an issue, or if it's other int types.
-    # Consider a more adaptive normalization if value ranges vary widely.
-    min_val = tensor.min()
-    max_val = tensor.max()
-    if max_val > 1.0: # Heuristic: if max is already > 1, assume it needs normalization from common integer ranges
-        if max_val <= 255.0 and min_val >=0:
-            tensor = tensor / 255.0
-        elif max_val <= 65535.0 and min_val >=0:
-            tensor = tensor / 65535.0
-        # else: # Potentially already normalized or unknown range, leave as is or add warning
-            # print(f"Warning: Tensor value range ({min_val.item()}-{max_val.item()}) not typical for 8/16 bit. Check normalization.")
-    tensor = torch.clamp(tensor, 0.0, 1.0) # Ensure it's in [0,1] after normalization
-
-    # Adjust channels to target_bands
-    c, h, w = tensor.shape
-    if target_bands == 1:
-        if c == 1:
-            pass # Already grayscale
-        elif c == 3: # RGB to Grayscale
-            # Using Kornia for consistency if available, otherwise standard weights
-            # tensor = KF.rgb_to_grayscale(tensor.unsqueeze(0)).squeeze(0) # Requires Kornia
-            # Standard ITU-R BT.601 weights: R*0.299 + G*0.587 + B*0.114
-            # Assuming tensor is (3, H, W) for RGB input
-            if c >=3: # take first 3 bands if more are present
-                tensor = 0.299 * tensor[0:1, :, :] + 0.587 * tensor[1:2, :, :] + 0.114 * tensor[2:3, :, :]
-            else: # if less than 3 bands, just take the first one (e.g. if it was 2 bands)
-                tensor = tensor[0:1, :,:]
-        elif c > 1: # Multi-band (not 3) to Grayscale (e.g. take first band)
-            tensor = tensor[0:1, :, :] 
-        # else c==1, already handled
-    elif target_bands == 3:
-        if c == 3:
-            pass # Already RGB
-        elif c == 1: # Grayscale to RGB (replicate channel)
-            tensor = tensor.repeat(3, 1, 1)
-        elif c > 3: # More than 3 channels, take first 3
-            tensor = tensor[:3, :, :]
-        else: # c == 2 or other, pad with zeros to 3 channels
-            padding = torch.zeros(target_bands - c, h, w, dtype=tensor.dtype)
-            tensor = torch.cat([tensor, padding], dim=0)
-    # Else, if target_bands is not 1 or 3, the behavior is undefined by typical models
-    # For now, we only explicitly handle target_bands = 1 or 3.
-    # If other numbers are needed, this logic should be extended.
-    if tensor.shape[0] != target_bands:
-         # Fallback: if still not matching (e.g. target_bands=2), take first band and replicate if needed or error
-         print(f"Warning: Could not achieve target_bands={target_bands}. Resulting channels: {tensor.shape[0]}")
-
-    # Add batch dimension: (C, H, W) -> (1, C, H, W)
-    tensor = tensor.unsqueeze(0)
-    return tensor
-
-def get_loftr_matches(
-    img_target_np: np.ndarray, 
-    img_reference_np: np.ndarray, 
-    pretrained_model: str = "outdoor", 
-    device_str: str = 'cpu'
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Finds keypoint matches between two images using LoFTR and computes an inlier mask.
-    Input images are NumPy arrays (bands, H, W) from rasterio.
-
-    Args:
-        img_target_np (np.ndarray): NumPy array of the target image (bands, H, W).
-        img_reference_np (np.ndarray): NumPy array of the reference image (bands, H, W).
-        pretrained_model (str): Name of the pretrained LoFTR model (e.g., "outdoor").
-        device_str (str): Device to run LoFTR on ('cpu', 'cuda', 'mps', etc.).
-
-    Returns:
-        A tuple containing:
-            - mkpts0 (np.ndarray): Matched keypoints in target image (N, 2).
-            - mkpts1 (np.ndarray): Matched keypoints in reference image (N, 2).
-            - inliers_mask (np.ndarray): Boolean array indicating inlier matches (N,).
-                                        Returns empty arrays if matching or inlier detection fails.
-    """
-    
-    if device_str == 'cuda' and torch.cuda.is_available():
-        current_device = torch.device("cuda")
-    elif device_str == 'mps' and torch.backends.mps.is_available():
-        current_device = torch.device("mps")
+    if device_str == 'cuda' and not torch.cuda.is_available():
+        print("CUDA specified but not available, falling back to CPU for LoFTR.")
+        actual_device = torch.device('cpu')
+    elif device_str == 'mps' and not torch.backends.mps.is_available():
+        print("MPS specified but not available, falling back to CPU for LoFTR.")
+        actual_device = torch.device('cpu')
     else:
-        current_device = torch.device("cpu")
-    # print(f"Using device: {current_device} for LoFTR") # Reduced verbosity
+        actual_device = torch.device(device_str)
 
-    img_target_tensor = rasterio_to_torch_tensor(img_target_np, target_bands=1).to(current_device)
-    img_reference_tensor = rasterio_to_torch_tensor(img_reference_np, target_bands=1).to(current_device)
+    matcher = KF.LoFTR(pretrained=loftr_pretrained_model).to(actual_device).eval()
 
-    if img_target_tensor.shape[2] < 20 or img_target_tensor.shape[3] < 20 or \
-       img_reference_tensor.shape[2] < 20 or img_reference_tensor.shape[3] < 20:
-        print("Warning: One or both images are too small for LoFTR. Skipping matching.")
-        return np.array([]).reshape(0,2), np.array([]).reshape(0,2), np.array([], dtype=bool)
+    N = len(chip_data_list)
+    all_pairs_results: List[Optional[dict]] = [None] * N
+    valid_pairs_for_loftr: List[Tuple[int, torch.Tensor, Tuple[float, float], torch.Tensor, Tuple[float, float]]] = []
 
-    matcher = KF.LoFTR(pretrained=pretrained_model).to(current_device).eval()
+    def prep_for_loftr(img_array_chw: np.ndarray):
+        if img_array_chw.sum() == 0 or img_array_chw.shape[1] == 0 or img_array_chw.shape[2] == 0: # Check for empty spatial dims
+            return None
+        # Ensure at least 3 bands for RGB conversion, pad if necessary or take first band if single.
+        # LoFTR typically expects grayscale, but preprocessing often starts from RGB.
+        # The original script takes first 3 bands. We'll adapt this.
+        c = img_array_chw.shape[0]
+        if c == 0: return None # No channels
+        
+        bands_for_loftr_input = img_array_chw
+        if c >= 3:
+            bands_for_loftr_input = img_array_chw[[0,1,2], :, :] # Take first 3 for RGB assumption
+        elif c == 2: # Pad to 3 channels with zeros
+            padding = np.zeros((1, img_array_chw.shape[1], img_array_chw.shape[2]), dtype=img_array_chw.dtype)
+            bands_for_loftr_input = np.concatenate((img_array_chw, padding), axis=0)
+        elif c == 1: # Replicate to 3 channels
+            bands_for_loftr_input = np.repeat(img_array_chw, 3, axis=0)
 
-    input_dict = {
-        "image0": img_target_tensor,
-        "image1": img_reference_tensor,
-    }
+        resized_img, scales = resize_image_chip(bands_for_loftr_input, target_size_hw_loftr)
+        
+        # Normalize: LoFTR expects [0,1] float
+        # Convert to tensor, then normalize
+        tensor_img_u8 = torch.from_numpy(resized_img).float() # (C,H,W)
+        if tensor_img_u8.max() > 1.0: # Assume 0-255 if max > 1
+             tensor_img_norm = tensor_img_u8 / 255.0
+        else: # Assume already in [0,1] or similar small range
+             tensor_img_norm = tensor_img_u8
+        tensor_img_norm = torch.clamp(tensor_img_norm, 0.0, 1.0)
 
-    try:
+        # RGB to Grayscale for LoFTR
+        # K.color.rgb_to_grayscale expects (B,C,H,W) or (C,H,W)
+        # If it's already (C,H,W) and C=3, it should work.
+        grayscale_img_tensor = K.color.rgb_to_grayscale(tensor_img_norm) # (H,W) or (1,H,W)
+        if grayscale_img_tensor.ndim == 2: # ensure (1,H,W)
+            grayscale_img_tensor = grayscale_img_tensor.unsqueeze(0)
+        
+        return grayscale_img_tensor.unsqueeze(0), scales # Return (1,1,H,W), scales
+
+    preprocessed_chips_info = []
+    for i, chip_data in enumerate(tqdm(chip_data_list, desc="Preprocessing chips for LoFTR", unit="chip", leave=False)):
+        original_id = chip_data['id']
+        processed_reg = prep_for_loftr(chip_data['reg_img'])
+        processed_unreg = prep_for_loftr(chip_data['un_img'])
+        preprocessed_chips_info.append({'id': original_id, 
+                                       'idx_in_list': i, 
+                                       'processed_reg': processed_reg, 'processed_unreg': processed_unreg})
+
+    for chip_info in preprocessed_chips_info:
+        original_id, list_idx = chip_info['id'], chip_info['idx_in_list']
+        prep_reg_k, prep_unreg_k = chip_info['processed_reg'], chip_info['processed_unreg']
+
+        if prep_reg_k is not None and prep_unreg_k is not None:
+            r_tensor, r_scales = prep_reg_k # r_tensor is (1,1,H,W)
+            u_tensor, u_scales = prep_unreg_k # u_tensor is (1,1,H,W)
+            valid_pairs_for_loftr.append((original_id, r_tensor, r_scales, u_tensor, u_scales))
+        else:
+            all_pairs_results[list_idx] = {'id': original_id, 'mkpts_reg': np.empty((0,2)), 
+                                           'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool)}
+            
+    if not valid_pairs_for_loftr:
+        tqdm.write("No valid pairs for LoFTR after preprocessing.")
+        for i in range(N):
+            if all_pairs_results[i] is None:
+                 all_pairs_results[i] = {'id': chip_data_list[i]['id'], 'mkpts_reg': np.empty((0,2)),
+                                           'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool)}
+        return [res for res in all_pairs_results if res is not None]
+
+    loftr_processed_results_map = {}
+    for i in tqdm(range(0, len(valid_pairs_for_loftr), batch_size_config), desc="LoFTR Matching", unit="batch", leave=False):
+        current_gpu_batch_data = valid_pairs_for_loftr[i : i + batch_size_config]
+        
+        # image0 is registered (reference), image1 is unregistered (target for warping)
+        # Script had: image0 reg, image1 unreg. corr['keypoints0'] are for reg, corr['keypoints1'] for unreg.
+        # mkpts_reg, mkpts_un. This seems consistent.
+        img0_tensors_reg = torch.cat([item[1] for item in current_gpu_batch_data]).to(actual_device) # Registered tensors
+        img1_tensors_un = torch.cat([item[3] for item in current_gpu_batch_data]).to(actual_device)  # Unregistered tensors
+
         with torch.inference_mode():
-            correspondences = matcher(input_dict)
-    except Exception as e:
-        print(f"Error during LoFTR matching: {e}")
-        return np.array([]).reshape(0,2), np.array([]).reshape(0,2), np.array([], dtype=bool)
+            corr = matcher({"image0": img0_tensors_reg, "image1": img1_tensors_un})
 
-    mkpts0 = correspondences["keypoints0"].cpu().numpy()
-    mkpts1 = correspondences["keypoints1"].cpu().numpy()
-    # mconf = correspondences["confidence"].cpu().numpy() # LoFTR confidence, not directly returned now
+        all_kpts0_reg_batch_resized = corr['keypoints0'].cpu().numpy() 
+        all_kpts1_un_batch_resized = corr['keypoints1'].cpu().numpy()
+        batch_indices = corr['batch_indexes'].cpu().numpy()
 
-    if mkpts0.shape[0] == 0:
-        print("LoFTR found no matches.")
-        return np.array([]).reshape(0,2), np.array([]).reshape(0,2), np.array([], dtype=bool)
+        del corr, img0_tensors_reg, img1_tensors_un # Clear GPU memory
 
-    # Use cv2.findFundamentalMat to determine inliers, as per typical pipeline structure
-    # This was the previous approach and aligns with having an "inlier_mask"
-    inliers_mask = np.zeros(mkpts0.shape[0], dtype=bool)
-    if mkpts0.shape[0] >= 7: # findFundamentalMat requires at least 7 points
-        # Parameters for findFundamentalMat can be tuned. Using USAC_MAGSAC as it's generally robust.
-        # Thresholds like 0.5 for reprojection error and 0.999 for confidence are common starts.
-        # The maxIterations (e.g., 100000) is to give it ample chance to find a good model.
-        try:
-            _, cv_inliers = cv2.findFundamentalMat(mkpts0, mkpts1, cv2.USAC_MAGSAC, 0.5, 0.999, 100000)
-            if cv_inliers is not None:
-                inliers_mask = cv_inliers.ravel().astype(bool)
-            else:
-                print("Warning: findFundamentalMat returned None for inliers.")
-        except cv2.error as e:
-            print(f"cv2.error in findFundamentalMat: {e}. mkpts0: {mkpts0.shape}, mkpts1: {mkpts1.shape}")
-            # Keep inliers_mask as all False
-    else:
-        print(f"Warning: Not enough keypoints ({mkpts0.shape[0]}) to compute Fundamental Matrix. Returning no inliers.")
-        # inliers_mask remains all False
+        for j_batch_idx in range(len(current_gpu_batch_data)):
+            original_id = current_gpu_batch_data[j_batch_idx][0]
+            reg_img_scales = current_gpu_batch_data[j_batch_idx][2] # (h_scale, w_scale)
+            un_img_scales  = current_gpu_batch_data[j_batch_idx][4] # (h_scale, w_scale)
 
-    return mkpts0, mkpts1, inliers_mask
+            mask_j = (batch_indices == j_batch_idx)
+            mkpts_reg_resized = all_kpts0_reg_batch_resized[mask_j] # Points in LoFTR's resized registered image
+            mkpts_un_resized = all_kpts1_un_batch_resized[mask_j]   # Points in LoFTR's resized unregistered image
 
-def register_target(
-    img_target_buffered_np: np.ndarray, 
-    meta_reference_buffered: dict, # Metadata of the space to warp into
-    mkpts_target: np.ndarray, 
-    mkpts_reference: np.ndarray, 
-    inliers_mask: np.ndarray, # Boolean mask from get_loftr_matches
-    min_matches_for_homography: int = 10,
-    ransac_reproj_threshold: float = 5.0
-) -> tuple[np.ndarray | None, dict | None]:
-    """
-    Registers the target image tile to the reference image tile using an inlier mask
-    derived from LoFTR keypoints and findFundamentalMat.
-    The output image is warped to align with the reference tile's pixel grid and georeferencing.
+            # Scale keypoints back to original chip dimensions
+            mkpts_reg_orig = np.zeros_like(mkpts_reg_resized)
+            if mkpts_reg_resized.shape[0] > 0:
+                mkpts_reg_orig[:, 0] = mkpts_reg_resized[:, 0] * reg_img_scales[1] # W scale (x-coord)
+                mkpts_reg_orig[:, 1] = mkpts_reg_resized[:, 1] * reg_img_scales[0] # H scale (y-coord)
 
-    Args:
-        img_target_buffered_np (np.ndarray): Target image tile (bands, H, W) including buffer.
-        meta_reference_buffered (dict): Rasterio metadata for the reference tile.
-                                          This defines the target coordinate system for warping.
-        mkpts_target (np.ndarray): Matched keypoints in target image tile (N, 2), from LoFTR.
-        mkpts_reference (np.ndarray): Matched keypoints in reference image tile (N, 2), from LoFTR.
-        inliers_mask (np.ndarray): Boolean array (N,) indicating inlier matches.
-        min_matches_for_homography (int): Minimum number of inlier matches to attempt homography.
-        ransac_reproj_threshold (float): RANSAC reprojection threshold for cv2.findHomography.
+            mkpts_un_orig = np.zeros_like(mkpts_un_resized)
+            if mkpts_un_resized.shape[0] > 0:
+                mkpts_un_orig[:, 0] = mkpts_un_resized[:, 0] * un_img_scales[1]  # W scale
+                mkpts_un_orig[:, 1] = mkpts_un_resized[:, 1] * un_img_scales[0]  # H scale
+            del mkpts_reg_resized, mkpts_un_resized
 
-    Returns:
-        tuple:
-            - registered_target_img (np.ndarray | None): The target image warped to the reference
-                                                         tile's coordinate system (bands, H, W).
-                                                         Shape matches reference tile.
-            - registered_meta (dict | None): Rasterio metadata for the registered target image.
-                                             Transform, CRS, width, height match meta_reference_buffered.
-                                             Returns None, None if registration fails.
-    """
-    if img_target_buffered_np is None or meta_reference_buffered is None:
-        print("Error: Target image or reference metadata is None. Cannot register.")
-        return None, None
-    if inliers_mask is None:
-        print("Error: Inliers mask is None. Cannot register.")
-        return None, None
-
-    # Filter points using the provided inliers_mask
-    if not np.any(inliers_mask):
-        print("Warning: No inliers provided by the mask. Cannot compute homography.")
-        return None, None
-        
-    pts_target = mkpts_target[inliers_mask]
-    pts_reference = mkpts_reference[inliers_mask]
-
-    if pts_target.shape[0] < min_matches_for_homography:
-        print(f"Warning: Not enough inlier matches ({pts_target.shape[0]}) for homography. Need at least {min_matches_for_homography}.")
-        return None, None
-
-    # Estimate Homography
-    homography_matrix, h_mask = cv2.findHomography(
-        pts_target, pts_reference, cv2.RANSAC, ransac_reproj_threshold
-    )
-
-    if homography_matrix is None:
-        print("Warning: Homography estimation failed.")
-        return None, None
-
-    ref_height = meta_reference_buffered['height']
-    ref_width = meta_reference_buffered['width']
-    ref_bands = img_target_buffered_np.shape[0]
-    ref_dtype = img_target_buffered_np.dtype
-
-    img_target_hwc = np.moveaxis(img_target_buffered_np, 0, -1)
-    
-    registered_target_hwc = cv2.warpPerspective(
-        img_target_hwc, 
-        homography_matrix, 
-        (ref_width, ref_height)
-    )
-    
-    if registered_target_hwc.ndim == 2 and ref_bands == 1:
-        registered_target_hwc = registered_target_hwc[..., np.newaxis]
-        
-    registered_target_img = np.moveaxis(registered_target_hwc, -1, 0)
-
-    registered_meta = meta_reference_buffered.copy()
-    registered_meta['count'] = ref_bands
-    registered_meta['dtype'] = str(ref_dtype) 
-
-    return registered_target_img, registered_meta
-
-def tidy_target(registered_target_img: np.ndarray, metadata_target: dict, buffer_pixels: int):
-    """
-    Removes a buffer from an image and updates its metadata (transform, width, height).
-
-    Args:
-        registered_target_img (np.ndarray): The image data (bands, height, width) including the buffer.
-        metadata_target (dict): Rasterio-like metadata for registered_target_img.
-                                Must include 'transform' (affine.Affine), 'width', 'height'.
-                                Other keys like 'crs', 'count', 'dtype' will be passed through.
-        buffer_pixels (int): The buffer size in pixels to remove from each side.
-
-    Returns:
-        tuple: (tidied_image_data (np.ndarray), tidied_metadata (dict))
-               tidied_metadata contains updated 'transform', 'width', 'height'.
-    """
-    if not isinstance(metadata_target, dict) or 'transform' not in metadata_target:
-        raise ValueError("metadata_target must be a dict with a 'transform' key.")
-    if not isinstance(metadata_target['transform'], Affine):
-        raise ValueError("metadata_target['transform'] must be an affine.Affine object.")
-    if buffer_pixels < 0:
-        raise ValueError("buffer_pixels must be non-negative.")
-
-    original_transform = metadata_target['transform']
-    
-    # Calculate new transform: top-left corner shifts by (buffer_pixels, buffer_pixels)
-    # relative to the old pixel grid.
-    new_top_left_transform = original_transform * Affine.translation(buffer_pixels, buffer_pixels)
-
-    # Crop the image data
-    # Assuming image is (bands, height, width) or (height, width)
-    if registered_target_img.ndim == 3:
-        h_buffered, w_buffered = registered_target_img.shape[1], registered_target_img.shape[2]
-        tidied_image_data = registered_target_img[
-            :,
-            buffer_pixels : h_buffered - buffer_pixels,
-            buffer_pixels : w_buffered - buffer_pixels
-        ]
-        new_height, new_width = tidied_image_data.shape[1], tidied_image_data.shape[2]
-    elif registered_target_img.ndim == 2:
-        h_buffered, w_buffered = registered_target_img.shape
-        tidied_image_data = registered_target_img[
-            buffer_pixels : h_buffered - buffer_pixels,
-            buffer_pixels : w_buffered - buffer_pixels
-        ]
-        new_height, new_width = tidied_image_data.shape
-    else:
-        raise ValueError("registered_target_img must be a 2D or 3D array.")
-
-    if new_height <= 0 or new_width <= 0:
-        raise ValueError(f"Buffer ({buffer_pixels}px) is too large for image dimensions ({h_buffered}x{w_buffered}).")
-
-    tidied_metadata = metadata_target.copy()
-    tidied_metadata['transform'] = new_top_left_transform
-    tidied_metadata['width'] = new_width
-    tidied_metadata['height'] = new_height
-
-    return tidied_image_data, tidied_metadata
-
-
-def make_recipient_ortho(
-    target_ortho_path: str,
-    recipient_ortho_path: str,
-    dtype_override: str = None,
-    nodata_override = None,
-    fill_value = np.nan # Default fill if nodata is not specified or not applicable for dtype
-):
-    """
-    Creates an empty recipient orthomosaic GeoTIFF with the same geospatial
-    properties (dimensions, CRS, transform, bounds) as a model orthomosaic.
-    The created raster is filled with a specified nodata value or NaN.
-
-    Args:
-        target_ortho_path (str): Path to the model orthomosaic (e.g., original target).
-        recipient_ortho_path (str): Path for the new recipient orthomosaic.
-        dtype_override (str, optional): Override data type for the recipient.
-                                      If None, uses dtype from target_ortho_path.
-        nodata_override (any, optional): Override NoData value for the recipient.
-                                       If None, uses nodata from target_ortho_path if available.
-        fill_value (any, optional): Value to fill the raster with if nodata cannot be set
-                                   (e.g. nodata_override is None and target has no nodata, or chosen dtype).
-                                   Defaults to np.nan, which implies a float dtype if not overridden.
-
-    Returns:
-        dict: The Rasterio profile of the created recipient orthomosaic.
-    """
-    with rasterio.open(target_ortho_path) as src:
-        profile = src.profile.copy()
-
-    if dtype_override:
-        profile['dtype'] = dtype_override
-    
-    # If fill_value is nan and dtype is not float, this will be problematic.
-    # Ensure dtype is float if nan is the fill_value and no nodata is explicitly set.
-    current_fill_value = fill_value
-    if nodata_override is not None:
-        profile['nodata'] = nodata_override
-        current_fill_value = nodata_override # Fill with the specified nodata value
-    elif profile.get('nodata') is not None:
-        current_fill_value = profile['nodata'] # Fill with source nodata
-    elif np.isnan(current_fill_value) and not np.issubdtype(np.dtype(profile['dtype']), np.floating):
-        # If default fill is nan, but dtype is integer, change dtype to float32
-        profile['dtype'] = 'float32'
-        if nodata_override is None: # Only set nodata if not already overridden
-             profile['nodata'] = np.nan
-
-    # Ensure blockysize is a power of 2 for COG compatibility if not present
-    if 'blockxsize' not in profile or not (profile['blockxsize'] > 0 and (profile['blockxsize'] & (profile['blockxsize'] - 1) == 0)):
-        profile['blockxsize'] = 256 # Default block size
-    if 'blockysize' not in profile or not (profile['blockysize'] > 0 and (profile['blockysize'] & (profile['blockysize'] - 1) == 0)):
-        profile['blockysize'] = 256 # Default block size
-    profile['tiled'] = True
-
-    with rasterio.open(recipient_ortho_path, 'w', **profile) as dst:
-        # Efficiently fill the raster if a fill value is determined
-        # For very large rasters, writing in chunks might be more memory-efficient
-        # but rasterio handles reasonably sized ones well with a full write.
-        if profile.get('nodata') is not None:
-            pass # No need to explicitly fill if nodata is set, it's implicitly that value
-        else:
-            # If no nodata value, fill explicitly, e.g. for float types with NaN
-            # This part is tricky because just opening with nodata doesn't fill.
-            # For true emptiness, relying on nodata is best.
-            # If we must fill (e.g. no nodata concept for the dtype), do it block by block.
-            fill_block = np.full((profile['blockysize'], profile['blockxsize']), 
-                                 current_fill_value, dtype=profile['dtype'])
-            for ji, window in dst.block_windows(1):
-                # Adjust fill_block shape for partial blocks at edges
-                current_block_shape = (window.height, window.width)
-                if fill_block.shape != current_block_shape:
-                    block_data = np.full(current_block_shape, current_fill_value, dtype=profile['dtype'])
-                    dst.write(block_data, window=window, indexes=dst.count)
-                else:
-                    dst.write(fill_block, window=window, indexes=dst.count)
-                    
-    return profile
-
-def fill_recipient_ortho(
-    list_of_tidy_target_imgs: list[np.ndarray],
-    list_of_metadata_targets: list[dict],
-    recipient_ortho_path: str
-):
-    """
-    Fills the recipient orthomosaic with tidied target images.
-
-    Each image in list_of_tidy_target_imgs is written to the recipient_ortho_path
-    according to its corresponding metadata in list_of_metadata_targets.
-    Assumes recipient_ortho_path exists and is writable.
-
-    Args:
-        list_of_tidy_target_imgs (list[np.ndarray]): List of tidied target image data arrays.
-                                                     Each array is (bands, height, width) or (height, width).
-        list_of_metadata_targets (list[dict]): List of metadata dicts for each target image.
-                                              Each dict must have 'transform', 'width', 'height',
-                                              and optionally 'count' (bands).
-        recipient_ortho_path (str): Path to the recipient orthomosaic.
-    """
-    if len(list_of_tidy_target_imgs) != len(list_of_metadata_targets):
-        raise ValueError("Mismatch between number of images and metadata entries.")
-
-    with rasterio.open(recipient_ortho_path, 'r+') as dst:
-        recipient_transform = dst.transform
-        recipient_crs = dst.crs
-
-        for img_data, meta in zip(list_of_tidy_target_imgs, list_of_metadata_targets):
-            if not isinstance(meta, dict) or not all(k in meta for k in ['transform', 'width', 'height']):
-                raise ValueError("Invalid metadata entry: must be dict with transform, width, height.")
-            if not isinstance(meta['transform'], Affine):
-                raise ValueError("Metadata 'transform' must be an Affine object.")
-
-            # Ensure image data is in (bands, height, width) or (height, width) format
-            if img_data.ndim == 2:
-                # Add a band dimension for single-band images
-                img_data_to_write = img_data.reshape(1, *img_data.shape)
-            elif img_data.ndim == 3:
-                img_data_to_write = img_data
-            else:
-                raise ValueError("Image data must be 2D or 3D.")
+            inliers = np.zeros(mkpts_reg_orig.shape[0], dtype=bool)
+            Fm, inliers_mask_cv = None, None
+            if mkpts_reg_orig.shape[0] >= min_matches_for_fm:
+                # Average scale factor for RANSAC threshold conversion
+                # Using reg_img_scales as reference for threshold scaling to original pixels
+                avg_reg_img_scale_factor_for_ransac = (reg_img_scales[0] + reg_img_scales[1]) / 2.0
+                found_inliers_for_pair = False
+                for loftr_thresh_px_input_space in loftr_reproj_thresh_px_levels:
+                    ransac_thresh_orig_chip_px = loftr_thresh_px_input_space * avg_reg_img_scale_factor_for_ransac
+                    for confidence_val in ransac_confidence_levels:
+                        try:
+                            # Points for findFundamentalMat: (mkpts_imgA, mkpts_imgB)
+                            # Here, reg is imgA (image0), un is imgB (image1)
+                            Fm, inliers_mask_cv = cv2.findFundamentalMat(
+                                mkpts_reg_orig, mkpts_un_orig, 
+                                method=cv2.USAC_MAGSAC, # Robust method
+                                ransacReprojThreshold=ransac_thresh_orig_chip_px,
+                                confidence=confidence_val,
+                                maxIters=100000 # Ample iterations
+                            )
+                            if Fm is not None and Fm.shape == (3,3) and not np.all(Fm == 0):
+                                if inliers_mask_cv is not None: # Ensure mask is not None
+                                    inliers = inliers_mask_cv.ravel() > 0
+                                    found_inliers_for_pair = True
+                                    break 
+                        except cv2.error:
+                            Fm, inliers_mask_cv = None, None 
+                            continue # Try next parameters
+                        if found_inliers_for_pair: break
+                    if found_inliers_for_pair: break
             
-            # Check CRS consistency if available in source meta
-            if 'crs' in meta and meta['crs'] != recipient_crs:
-                # This is a simplistic check. True reprojection is complex.
-                # For now, we assume CRSs are compatible if provided and matching.
-                # Consider raising a warning or error if they don't match.
-                print(f"Warning: CRS mismatch for a tile ({meta['crs']}) and recipient ({recipient_crs}). Assuming compatibility.")
+            loftr_processed_results_map[original_id] = {
+                'id': original_id, 'mkpts_reg': mkpts_reg_orig, 
+                'mkpts_un': mkpts_un_orig, 'inliers': inliers
+            }
+            del Fm, inliers_mask_cv
 
-            # Calculate the bounds of the current tidied image in its own CRS
-            # meta['transform'] is the transform for img_data
-            # img_data_to_write.shape[2] is width, img_data_to_write.shape[1] is height
-            img_bounds = array_bounds(
-                height=img_data_to_write.shape[1],
-                width=img_data_to_write.shape[2],
-                transform=meta['transform']
-            )
+        if actual_device.type == 'mps':
+            torch.mps.empty_cache()
+        elif actual_device.type == 'cuda':
+            torch.cuda.empty_cache()
 
-            # Calculate the window in the recipient raster
-            try:
-                window_in_recipient = Window.from_slices(
-                    *rasterio.windows.transform(img_bounds, recipient_transform).round_offsets().round_lengths().toranges()
-                )
-                # Alternative: window_in_recipient = rasterio.windows.from_bounds(*img_bounds, transform=recipient_transform)
-                # from_bounds can be sensitive, let's try to be precise by converting from world to pixel coords carefully
-                row_start, row_stop, col_start, col_stop = rasterio.warp.transform_bounds(
-                    meta.get('crs', recipient_crs), # Use tile's CRS if available, else recipient's
-                    recipient_crs, 
-                    *img_bounds
-                )
-                
-                # Convert geographic bounds to pixel window
-                # This is a more robust way if transforms are slightly different
-                # or CRSs are involved (though full reprojection is not done here)
-                top_left = rasterio.transform.rowcol(recipient_transform, xs=img_bounds[0], ys=img_bounds[3])
-                bottom_right = rasterio.transform.rowcol(recipient_transform, xs=img_bounds[2], ys=img_bounds[1])
-
-                window_col_off = top_left[1]
-                window_row_off = top_left[0]
-                window_width = bottom_right[1] - top_left[1]
-                window_height = bottom_right[0] - top_left[0]
-                
-                # Ensure window dimensions match the data to write, adjusting if necessary due to rounding
-                # This can happen if tile transform is not perfectly aligned with recipient grid
-                # For simplicity, we expect the window to match img_data_to_write dimensions
-                # If not, the user might need to resample/reproject the tile first.
-                
-                # Create the window object
-                window_to_write = Window(window_col_off, window_row_off, window_width, window_height)
-                
-                # Check that window dimensions approximately match data dimensions
-                if not (abs(window_to_write.width - img_data_to_write.shape[2]) <=1 and \
-                        abs(window_to_write.height - img_data_to_write.shape[1]) <=1 ):
-                     print(f"Warning: Calculated window {window_to_write} dimensions differ significantly from image data {img_data_to_write.shape[1:]}. Tile may be skewed or scaled differently.")
-                     # Potentially crop/pad img_data_to_write or skip if too different.
-                     # For now, proceed with calculated window.
-
-            except Exception as e:
-                print(f"Could not calculate window for a tile. Bounds: {img_bounds}, Error: {e}")
-                continue # Skip this tile
-
-            # Write the data
-            # Ensure number of bands matches
-            if img_data_to_write.shape[0] != dst.count:
-                 # Attempt to write to the first band if single band image and multi-band recipient, or vice-versa
-                 # This is a common scenario, but be careful.
-                if img_data_to_write.shape[0] == 1 and dst.count > 1:
-                    print(f"Warning: Writing single-band image to multi-band ({dst.count}) recipient. Writing to band 1.")
-                    dst.write(img_data_to_write[0], window=window_to_write, indexes=1)
-                elif dst.count == 1 and img_data_to_write.shape[0] > 1:
-                    # Example: take first band of image data if recipient is single band
-                    print(f"Warning: Writing multi-band image ({img_data_to_write.shape[0]}) to single-band recipient. Writing first band of image.")
-                    dst.write(img_data_to_write[0], window=window_to_write, indexes=1)
-                else:
-                    print(f"Error: Band count mismatch. Image has {img_data_to_write.shape[0]} bands, recipient has {dst.count}. Skipping tile.")
-                    continue
+    for i_orig_list_idx in range(N):
+        if all_pairs_results[i_orig_list_idx] is None: # Not an initially invalid chip
+            original_id_from_input = chip_data_list[i_orig_list_idx]['id']
+            if original_id_from_input in loftr_processed_results_map:
+                all_pairs_results[i_orig_list_idx] = loftr_processed_results_map[original_id_from_input]
             else:
-                dst.write(img_data_to_write, window=window_to_write)
+                tqdm.write(f"Warning: Missing LoFTR result for original_id {original_id_from_input}. Using empty.")
+                all_pairs_results[i_orig_list_idx] = {'id': original_id_from_input, 'mkpts_reg': np.empty((0,2)), 
+                                                      'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool)}
+    
+    final_output = []
+    for i_res, res_dict in enumerate(all_pairs_results):
+        if res_dict is not None:
+            final_output.append(res_dict)
+        else: # Should have been filled, but as a fallback
+            final_output.append({'id': chip_data_list[i_res]['id'], 'mkpts_reg': np.empty((0,2)),
+                                 'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool)})
+    return final_output
 
-def register_ortho(
-    target_ortho_path: str,
-    reference_ortho_path: str,
-    output_recipient_path: str,
-    cell_size_m: float,
-    buffer_m: float,
-    min_matches_for_homography: int = 10,
-    ransac_reproj_threshold: float = 5.0,
-    loftr_pretrained_model: str = "outdoor",
-    loftr_device_str: str = "cpu",
-    tile_resampling_method: RioResampling = RioResampling.bilinear,
-    nodata_tolerance_fraction: float = 0.25,
-    recipient_dtype_override: str = None,
-    recipient_nodata_override = None
-) -> str:
-    """
-    Orchestrates the entire survey registration pipeline.
 
-    Steps include:
-    1. Planning a grid over the target orthomosaic.
-    2. Creating an empty recipient orthomosaic.
-    3. For each grid cell:
-        a. Extracting paired target and reference tiles (with buffering).
-        b. Validating tiles for NoData content.
-        c. If valid, attempting feature matching (LoFTR) and registration (Homography).
-        d. Tidying the processed tile (removing buffer).
-        e. If registration fails or tile is invalid, the original target tile (tidied) is used.
-    4. Filling the recipient orthomosaic with all processed (and tidied) tiles.
+def generate_chip_gcps_gdal(un_chip: Chip, reg_chip: Chip,
+                            mkpts_un_chip_coords: np.ndarray, # Keypoints in unreg chip's pixel space
+                            mkpts_reg_chip_coords: np.ndarray, # Keypoints in reg chip's pixel space
+                            inliers_mask: np.ndarray # Boolean mask for inlier points
+                           ) -> List[gdal.GCP]:
+    """Generates GDAL GCPs from matched keypoints between unregistered and registered chips."""
+    if not inliers_mask.any():
+        return []
+    
+    # Transform for registered chip: converts reg_chip pixel coords to its CRS coords
+    # The GCP's target (x,y) are geographic coordinates from the registered chip
+    # The GCP's source (pixelX, pixelY) are pixel coordinates from the unregistered chip
+    reg_chip_transform = Affine.from_gdal(*reg_chip.profile["transform"].GetGeoTransform()) \
+        if isinstance(reg_chip.profile["transform"], gdal.Dataset) \
+        else reg_chip.profile["transform"] # Should be Affine or rasterio transform
+    
+    if not isinstance(reg_chip_transform, Affine): # Convert if rasterio.Affine
+        try:
+            reg_chip_transform = Affine(reg_chip_transform.a, reg_chip_transform.b, reg_chip_transform.c,
+                                        reg_chip_transform.d, reg_chip_transform.e, reg_chip_transform.f)
+        except AttributeError:
+            raise ValueError("Registered chip profile 'transform' is not a recognized Affine type.")
 
-    Args:
-        target_ortho_path: Path to the target orthomosaic GeoTIFF.
-        reference_ortho_path: Path to the reference orthomosaic GeoTIFF.
-        output_recipient_path: Path to save the final registered mosaic.
-        cell_size_m: Size of each grid cell in meters (unbuffered).
-        buffer_m: Buffer to add around each cell for tile processing, in meters.
-        min_matches_for_homography: Minimum number of inlier matches to attempt homography.
-        ransac_reproj_threshold: RANSAC reprojection threshold for findHomography.
-        loftr_pretrained_model: LoFTR pretrained model name.
-        loftr_device_str: Device for LoFTR ('cpu', 'cuda', 'mps').
-        tile_resampling_method: Rasterio resampling method for warping reference tiles.
-        nodata_tolerance_fraction: Max allowed NA fraction in tiles for registration attempt.
-        recipient_dtype_override: Optional dtype for the output mosaic.
-        recipient_nodata_override: Optional NoData value for the output mosaic.
 
-    Returns:
-        Path to the created registered orthomosaic.
-    """
-
-    print(f"Starting survey registration process...")
-    print(f"  Target: {target_ortho_path}")
-    print(f"  Reference: {reference_ortho_path}")
-    print(f"  Output: {output_recipient_path}")
-
-    # 1. Plan Grid
-    print(f"Planning grid with cell size {cell_size_m}m...")
-    grid_coords = plan_grid(target_ortho_path, cell_size_m)
-    if not grid_coords:
-        print("Error: No grid cells planned. Aborting.")
-        return None
-    print(f"Planned {len(grid_coords)} grid cells.")
-
-    # 2. Create Recipient Ortho
-    print(f"Creating recipient orthomosaic: {output_recipient_path}")
-    try:
-        make_recipient_ortho(
-            target_ortho_path=target_ortho_path, 
-            recipient_ortho_path=output_recipient_path,
-            dtype_override=recipient_dtype_override,
-            nodata_override=recipient_nodata_override
-        )
-    except Exception as e:
-        print(f"Error creating recipient orthomosaic: {e}. Aborting.")
-        return None
-
-    processed_tiles_data = []
-    processed_tiles_metadata = []
-
-    # 3. Process Each Tile
-    print(f"Processing {len(grid_coords)} tiles with {buffer_m}m buffer...")
-    for x_center, y_center in tqdm(grid_coords, desc="Processing Tiles"):
-        img_t_buf, img_r_buf, meta_t_buf, meta_r_buf = make_paired_tiles(
-            target_ortho_path,
-            reference_ortho_path,
-            x_center, y_center,
-            cell_size_m,
-            buffer_m,
-            resampling_method=tile_resampling_method
-        )
-
-        if img_t_buf is None or meta_t_buf is None: # Indicates failure in make_paired_tiles for this cell
-            # tqdm.write(f"Skipping cell ({x_center:.2f}, {y_center:.2f}) due to tile extraction failure.")
+    gcps = []
+    for (ux_px, uy_px), (rx_px, ry_px), is_inlier in zip(mkpts_un_chip_coords, mkpts_reg_chip_coords, inliers_mask):
+        if not is_inlier:
             continue
         
-        current_tile_data = None
-        current_tile_meta = None
-        registration_successful = False
-
-        # Validate tiles
-        is_valid_for_reg, targ_na, ref_na = check_valid_mask(
-            img_t_buf, meta_t_buf, img_r_buf, meta_r_buf, 
-            tol_na_frac=nodata_tolerance_fraction
-        )
-        # tqdm.write(f"  Cell ({x_center:.2f}, {y_center:.2f}): Valid for Reg: {is_valid_for_reg} (Target NA: {targ_na:.2f}, Ref NA: {ref_na:.2f})")
-
-        if is_valid_for_reg:
-            # Attempt matching
-            mkpts_t, mkpts_r, inliers_mask = get_loftr_matches(
-                img_t_buf, img_r_buf, 
-                pretrained_model=loftr_pretrained_model, 
-                device_str=loftr_device_str
-            )
-
-            if inliers_mask.sum() >= min_matches_for_homography:
-                # Attempt registration
-                # tqdm.write(f"    Attempting registration with {inliers_mask.sum()} inlier points.")
-                reg_t_buf, reg_meta_buf = register_target(
-                    img_t_buf, 
-                    meta_r_buf, # Warp target into reference tile's space and metadata
-                    mkpts_t, 
-                    mkpts_r, 
-                    inliers_mask,
-                    min_matches_for_homography=min_matches_for_homography,
-                    ransac_reproj_threshold=ransac_reproj_threshold
-                )
-
-                if reg_t_buf is not None and reg_meta_buf is not None:
-                    # Registration successful, now tidy this registered tile
-                    try:
-                        buffer_px_for_tidy = int(round(buffer_m / abs(reg_meta_buf['transform'].a)))
-                        current_tile_data, current_tile_meta = tidy_target(
-                            reg_t_buf, reg_meta_buf, buffer_px_for_tidy
-                        )
-                        registration_successful = True
-                        tqdm.write(f"      Registration and tidying successful.")
-                    except Exception as e:
-                        tqdm.write(f"      Error tidying registered tile: {e}")
-                
-        if not registration_successful:
-            tqdm.write(f"    Using original target tile (pass-through). Attempting to tidy.")
-            try:
-                buffer_px_for_tidy = int(round(buffer_m / abs(meta_t_buf['transform'].a)))
-                current_tile_data, current_tile_meta = tidy_target(
-                    img_t_buf, meta_t_buf, buffer_px_for_tidy
-                )
-                tqdm.write(f"      Tidying of original target successful.")
-            except Exception as e:
-                tqdm.write(f"      Error tidying original target tile: {e}")
+        # Convert registered chip pixel coordinates (rx_px, ry_px) to its geographic coordinates
+        # These become the GCP's (GCPX, GCPY, GCPZ)
+        gx_geo, gy_geo = reg_chip_transform * (float(rx_px), float(ry_px))
         
-        if current_tile_data is not None and current_tile_meta is not None:
-            processed_tiles_data.append(current_tile_data)
-            processed_tiles_metadata.append(current_tile_meta)
-        # else:
-            # tqdm.write(f"    Failed to produce a tidied tile for cell ({x_center:.2f}, {y_center:.2f}).")
+        # Unregistered chip pixel coordinates (ux_px, uy_px) are the (GCPPixel, GCPLine)
+        gcps.append(gdal.GCP(gx_geo, gy_geo, 0, float(ux_px), float(uy_px))) # Assume Z=0 for GCPs
+    return gcps
 
-    # 4. Fill Recipient Ortho
-    if processed_tiles_data:
-        print(f"Assembling final orthomosaic from {len(processed_tiles_data)} processed tiles...")
-        try:
-            fill_recipient_ortho(
-                processed_tiles_data, 
-                processed_tiles_metadata, 
-                output_recipient_path
-            )
-            print(f"Successfully created registered orthomosaic: {output_recipient_path}")
-            return output_recipient_path
-        except Exception as e:
-            print(f"Error filling recipient orthomosaic: {e}")
-            return None
+def warp_chip_gdal(un_chip: Chip, gcps: List[gdal.GCP], out_chip_path: str,
+                   polynomial_order: int = 3, 
+                   gdal_resample_algorithm: str = "cubic",
+                   src_nodata_val = 0, # Nodata value in source chip (un_chip)
+                   dst_nodata_val = 0  # Nodata value for output warped chip
+                   ):
+    """Warps a single unregistered chip using GDAL GCPs, saving to out_chip_path."""
+    gdal.UseExceptions() # Ensure exceptions are on for this GDAL-heavy part
+
+    # Create an in-memory GTiff dataset from the un_chip numpy array
+    # un_chip.profile["transform"] should be an Affine object or GDAL-style tuple
+    un_chip_affine_transform = un_chip.profile["transform"]
+    if not isinstance(un_chip_affine_transform, tuple): # If it's Affine, convert
+        un_chip_gdal_transform = un_chip_affine_transform.to_gdal()
     else:
-        print("No tiles were successfully processed to fill the orthomosaic.")
-        # Optionally, delete the empty recipient file created by make_recipient_ortho if desired.
-        # For now, it will remain as an empty (or NaN-filled) file.
-        return None
+        un_chip_gdal_transform = un_chip_affine_transform
+
+    with MemoryFile() as mem_file:
+        # Correctly get rasterio driver for in-memory dataset
+
+        with mem_file.open(
+            driver='GTiff', # Use 'GTiff' for broader compatibility
+            height=un_chip.array.shape[1], # H from (C,H,W)
+            width=un_chip.array.shape[2],  # W from (C,H,W)
+            count=un_chip.array.shape[0],  # C from (C,H,W)
+            dtype=str(un_chip.array.dtype),
+            transform=un_chip_affine_transform, # rasterio transform
+            crs=un_chip.profile["crs"],
+            nodata=src_nodata_val 
+        ) as mem_rasterio_dst:
+            mem_rasterio_dst.write(un_chip.array)
+        
+        # mem_file.name is the path to the in-memory dataset that GDAL can open
+        vrt_ds = None
+        try:
+            # Translate to VRT with GCPs
+            # Output to "" means in-memory GDAL dataset
+            translate_opts = gdal.TranslateOptions(format="VRT", GCPs=gcps)
+            vrt_ds = gdal.Translate("", mem_file.name, options=translate_opts)
+            if vrt_ds is None:
+                raise RuntimeError(f"GDAL Translate to VRT failed for chip data from {mem_file.name}")
+
+            warp_opts = gdal.WarpOptions(
+                format="GTiff",
+                outputBounds=un_chip.bounds, # Geographic bounds of the original un_chip
+                width=int(un_chip.profile["width"]), # Pixel width of original un_chip
+                height=int(un_chip.profile["height"]),# Pixel height of original un_chip
+                polynomialOrder=polynomial_order,
+                resampleAlg=gdal_resample_algorithm,
+                dstSRS=str(un_chip.profile["crs"]), # Target SRS is same as un_chip's
+                srcNodata=src_nodata_val,
+                dstNodata=dst_nodata_val,
+                # warpOptions=["SOURCE_EXTRA=5", "WRITE_FLUSH=YES"] # From script
+                # Forcing output type might be needed if issues with dtype
+                # outputType=gdal.GDT_Byte if un_chip.array.dtype == np.uint8 else gdal.GDT_UInt16 # Example
+            )
+            gdal.Warp(out_chip_path, vrt_ds, options=warp_opts)
+        finally:
+            vrt_ds = None # Dereference to allow GDAL to free VRT resources
+
+def merge_warped_chips_gdal(
+    warped_chips_info: List[Tuple[str, Tuple[float,float,float,float], Tuple[float,float]]], # (fpath, bounds, (pix_w, pix_h))
+    final_output_path: str, 
+    buffer_width_crs: float, # Buffer width in CRS units to crop from each side
+    buffer_height_crs: float # Buffer height in CRS units to crop from each side
+):
+    """Merges cropped warped chips into a final raster."""
+    gdal.UseExceptions()
+    if not warped_chips_info:
+        print("⚠️  No warped chips to merge.")
+        return
+
+    with tempfile.TemporaryDirectory() as crop_temp_dir:
+        cropped_chip_paths = []
+        print("Cropping buffered edges from warped chips...")
+        for i, (chip_fpath, chip_bounds_buffered, (pix_res_w, pix_res_h)) in \
+            enumerate(tqdm(warped_chips_info, desc="Cropping Warped Chips", unit="chip", leave=False)):
+            
+            # chip_bounds_buffered = (xmin_buf, ymin_buf, xmax_buf, ymax_buf)
+            # Core bounds after removing buffer
+            core_bounds = [
+                chip_bounds_buffered[0] + buffer_width_crs,  # new xmin
+                chip_bounds_buffered[1] + buffer_height_crs,  # new ymin
+                chip_bounds_buffered[2] - buffer_width_crs,  # new xmax
+                chip_bounds_buffered[3] - buffer_height_crs   # new ymax
+            ]
+            
+            # Ensure core bounds are valid (xmin < xmax, ymin < ymax)
+            if core_bounds[0] >= core_bounds[2] or core_bounds[1] >= core_bounds[3]:
+                tqdm.write(f"Skipping chip {i} due to invalid core bounds after buffer removal.")
+                continue
+
+            cropped_chip_out_path = os.path.join(crop_temp_dir, f"crop_{os.path.basename(chip_fpath)}")
+            
+            warp_to_crop_opts = gdal.WarpOptions(
+                format="GTiff",
+                outputBounds=core_bounds, # Target geographic extent is the core area
+                xRes=pix_res_w, 
+                yRes=pix_res_h,
+                multithread=True,
+                # warpOptions=["OPTIMIZE_SIZE=YES"], # From script
+                dstNodata=0 # Assuming 0 is a safe nodata for intermediate cropped chips
+            )
+            gdal.Warp(cropped_chip_out_path, chip_fpath, options=warp_to_crop_opts)
+            cropped_chip_paths.append(cropped_chip_out_path)
+
+        if not cropped_chip_paths:
+            print("⚠️  No chips remaining after cropping. Merge aborted.")
+            return
+
+        print("Building VRT for merging cropped chips...")
+        merged_vrt_path = os.path.join(crop_temp_dir, "merged_all_cropped.vrt")
+        # Use the resolution from the first successfully cropped chip as reference for VRT
+        # This assumes all chips should roughly align to this resolution after cropping.
+        ref_pix_w_for_vrt, ref_pix_h_for_vrt = warped_chips_info[0][2] # pix_res_w, pix_res_h from first chip
+        
+        vrt_build_opts = gdal.BuildVRTOptions(
+            xRes=ref_pix_w_for_vrt, 
+            yRes=ref_pix_h_for_vrt,
+            # Add other options like srcNodata, VRTNodata if needed
+        )
+        gdal.BuildVRT(merged_vrt_path, cropped_chip_paths, options=vrt_build_opts)
+
+        print(f"Translating merged VRT to final COG: {final_output_path} …")
+        output_dir = os.path.dirname(final_output_path)
+        if output_dir: # Ensure output directory exists
+            os.makedirs(output_dir, exist_ok=True)
+        
+        translate_to_cog_opts = gdal.TranslateOptions(
+            format="GTiff",
+            creationOptions=["COMPRESS=LZW", "PREDICTOR=2", "BIGTIFF=YES", "TILED=YES", "COPY_SRC_OVERVIEWS=YES"],
+            # Add callback for progress if desired, e.g., gdal.TermProgress_nocb
+        )
+        gdal.Translate(final_output_path, merged_vrt_path, options=translate_to_cog_opts)
+        
+        print("Building overviews for the final COG...")
+        final_ds = gdal.Open(final_output_path, gdal.GA_Update)
+        if final_ds:
+            # Standard overview levels
+            overview_levels = [2, 4, 8, 16, 32] 
+            # Ensure gdal config options are set if they affect overview generation
+            gdal.SetConfigOption("COMPRESS_OVERVIEW", "LZW") 
+            gdal.SetConfigOption("PREDICTOR_OVERVIEW", "2") # For LZW
+            final_ds.BuildOverviews("NEAREST", overview_levels) # NEAREST is common for discrete data, AVERAGE for continuous
+            final_ds = None # Close dataset
+        
+        try: # Clean up VRT
+            gdal.Unlink(merged_vrt_path) 
+        except Exception: # nosemgrep
+            pass # nosemgrep
+            tqdm.write(f"Note: Could not unlink intermediate VRT {merged_vrt_path}")
+
+    print("Chip merging complete.")
+
+
+def calculate_chip_crs_parameters_gdal(
+    parent_raster_path: str,
+    target_chip_width_px: int, # e.g., TARGET_SIZE[1] from script
+    target_chip_height_px: int, # e.g., TARGET_SIZE[0] from script
+    buffer_fraction_of_core: float # e.g., BUFFER_FRAC from script
+) -> Tuple[float, float, float, float, float, float]:
+    """
+    Calculates chip core dimensions and buffer sizes in CRS units, plus pixel resolutions.
+    Args:
+        parent_raster_path: Path to the main raster (e.g., unregistered survey).
+        target_chip_width_px: Desired width of the core chip area in pixels.
+        target_chip_height_px: Desired height of the core chip area in pixels.
+        buffer_fraction_of_core: Fraction of core dimension to use as buffer on each side.
+    Returns:
+        Tuple: (actual_core_w_crs, actual_core_h_crs, 
+                buffer_to_add_w_crs, buffer_to_add_h_crs, 
+                res_x, res_y)
+    """
+    with rasterio.open(parent_raster_path) as src:
+        # abs() for pixel resolution as it can be negative for north-up images where origin is top-left
+        res_x = abs(src.transform.a) # Pixel width in CRS units
+        res_y = abs(src.transform.e) # Pixel height in CRS units
+
+    actual_core_w_crs = target_chip_width_px * res_x
+    actual_core_h_crs = target_chip_height_px * res_y
+    
+    if actual_core_w_crs <= 0:
+        raise ValueError("Target chip width results in non-positive core CRS width. Check target_chip_width_px and raster resolution.")
+    if actual_core_h_crs <= 0:
+        raise ValueError("Target chip height results in non-positive core CRS height. Check target_chip_height_px and raster resolution.")
+        
+    buffer_to_add_w_crs = buffer_fraction_of_core * actual_core_w_crs
+    buffer_to_add_h_crs = buffer_fraction_of_core * actual_core_h_crs
+    
+    return actual_core_w_crs, actual_core_h_crs, buffer_to_add_w_crs, buffer_to_add_h_crs, res_x, res_y
+
+def register_survey_by_chips(
+    unreg_survey_path: str,
+    reg_reference_path: str,
+    output_registered_survey_path: str,
+    # Chip geometry and buffering parameters (typically derived from target pixel sizes)
+    core_chip_width_crs: float, # CRS width of the core processing area of a chip
+    core_chip_height_crs: float,# CRS height of the core processing area of a chip
+    buffer_width_crs: float,   # CRS width of buffer to add to each side of a chip for processing
+    buffer_height_crs: float,  # CRS height of buffer to add to each side of a chip for processing
+    # Processing parameters
+    device_for_loftr: str = 'cpu',
+    max_loader_workers: int = 4, # For ThreadPoolExecutor loading chips
+    loftr_batch_size: int = 8,
+    processing_chunk_size: int = 32, # Number of grid points per major processing cycle
+    # LoFTR & GCP parameters with defaults from script
+    loftr_model_name: str = 'outdoor',
+    target_size_hw_for_loftr_preprocessing: Tuple[int, int] = (480, 640), # (H,W) for LoFTR input
+    min_loftr_matches_for_fundamental_matrix: int = 7,
+    loftr_reproj_threshold_px_levels_in_resized_space: List[float] = [0.5, 1.0, 2.0],
+    ransac_confidence_levels_for_fm: List[float] = [0.999, 0.95],
+    min_gcps_for_warp: int = 10, # Minimum number of valid GCPs required to attempt warp_chip
+    # GDAL warp parameters
+    gdal_polynomial_order: int = 3,
+    gdal_resampling_algorithm: str = "cubic", # e.g., "cubic", "bilinear", "near"
+    gdal_src_nodata: Optional[float]=0, # Nodata in source chips before warp
+    gdal_dst_nodata: Optional[float]=0  # Nodata for warped chips and final output
+):
+    """
+    Registers an unregistered survey raster to a registered reference raster using a chip-based
+    approach with LoFTR for feature matching and GDAL for warping and merging.
+    """
+    gdal.UseExceptions() # Ensure GDAL exceptions are enabled
+
+    print(f"Starting chip-based survey registration:")
+    print(f"  Unregistered: {unreg_survey_path}")
+    print(f"  Reference: {reg_reference_path}")
+    print(f"  Output: {output_registered_survey_path}")
+
+    # Generate grid over the unregistered survey based on core chip dimensions
+    grid_gdf = generate_grid_points_chip(unreg_survey_path, core_chip_width_crs, core_chip_height_crs)
+    if grid_gdf.empty:
+        print("No grid points generated. Check chip dimensions and survey extent. Aborting.")
+        return
+
+    # List to collect paths and metadata of successfully warped (and buffered) chips for merging
+    warped_chips_for_merge_all_chunks: List[Tuple[str, Tuple[float,float,float,float], Tuple[float,float]]] = [] 
+
+    # Statistics counters
+    total_successful_warps = 0
+    total_skipped_no_img_data = 0
+    total_skipped_no_loftr_inliers = 0
+    total_skipped_insufficient_gcps = 0
+    total_errors_in_processing = 0
+
+    output_dir = os.path.dirname(output_registered_survey_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as main_processing_tmpdir:
+        num_chunks = (len(grid_gdf) + processing_chunk_size - 1) // processing_chunk_size
+
+        for chunk_idx in tqdm(range(num_chunks), desc="Total Progress (Chunks)", unit="chunk", position=0):
+            chunk_start_idx = chunk_idx * processing_chunk_size
+            chunk_end_idx = min((chunk_idx + 1) * processing_chunk_size, len(grid_gdf))
+            current_grid_points_chunk_df = grid_gdf.iloc[chunk_start_idx:chunk_end_idx]
+
+            if current_grid_points_chunk_df.empty:
+                continue
+            
+            tqdm.write(f"--- Processing Chunk {chunk_idx + 1}/{num_chunks} (Grid Indices {chunk_start_idx} to {chunk_end_idx-1}) ---")
+
+            # 1. Load chip pairs for the current chunk
+            loaded_chips_data_current_chunk: List[dict] = [] # Store {'id': original_idx, 'un_chip': Chip, 'reg_chip': Chip}
+            chip_load_futures = {}
+            with ThreadPoolExecutor(max_workers=max_loader_workers) as executor:
+                for original_grid_idx, grid_row in current_grid_points_chunk_df.iterrows():
+                    future = executor.submit(load_chips_gdal, grid_row.geometry,
+                                             unreg_survey_path, reg_reference_path,
+                                             core_chip_width_crs, core_chip_height_crs,
+                                             buffer_width_crs, buffer_height_crs)
+                    chip_load_futures[future] = original_grid_idx
+                
+                progress_loading = tqdm(as_completed(chip_load_futures), total=len(chip_load_futures), 
+                                        desc=f"  Loading chips (Chunk {chunk_idx+1})", unit="chip", leave=False, position=1)
+                for fut_load in progress_loading:
+                    original_idx = chip_load_futures[fut_load]
+                    try:
+                        un_chip_obj, reg_chip_obj = fut_load.result()
+                        loaded_chips_data_current_chunk.append({'id': original_idx, 
+                                                               'un_chip': un_chip_obj, 
+                                                               'reg_chip': reg_chip_obj})
+                    except Exception as e:
+                        tqdm.write(f"⚠️  Load failure for chip id {original_idx} in chunk {chunk_idx+1}: {e}")
+                        total_errors_in_processing +=1
+            
+            if not loaded_chips_data_current_chunk:
+                tqdm.write(f"❌  No chips successfully loaded for chunk {chunk_idx+1}. Skipping.")
+                continue
+            
+            # Sort by ID to maintain order if needed, though map lookup is used later
+            loaded_chips_data_current_chunk.sort(key=lambda x: x['id'])
+
+            # 2. Batch LoFTR matching for the current chunk's loaded chips
+            loftr_input_for_chunk = [{'id': lcd['id'], 
+                                      'un_img': lcd['un_chip'].array, # Unregistered is 'target' for warping
+                                      'reg_img': lcd['reg_chip'].array  # Registered is 'reference' space
+                                     } for lcd in loaded_chips_data_current_chunk]
+            
+            loftr_matches_results_chunk = batch_get_loftr_matches_chip(
+                loftr_input_for_chunk,
+                device_str=device_for_loftr,
+                batch_size_config=loftr_batch_size,
+                loftr_pretrained_model=loftr_model_name,
+                min_matches_for_fm=min_loftr_matches_for_fundamental_matrix,
+                loftr_reproj_thresh_px_levels=loftr_reproj_threshold_px_levels_in_resized_space,
+                ransac_confidence_levels=ransac_confidence_levels_for_fm,
+                target_size_hw_loftr=target_size_hw_for_loftr_preprocessing
+            )
+            # Create a map for quick lookup of match results by original_id
+            matches_map_for_chunk = {match_res['id']: match_res for match_res in loftr_matches_results_chunk}
+
+            # 3. Generate GCPs and Warp chips for the current chunk
+            chunk_successful_warps = 0
+            chunk_skipped_no_data = 0
+            chunk_skipped_no_inliers = 0
+            chunk_skipped_low_gcps = 0
+            chunk_errors = 0
+
+            progress_warping = tqdm(loaded_chips_data_current_chunk, desc=f"  Warping chips (Chunk {chunk_idx+1})", unit="chip", leave=False, position=1)
+            for loaded_chip_info in progress_warping:
+                original_idx = loaded_chip_info['id']
+                un_chip_to_warp = loaded_chip_info['un_chip']
+                reg_chip_reference = loaded_chip_info['reg_chip']
+                
+                match_data_for_chip = matches_map_for_chunk.get(original_idx)
+
+                try:
+                    if match_data_for_chip is None:
+                        # This case should ideally be handled by batch_get_loftr_matches_chip returning empty arrays for this id
+                        tqdm.write(f"Chip {original_idx}: Skipped (no LoFTR match data found).")
+                        chunk_errors +=1
+                        continue
+
+                    # Check for empty image arrays before proceeding
+                    if un_chip_to_warp.array.sum() == 0 or reg_chip_reference.array.sum() == 0 or \
+                       un_chip_to_warp.array.size == 0 or reg_chip_reference.array.size == 0:
+                        chunk_skipped_no_data += 1
+                        continue
+                    
+                    # Keypoints from LoFTR: mkpts_reg are in reg_chip_reference's pixel space,
+                    # mkpts_un are in un_chip_to_warp's pixel space.
+                    mkpts_in_reg_chip = match_data_for_chip['mkpts_reg'] 
+                    mkpts_in_un_chip = match_data_for_chip['mkpts_un']
+                    inliers_from_loftr = match_data_for_chip['inliers']
+
+                    num_inliers = int(inliers_from_loftr.sum())
+                    if num_inliers == 0:
+                        chunk_skipped_no_inliers += 1
+                        continue
+                    
+                    # Generate GCPs: un_chip (source pixels), reg_chip (target geo coords)
+                    gcp_list_for_warp = generate_chip_gcps_gdal(un_chip_to_warp, reg_chip_reference,
+                                                                mkpts_in_un_chip, mkpts_in_reg_chip,
+                                                                inliers_from_loftr)
+                    
+                    if len(gcp_list_for_warp) < min_gcps_for_warp:
+                        chunk_skipped_low_gcps += 1
+                        continue
+
+                    # Define output path for this warped chip (in the main temporary directory)
+                    # Base name from original grid index to ensure uniqueness
+                    warped_chip_filename = f"warped_chip_{original_idx}.tif"
+                    output_path_for_this_warped_chip = os.path.join(main_processing_tmpdir, warped_chip_filename)
+                    
+                    warp_chip_gdal(un_chip_to_warp, gcp_list_for_warp, output_path_for_this_warped_chip,
+                                   polynomial_order=gdal_polynomial_order,
+                                   gdal_resample_algorithm=gdal_resampling_algorithm,
+                                   src_nodata_val=gdal_src_nodata,
+                                   dst_nodata_val=gdal_dst_nodata
+                                   )
+                    
+                    chunk_successful_warps += 1
+                    
+                    # Get pixel resolution of the un_chip (source of warp) for merge step
+                    # This assumes the warped chip maintains roughly this resolution in its core area
+                    un_chip_transform = un_chip_to_warp.profile["transform"]
+                    pix_width_un = abs(un_chip_transform.a)
+                    pix_height_un = abs(un_chip_transform.e)
+                    
+                    # Store path, original (buffered) bounds of un_chip, and its pixel resolution
+                    warped_chips_for_merge_all_chunks.append(
+                        (output_path_for_this_warped_chip, un_chip_to_warp.bounds, (pix_width_un, pix_height_un))
+                    )
+
+                except Exception as e_warp:
+                    tqdm.write(f"Chip {original_idx}: ERROR during warping in chunk {chunk_idx+1} — {e_warp}")
+                    chunk_errors += 1
+            
+            # Aggregate chunk stats to totals
+            total_successful_warps += chunk_successful_warps
+            total_skipped_no_img_data += chunk_skipped_no_data
+            total_skipped_no_loftr_inliers += chunk_skipped_no_inliers
+            total_skipped_insufficient_gcps += chunk_skipped_low_gcps
+            total_errors_in_processing += chunk_errors
+            
+            tqdm.write(f"  Chunk {chunk_idx+1} Summary: Warped: {chunk_successful_warps}, "
+                  f"Skipped (NoData: {chunk_skipped_no_data}, NoInliers: {chunk_skipped_no_inliers}, LowGCPs: {chunk_skipped_low_gcps}), "
+                  f"Errors: {chunk_errors}")
+
+            # Clean up large chunk-specific data to free memory
+            del loaded_chips_data_current_chunk, loftr_input_for_chunk, loftr_matches_results_chunk, matches_map_for_chunk
+            if 'gc' in sys.modules: # If gc was imported (it is by original script)
+                 import gc
+                 gc.collect()
+        
+        # --- End of all chunk processing ---
+
+        print("\nOverall Warping Summary:")
+        print(f"  Successfully warped chips (pre-merge): {total_successful_warps}")
+        print(f"  Skipped (no image data): {total_skipped_no_img_data}")
+        print(f"  Skipped (no LoFTR inliers): {total_skipped_no_loftr_inliers}")
+        print(f"  Skipped (insufficient GCPs): {total_skipped_insufficient_gcps}")
+        print(f"  Errors during chip processing: {total_errors_in_processing}")
+
+        # Merge all successfully warped (and buffered) chips
+        if warped_chips_for_merge_all_chunks:
+            print("\nStarting merge process for warped chips...")
+            merge_warped_chips_gdal(warped_chips_for_merge_all_chunks,
+                                    output_registered_survey_path,
+                                    buffer_width_crs, # Buffer to remove (same as added for processing)
+                                    buffer_height_crs # Buffer to remove
+                                   )
+            print(f"Registration process complete. Output at: {output_registered_survey_path}")
+        else:
+            print("⚠️  No chips were successfully warped. Final output raster will not be created.")
+            pass # Or raise an error / return a status
 
     
 
