@@ -133,6 +133,13 @@ def batch_get_loftr_matches_chip(
     """
     Performs batched LoFTR matching on pairs of image chips.
     Initializes LoFTR model internally.
+    Each dictionary in the output list will contain:
+    'id': original chip id
+    'mkpts_reg': keypoints in registered chip (original pixel space)
+    'mkpts_un': keypoints in unregistered chip (original pixel space)
+    'inliers': boolean mask for inlier keypoints
+    'used_reproj_thresh': LoFTR reprojection threshold (resized space) used for successful RANSAC, or np.nan
+    'used_ransac_confidence': RANSAC confidence level used for successful RANSAC, or np.nan
     """
     if device_str == 'cuda' and not torch.cuda.is_available():
         print("CUDA specified but not available, falling back to CPU for LoFTR.")
@@ -205,15 +212,19 @@ def batch_get_loftr_matches_chip(
             u_tensor, u_scales = prep_unreg_k # u_tensor is (1,1,H,W)
             valid_pairs_for_loftr.append((original_id, r_tensor, r_scales, u_tensor, u_scales))
         else:
-            all_pairs_results[list_idx] = {'id': original_id, 'mkpts_reg': np.empty((0,2)), 
-                                           'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool)}
+            all_pairs_results[list_idx] = {'id': original_id, 'mkpts_reg': np.empty((0,2)),
+                                           'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool),
+                                           'used_reproj_thresh': np.nan, 
+                                           'used_ransac_confidence': np.nan}
             
     if not valid_pairs_for_loftr:
         tqdm.write("No valid pairs for LoFTR after preprocessing.")
         for i in range(N):
             if all_pairs_results[i] is None:
                  all_pairs_results[i] = {'id': chip_data_list[i]['id'], 'mkpts_reg': np.empty((0,2)),
-                                           'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool)}
+                                           'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool),
+                                           'used_reproj_thresh': np.nan,
+                                           'used_ransac_confidence': np.nan}
         return [res for res in all_pairs_results if res is not None]
 
     loftr_processed_results_map = {}
@@ -258,6 +269,9 @@ def batch_get_loftr_matches_chip(
 
             inliers = np.zeros(mkpts_reg_orig.shape[0], dtype=bool)
             Fm, inliers_mask_cv = None, None
+            current_used_reproj_thresh = np.nan
+            current_used_ransac_confidence = np.nan
+
             if mkpts_reg_orig.shape[0] >= min_matches_for_fm:
                 # Average scale factor for RANSAC threshold conversion
                 # Using reg_img_scales as reference for threshold scaling to original pixels
@@ -279,6 +293,8 @@ def batch_get_loftr_matches_chip(
                             if Fm is not None and Fm.shape == (3,3) and not np.all(Fm == 0):
                                 if inliers_mask_cv is not None: # Ensure mask is not None
                                     inliers = inliers_mask_cv.ravel() > 0
+                                    current_used_reproj_thresh = loftr_thresh_px_input_space
+                                    current_used_ransac_confidence = confidence_val
                                     found_inliers_for_pair = True
                                     break 
                         except cv2.error:
@@ -289,7 +305,9 @@ def batch_get_loftr_matches_chip(
             
             loftr_processed_results_map[original_id] = {
                 'id': original_id, 'mkpts_reg': mkpts_reg_orig, 
-                'mkpts_un': mkpts_un_orig, 'inliers': inliers
+                'mkpts_un': mkpts_un_orig, 'inliers': inliers,
+                'used_reproj_thresh': current_used_reproj_thresh,
+                'used_ransac_confidence': current_used_ransac_confidence
             }
             del Fm, inliers_mask_cv
 
@@ -306,7 +324,9 @@ def batch_get_loftr_matches_chip(
             else:
                 tqdm.write(f"Warning: Missing LoFTR result for original_id {original_id_from_input}. Using empty.")
                 all_pairs_results[i_orig_list_idx] = {'id': original_id_from_input, 'mkpts_reg': np.empty((0,2)), 
-                                                      'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool)}
+                                                      'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool),
+                                                      'used_reproj_thresh': np.nan,
+                                                      'used_ransac_confidence': np.nan}
     
     final_output = []
     for i_res, res_dict in enumerate(all_pairs_results):
@@ -314,7 +334,9 @@ def batch_get_loftr_matches_chip(
             final_output.append(res_dict)
         else: # Should have been filled, but as a fallback
             final_output.append({'id': chip_data_list[i_res]['id'], 'mkpts_reg': np.empty((0,2)),
-                                 'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool)})
+                                 'mkpts_un': np.empty((0,2)), 'inliers': np.zeros(0,bool),
+                                 'used_reproj_thresh': np.nan,
+                                 'used_ransac_confidence': np.nan})
     return final_output
 
 
@@ -424,7 +446,7 @@ def merge_warped_chips_gdal(
     """Merges cropped warped chips into a final raster."""
     gdal.UseExceptions()
     if not warped_chips_info:
-        print("⚠️  No warped chips to merge.")
+        print("No warped chips to merge.")
         return
 
     with tempfile.TemporaryDirectory() as crop_temp_dir:
@@ -462,7 +484,7 @@ def merge_warped_chips_gdal(
             cropped_chip_paths.append(cropped_chip_out_path)
 
         if not cropped_chip_paths:
-            print("⚠️  No chips remaining after cropping. Merge aborted.")
+            print("No chips remaining after cropping. Merge aborted.")
             return
 
         print("Building VRT for merging cropped chips...")
@@ -478,7 +500,7 @@ def merge_warped_chips_gdal(
         )
         gdal.BuildVRT(merged_vrt_path, cropped_chip_paths, options=vrt_build_opts)
 
-        print(f"Translating merged VRT to final COG: {final_output_path} …")
+        print(f"Translating merged VRT to final COG: {final_output_path} ...")
         output_dir = os.path.dirname(final_output_path)
         if output_dir: # Ensure output directory exists
             os.makedirs(output_dir, exist_ok=True)
@@ -509,20 +531,20 @@ def merge_warped_chips_gdal(
 
 def calculate_chip_crs_parameters_gdal(
     parent_raster_path: str,
-    target_chip_width_px: int, # e.g., TARGET_SIZE[1] from script
-    target_chip_height_px: int, # e.g., TARGET_SIZE[0] from script
+    target_total_chip_width_px: int, # e.g., TARGET_SIZE[1] from script (TOTAL width)
+    target_total_chip_height_px: int, # e.g., TARGET_SIZE[0] from script (TOTAL height)
     buffer_fraction_of_core: float # e.g., BUFFER_FRAC from script
 ) -> Tuple[float, float, float, float, float, float]:
     """
     Calculates chip core dimensions and buffer sizes in CRS units, plus pixel resolutions.
     Args:
         parent_raster_path: Path to the main raster (e.g., unregistered survey).
-        target_chip_width_px: Desired width of the core chip area in pixels.
-        target_chip_height_px: Desired height of the core chip area in pixels.
+        target_total_chip_width_px: Desired total width of the chip (core + 2*buffer) in pixels.
+        target_total_chip_height_px: Desired total height of the chip (core + 2*buffer) in pixels.
         buffer_fraction_of_core: Fraction of core dimension to use as buffer on each side.
     Returns:
-        Tuple: (actual_core_w_crs, actual_core_h_crs, 
-                buffer_to_add_w_crs, buffer_to_add_h_crs, 
+        Tuple: (actual_core_w_crs, actual_core_h_crs,
+                buffer_to_add_w_crs, buffer_to_add_h_crs,
                 res_x, res_y)
     """
     with rasterio.open(parent_raster_path) as src:
@@ -530,17 +552,32 @@ def calculate_chip_crs_parameters_gdal(
         res_x = abs(src.transform.a) # Pixel width in CRS units
         res_y = abs(src.transform.e) # Pixel height in CRS units
 
-    actual_core_w_crs = target_chip_width_px * res_x
-    actual_core_h_crs = target_chip_height_px * res_y
-    
+    if res_x == 0 or res_y == 0:
+        raise ValueError("Raster resolution (x or y) is zero. Cannot calculate chip dimensions.")
+
+    # Calculate core dimensions in pixels based on total and buffer fraction
+    # T_w = C_w + 2 * (C_w * B_f) = C_w * (1 + 2 * B_f) => C_w = T_w / (1 + 2 * B_f)
+    core_chip_width_px = target_total_chip_width_px / (1 + 2 * buffer_fraction_of_core)
+    core_chip_height_px = target_total_chip_height_px / (1 + 2 * buffer_fraction_of_core)
+
+    if core_chip_width_px <= 0 or core_chip_height_px <= 0:
+        raise ValueError(
+            f"Calculated non-positive core pixel dimensions: {core_chip_width_px:.2f}w x {core_chip_height_px:.2f}h. "
+            f"Check target_total_chip dimensions ({target_total_chip_width_px}w, {target_total_chip_height_px}h) "
+            f"and buffer_fraction ({buffer_fraction_of_core}). Ensure total is large enough relative to buffer."
+        )
+
+    actual_core_w_crs = core_chip_width_px * res_x
+    actual_core_h_crs = core_chip_height_px * res_y
+
     if actual_core_w_crs <= 0:
-        raise ValueError("Target chip width results in non-positive core CRS width. Check target_chip_width_px and raster resolution.")
+        raise ValueError("Target chip width results in non-positive core CRS width. Check target_total_chip_width_px and raster resolution.")
     if actual_core_h_crs <= 0:
-        raise ValueError("Target chip height results in non-positive core CRS height. Check target_chip_height_px and raster resolution.")
-        
+        raise ValueError("Target chip height results in non-positive core CRS height. Check target_total_chip_height_px and raster resolution.")
+
     buffer_to_add_w_crs = buffer_fraction_of_core * actual_core_w_crs
     buffer_to_add_h_crs = buffer_fraction_of_core * actual_core_h_crs
-    
+
     return actual_core_w_crs, actual_core_h_crs, buffer_to_add_w_crs, buffer_to_add_h_crs, res_x, res_y
 
 def register_survey_by_chips(
@@ -548,8 +585,8 @@ def register_survey_by_chips(
     reg_reference_path: str,
     output_registered_survey_path: str,
     # NEW: Parameters for chip dimension calculation
-    target_chip_width_px: int = 640,
-    target_chip_height_px: int = 480,
+    target_total_chip_width_px: int = 640,
+    target_total_chip_height_px: int = 480,
     buffer_fraction_of_core: float = 0.1,
     # Processing parameters
     device_for_loftr: str = 'cpu',
@@ -567,11 +604,39 @@ def register_survey_by_chips(
     gdal_polynomial_order: int = 3,
     gdal_resampling_algorithm: str = "cubic", # e.g., "cubic", "bilinear", "near"
     gdal_src_nodata: Optional[float]=0, # Nodata in source chips before warp
-    gdal_dst_nodata: Optional[float]=0  # Nodata for warped chips and final output
+    gdal_dst_nodata: Optional[float]=0,  # Nodata for warped chips and final output
+    output_stats_raster_path: Optional[str] = None, # Path for the 3-band stats raster (inliers, reproj_thresh, ransac_conf)
+    debug_output_dir_for_warped_chips: Optional[str] = None # NEW: Directory to save individual warped chips before merge for debugging
 ):
     """
     Registers an unregistered survey raster to a registered reference raster using a chip-based
     approach with LoFTR for feature matching and GDAL for warping and merging.
+
+    Args:
+        unreg_survey_path: Path to the unregistered survey raster.
+        reg_reference_path: Path to the registered reference raster.
+        output_registered_survey_path: Path to save the final registered survey.
+        target_total_chip_width_px: Desired total width of the chip (core + 2*buffer) in pixels.
+        target_total_chip_height_px: Desired total height of the chip (core + 2*buffer) in pixels.
+        buffer_fraction_of_core: Fraction of core dimension to use as buffer on each side.
+        device_for_loftr: Device for LoFTR model ('cpu', 'cuda', 'mps').
+        max_loader_workers: Maximum number of workers for loading chips concurrently.
+        loftr_batch_size: Batch size for LoFTR inference.
+        processing_chunk_size: Number of grid points to process in one major cycle.
+        loftr_model_name: Pretrained LoFTR model name (e.g., 'outdoor').
+        target_size_hw_for_loftr_preprocessing: Target (H,W) for LoFTR input image resizing.
+        min_loftr_matches_for_fundamental_matrix: Minimum matches needed for Fundamental Matrix estimation.
+        loftr_reproj_threshold_px_levels_in_resized_space: RANSAC reprojection thresholds for LoFTR (in resized space).
+        ransac_confidence_levels_for_fm: Confidence levels for RANSAC Fundamental Matrix estimation.
+        min_gcps_for_warp: Minimum number of GCPs to attempt warping a chip (Note: effective minimum is based on polynomial_order).
+        gdal_polynomial_order: Polynomial order for GDAL warp.
+        gdal_resampling_algorithm: GDAL resampling algorithm for warp.
+        gdal_src_nodata: Nodata value in source chips.
+        gdal_dst_nodata: Nodata value for warped chips and final output.
+        output_stats_raster_path: Optional path to save a 3-band raster with LoFTR match statistics.
+        debug_output_dir_for_warped_chips: If provided, individual warped chips (before cropping and merging)
+                                           will be saved to this directory for inspection. The directory will be created if it doesn't exist.
+                                           These chips will not be automatically deleted.
     """
     gdal.UseExceptions() # Ensure GDAL exceptions are enabled
 
@@ -579,22 +644,29 @@ def register_survey_by_chips(
     print(f"  Unregistered: {unreg_survey_path}")
     print(f"  Reference: {reg_reference_path}")
     print(f"  Output: {output_registered_survey_path}")
+    if output_stats_raster_path:
+        print(f"  Stats Raster: {output_stats_raster_path}")
+
+    # Handle debug directory for warped chips
+    if debug_output_dir_for_warped_chips:
+        os.makedirs(debug_output_dir_for_warped_chips, exist_ok=True)
+        print(f"  Debug: Individual warped chips (pre-cropping) will be saved to: {debug_output_dir_for_warped_chips}")
 
     # Calculate chip CRS parameters internally
-    print("⏳ Calculating chip CRS parameters...")
+    print("Calculating chip CRS parameters...")
     try:
         core_chip_width_crs, core_chip_height_crs, \
         buffer_width_crs, buffer_height_crs, \
         pix_x_res, pix_y_res = calculate_chip_crs_parameters_gdal(
             parent_raster_path=unreg_survey_path,
-            target_chip_width_px=target_chip_width_px,
-            target_chip_height_px=target_chip_height_px,
+            target_total_chip_width_px=target_total_chip_width_px,
+            target_total_chip_height_px=target_total_chip_height_px,
             buffer_fraction_of_core=buffer_fraction_of_core
         )
-        print("💡 Computed chip dimensions (CRS units):")
-        print(f"    Core size: {core_chip_width_crs:.2f}w × {core_chip_height_crs:.2f}h")
-        print(f"    Buffer to add (each side): {buffer_width_crs:.2f}w × {buffer_height_crs:.2f}h")
-        print(f"    Pixel resolution: {pix_x_res:.4f} (x), {pix_y_res:.4f} (y)\n")
+        print("Computed chip dimensions (CRS units):")
+        print(f"    Core size: {core_chip_width_crs:.2f}w x {core_chip_height_crs:.2f}h")
+        print(f"    Buffer to add (each side): {buffer_width_crs:.2f}w x {buffer_height_crs:.2f}h")
+        print(f"    Pixel resolution: {pix_x_res:.4f} (x), {pix_y_res:.4f} (y)\\n")
     except FileNotFoundError:
         print(f"Error: Unregistered raster not found at {unreg_survey_path}. Cannot calculate parameters.")
         print("Please ensure the unreg_survey_path is a valid path or URL accessible by rasterio.")
@@ -609,6 +681,73 @@ def register_survey_by_chips(
     if grid_gdf.empty:
         print("No grid points generated. Check chip dimensions and survey extent. Aborting.")
         return
+
+    # Determine actual chip grid dimensions from the generated points
+    num_chip_cols = 0
+    num_chip_rows = 0
+    if not grid_gdf.empty:
+        # Sort unique coordinates to ensure consistent ordering for num_chip_rows/cols
+        # unique_x_coords = np.sort(grid_gdf.geometry.x.unique())
+        # unique_y_coords = np.sort(grid_gdf.geometry.y.unique()) # Sorted bottom-to-top
+        # num_chip_cols = len(unique_x_coords)
+        # num_chip_rows = len(unique_y_coords)
+
+        # A more direct way to get counts if grid is regular and fully populated by generate_grid_points_chip
+        # This assumes generate_grid_points_chip fills out a complete grid based on its arange steps.
+        with rasterio.open(unreg_survey_path) as src_main_raster: # Re-open to get bounds for arange logic
+            left_bound, bottom_bound, right_bound, top_bound = src_main_raster.bounds
+        
+        # Estimate number of x points (columns)
+        xs_for_count = np.arange(left_bound + core_chip_width_crs / 2, right_bound, core_chip_width_crs)
+        num_chip_cols = len(xs_for_count)
+        
+        # Estimate number of y points (rows)
+        ys_for_count = np.arange(bottom_bound + core_chip_height_crs / 2, top_bound, core_chip_height_crs)
+        num_chip_rows = len(ys_for_count)
+
+    if num_chip_cols == 0 or num_chip_rows == 0:
+        print("Warning: Effective chip grid has 0 columns or 0 rows. Stats raster will not be generated.")
+        output_stats_raster_path = None # Disable stats raster
+
+    # Initialize stats raster if path is provided
+    stats_grid = None
+    stats_raster_transform = None
+    stats_raster_crs = None
+    # num_grid_cols_for_stats_raster = 0 # Replaced by num_chip_cols
+
+    if output_stats_raster_path: # Check if still enabled
+        try:
+            with rasterio.open(unreg_survey_path) as src:
+                unreg_bounds_for_origin = src.bounds # Used for left origin, top might be adjusted
+                stats_raster_crs = src.crs
+                
+                # Use num_chip_rows and num_chip_cols for stats_grid dimensions
+                if num_chip_cols <= 0 or num_chip_rows <= 0: # Should have been caught above
+                    print("Warning: Calculated zero or negative dimensions for stats raster based on chip grid. Skipping its creation.")
+                    output_stats_raster_path = None # Disable further processing
+                else:
+                    # Initialize 3-band float32 grid with np.nan as nodata
+                    # Band 0: Inlier count
+                    # Band 1: Used LoFTR reprojection threshold
+                    # Band 2: Used RANSAC confidence
+                    stats_grid = np.full((3, num_chip_rows, num_chip_cols),
+                                           np.nan, dtype=np.float32)
+                    
+                    # Calculate the actual top Y-coordinate of the chip grid.
+                    # ys_for_count contains y-centroids from bottom to top.
+                    # The top-most y-centroid is ys_for_count[num_chip_rows - 1].
+                    # The top edge of this top-most row of chips is centroid_y + half_cell_height.
+                    actual_grid_top_y = ys_for_count[num_chip_rows - 1] + (core_chip_height_crs / 2.0)
+                    
+                    # Transform defines top-left of cell (0,0) of stats_grid and pixel size
+                    stats_raster_transform = Affine(core_chip_width_crs, 0.0, unreg_bounds_for_origin.left,
+                                                     0.0, -core_chip_height_crs, actual_grid_top_y) # Use actual_grid_top_y
+                    print(f"Initialized stats raster: 3 bands, {num_chip_rows}h x {num_chip_cols}w, cell_size=({core_chip_width_crs:.2f}, {core_chip_height_crs:.2f}) CRS units, top_y_origin={actual_grid_top_y:.2f}")
+
+        except Exception as e:
+            print(f"Error initializing stats raster: {e}. It will not be created.")
+            output_stats_raster_path = None 
+            stats_grid = None
 
     # List to collect paths and metadata of successfully warped (and buffered) chips for merging
     warped_chips_for_merge_all_chunks: List[Tuple[str, Tuple[float,float,float,float], Tuple[float,float]]] = [] 
@@ -626,6 +765,12 @@ def register_survey_by_chips(
 
     with tempfile.TemporaryDirectory() as main_processing_tmpdir:
         num_chunks = (len(grid_gdf) + processing_chunk_size - 1) // processing_chunk_size
+
+        # Determine the actual path to save individual warped chips
+        if debug_output_dir_for_warped_chips:
+            path_to_save_individual_warped_chips = debug_output_dir_for_warped_chips
+        else:
+            path_to_save_individual_warped_chips = main_processing_tmpdir
 
         for chunk_idx in tqdm(range(num_chunks), desc="Total Progress (Chunks)", unit="chunk", position=0):
             chunk_start_idx = chunk_idx * processing_chunk_size
@@ -658,11 +803,11 @@ def register_survey_by_chips(
                                                                'un_chip': un_chip_obj, 
                                                                'reg_chip': reg_chip_obj})
                     except Exception as e:
-                        tqdm.write(f"⚠️  Load failure for chip id {original_idx} in chunk {chunk_idx+1}: {e}")
+                        tqdm.write(f"Load failure for chip id {original_idx} in chunk {chunk_idx+1}: {e}")
                         total_errors_in_processing +=1
             
             if not loaded_chips_data_current_chunk:
-                tqdm.write(f"❌  No chips successfully loaded for chunk {chunk_idx+1}. Skipping.")
+                tqdm.write(f"No chips successfully loaded for chunk {chunk_idx+1}. Skipping.")
                 continue
             
             # Sort by ID to maintain order if needed, though map lookup is used later
@@ -686,6 +831,44 @@ def register_survey_by_chips(
             )
             # Create a map for quick lookup of match results by original_id
             matches_map_for_chunk = {match_res['id']: match_res for match_res in loftr_matches_results_chunk}
+
+            # Populate stats grid for this chunk if enabled
+            if output_stats_raster_path and stats_grid is not None and num_chip_cols > 0 and num_chip_rows > 0:
+                for loaded_chip_info_for_stats in loaded_chips_data_current_chunk:
+                    original_idx = loaded_chip_info_for_stats['id'] # Index in the full grid_gdf
+                    match_data = matches_map_for_chunk.get(original_idx)
+                    
+                    # original_idx corresponds to the chip's position in the grid generated by
+                    # iterating y from bottom-to-top, then x from left-to-right.
+                    # num_chip_cols is the number of x-points in each row of chips.
+                    
+                    chip_col_idx_from_left = original_idx % num_chip_cols
+                    chip_row_idx_from_bottom = original_idx // num_chip_cols
+
+                    # The stats_grid numpy array is indexed (bands, row_from_top, col_from_left).
+                    # Convert chip_row_idx_from_bottom to stats_grid_row_idx_from_top.
+                    stats_grid_row_idx = (num_chip_rows - 1) - chip_row_idx_from_bottom
+                    stats_grid_col_idx = chip_col_idx_from_left
+
+
+                    if 0 <= stats_grid_row_idx < num_chip_rows and \
+                       0 <= stats_grid_col_idx < num_chip_cols:
+                        if match_data:
+                            num_inliers = float(match_data['inliers'].sum())
+                            used_thresh = match_data.get('used_reproj_thresh', np.nan)
+                            used_conf = match_data.get('used_ransac_confidence', np.nan)
+
+                            stats_grid[0, stats_grid_row_idx, stats_grid_col_idx] = num_inliers
+                            stats_grid[1, stats_grid_row_idx, stats_grid_col_idx] = used_thresh
+                            stats_grid[2, stats_grid_row_idx, stats_grid_col_idx] = used_conf
+                        # Else: cells remain np.nan (initialized value) if no match_data or chip failed earlier
+                    else:
+                        # This warning indicates an issue with indexing logic or num_chip_rows/cols calculation relative to original_idx range.
+                        tqdm.write(f"Warning: Calculated out-of-bounds index for stats grid. Chip ID: {original_idx}, "
+                                   f"Target stats_grid_idx: ({stats_grid_row_idx}, {stats_grid_col_idx}). "
+                                   f"Stats grid dims: ({num_chip_rows}h, {num_chip_cols}w). "
+                                   f"Chip row_from_bottom: {chip_row_idx_from_bottom}, chip_col_from_left: {chip_col_idx_from_left}.")
+
 
             # 3. Generate GCPs and Warp chips for the current chunk
             chunk_successful_warps = 0
@@ -764,7 +947,7 @@ def register_survey_by_chips(
                     # Define output path for this warped chip (in the main temporary directory)
                     # Base name from original grid index to ensure uniqueness
                     warped_chip_filename = f"warped_chip_{original_idx}.tif"
-                    output_path_for_this_warped_chip = os.path.join(main_processing_tmpdir, warped_chip_filename)
+                    output_path_for_this_warped_chip = os.path.join(path_to_save_individual_warped_chips, warped_chip_filename)
                     
                     warp_chip_gdal(un_chip_to_warp, gcp_list_for_warp, output_path_for_this_warped_chip,
                                    polynomial_order=poly_order_for_this_chip, # Use the dynamically determined order
@@ -787,7 +970,7 @@ def register_survey_by_chips(
                     )
 
                 except Exception as e_warp:
-                    tqdm.write(f"Chip {original_idx}: ERROR during warping in chunk {chunk_idx+1} — {e_warp}")
+                    tqdm.write(f"Chip {original_idx}: ERROR during warping in chunk {chunk_idx+1} - {e_warp}")
                     chunk_errors += 1
             
             # Aggregate chunk stats to totals
@@ -826,9 +1009,34 @@ def register_survey_by_chips(
                                    )
             print(f"Registration process complete. Output at: {output_registered_survey_path}")
         else:
-            print("⚠️  No chips were successfully warped. Final output raster will not be created.")
+            print("No chips were successfully warped. Final output raster will not be created.")
             pass # Or raise an error / return a status
 
-    
-
+    # Save the stats raster if it was generated
+    if output_stats_raster_path and stats_grid is not None and stats_raster_transform and stats_raster_crs:
+        print(f"\nSaving stats raster to: {output_stats_raster_path}")
+        try:
+            with rasterio.open(
+                output_stats_raster_path,
+                'w',
+                driver='GTiff',
+                height=stats_grid.shape[1],
+                width=stats_grid.shape[2],
+                count=3, # 3 bands
+                dtype=stats_grid.dtype, # np.float32
+                crs=stats_raster_crs,
+                transform=stats_raster_transform,
+                nodata=np.nan, # Nodata value for all bands
+                compress='lzw',
+                predictor=2
+            ) as dst:
+                dst.write(stats_grid) # Writes all 3 bands
+                dst.set_band_description(1, "Inlier Count")
+                dst.set_band_description(2, "LoFTR Reprojection Threshold (px in resized space)")
+                dst.set_band_description(3, "RANSAC Confidence")
+            print("Stats raster saved successfully.")
+        except Exception as e:
+            print(f"Error saving stats raster: {e}")
+    elif output_stats_raster_path: # Path was given, but something went wrong
+        print(f"Stats raster was requested but not generated/saved due to earlier issues.")
 
