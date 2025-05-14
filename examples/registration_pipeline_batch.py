@@ -25,7 +25,9 @@ import concurrent.futures
 import threading
 import pandas as pd
 
+device = 'mps'
 
+matcher = KF.LoFTR(pretrained='outdoor').to(device).eval()
 
 def get_bbox_bounds(point_gdf, width_length, height_length=None, buffer=0):
     """
@@ -167,36 +169,36 @@ def resize_for_matching(img_array, target_size=(512, 512)):
     
     return resized_array, (w_scale, h_scale)
 
-def apply_clahe_to_grayscale_batch(img_tensor: torch.Tensor,
-                                    clip_limit: float = 2.0,
-                                    tile_grid_size: tuple = (8, 8)) -> torch.Tensor:
-    """
-    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to a batch of RGB images
-    after converting them to grayscale using Kornia.
+# def apply_clahe_to_grayscale_batch(img_tensor: torch.Tensor,
+#                                     clip_limit: float = 2.0,
+#                                     tile_grid_size: tuple = (8, 8)) -> torch.Tensor:
+#     """
+#     Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to a batch of RGB images
+#     after converting them to grayscale using Kornia.
 
-    Args:
-        img_tensor (torch.Tensor): RGB image batch tensor of shape (B, 3, H, W), float32 in [0, 1].
-        clip_limit (float): CLAHE clip limit.
-        tile_grid_size (tuple): Size of grid for histogram equalization (tiles in x and y).
+#     Args:
+#         img_tensor (torch.Tensor): RGB image batch tensor of shape (B, 3, H, W), float32 in [0, 1].
+#         clip_limit (float): CLAHE clip limit.
+#         tile_grid_size (tuple): Size of grid for histogram equalization (tiles in x and y).
 
-    Returns:
-        torch.Tensor: CLAHE-enhanced grayscale image batch tensor of shape (B, 1, H, W), float32 in [0, 1].
-    """
-    assert img_tensor.dim() == 4 and img_tensor.shape[1] == 3, "Input must be RGB batch (B, 3, H, W)"
+#     Returns:
+#         torch.Tensor: CLAHE-enhanced grayscale image batch tensor of shape (B, 1, H, W), float32 in [0, 1].
+#     """
+#     assert img_tensor.dim() == 4 and img_tensor.shape[1] == 3, "Input must be RGB batch (B, 3, H, W)"
 
-    # Convert to grayscale with Kornia
-    grayscale = K.color.rgb_to_grayscale(img_tensor)  # (B, 1, H, W)
+#     # Convert to grayscale with Kornia
+#     grayscale = K.color.rgb_to_grayscale(img_tensor)  # (B, 1, H, W)
 
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-    enhanced = []
+#     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+#     enhanced = []
 
-    for img in grayscale:
-        img_np = (img.squeeze().cpu().numpy() * 255).astype('uint8')  # shape: (H, W)
-        cl_img = clahe.apply(img_np)
-        cl_tensor = torch.tensor(cl_img, dtype=torch.float32).div(255).unsqueeze(0)  # shape: (1, H, W)
-        enhanced.append(cl_tensor)
+#     for img in grayscale:
+#         img_np = (img.squeeze().cpu().numpy() * 255).astype('uint8')  # shape: (H, W)
+#         cl_img = clahe.apply(img_np)
+#         cl_tensor = torch.tensor(cl_img, dtype=torch.float32).div(255).unsqueeze(0)  # shape: (1, H, W)
+#         enhanced.append(cl_tensor)
 
-    return torch.stack(enhanced)  # shape: (B, 1, H, W)
+#     return torch.stack(enhanced)  # shape: (B, 1, H, W)
 
 def batch_get_loftr_matches(img1_batch, img2_batch, device: str = 'cpu', target_size=(480, 640), #note H X W
                             loftr_space_reproj_threshold_levels: list[float] = [0.5, 0.75, 1.0, 2.0],
@@ -223,7 +225,7 @@ def batch_get_loftr_matches(img1_batch, img2_batch, device: str = 'cpu', target_
         return []
     
     # Initialize LoFTR matcher once for the batch
-    matcher = KF.LoFTR(pretrained='outdoor').to(device).eval()
+    #matcher = KF.LoFTR(pretrained='outdoor').to(device).eval()
     input_batch_size = len(img1_batch)
     results = []
     
@@ -242,8 +244,8 @@ def batch_get_loftr_matches(img1_batch, img2_batch, device: str = 'cpu', target_
             # Convert to tensor
             img_tensor = rasterio_to_torch_tensor(img_resized).float().div(255.0)
             # Convert to grayscale
-            #img_gray = K.color.rgb_to_grayscale(img_tensor)
-            img_gray = apply_clahe_to_grayscale_batch(img_tensor)
+            img_gray = K.color.rgb_to_grayscale(img_tensor)
+            #img_gray = apply_clahe_to_grayscale_batch(img_tensor)
             return img_gray, img_scale_factors
         
         # Submit all preprocessing tasks
@@ -861,7 +863,7 @@ def calculate_chip_crs_parameters(
 
 
 # Example usage
-device = 'mps'
+#device = 'mps'
 max_workers = 10
 batch_size = 20
 

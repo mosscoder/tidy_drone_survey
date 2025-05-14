@@ -25,8 +25,9 @@ LOFTR_DEVICE = 'mps'
 LOFTR_TARGET_SIZE = (480, 640) # As used in batch_get_loftr_matches
 LOFTR_REPROJ_THRESHOLDS = [0.5, 0.75, 1.0, 2.0] # As used in batch_get_loftr_matches
 
-TARGET_FEATURE_INDEX = 3140 # Set this to an integer (e.g., 0, 1, 2...) to debug a specific feature by its index in the GeoJSON
-TARGET_IDX_VALUE = 2100 # Set this to an integer to debug a specific feature by its 'idx' field value
+# --- Manual Coordinate Input (Overrides GeoJSON lookup if both X and Y are set) ---
+MANUAL_X_COORD = 255638.35
+MANUAL_Y_COORD = 282915.27
 
 # --- Helper Functions (Copied/adapted from registration_pipeline_batch.py) ---
 
@@ -190,21 +191,50 @@ def save_matches_visualization(
     img2_bgr = convert_to_bgr_for_draw(img2_u8)
 
     # 4. Filter keypoints by inliers
-    mkpts1_inliers = mkpts1[inliers_mask]
-    mkpts2_inliers = mkpts2[inliers_mask]
+    mkpts1_all_inliers = mkpts1[inliers_mask]
+    mkpts2_all_inliers = mkpts2[inliers_mask]
 
-    # 5. Convert keypoints to cv2.KeyPoint objects
-    kp1 = [cv2.KeyPoint(p[0], p[1], 10) for p in mkpts1_inliers] # size=10 for visibility
-    kp2 = [cv2.KeyPoint(p[0], p[1], 10) for p in mkpts2_inliers]
+    num_all_inliers = mkpts1_all_inliers.shape[0]
 
-    # 6. Create DMatch objects
-    matches = [cv2.DMatch(i, i, 0) for i in range(len(kp1))]
-
-    if not matches:
+    if num_all_inliers == 0:
         print(f"  No inlier matches to draw for {filename_prefix}.")
         # Optionally, save individual images if no matches
         # cv2.imwrite(f"{filename_prefix}_img1_no_matches.png", img1_bgr)
         # cv2.imwrite(f"{filename_prefix}_img2_no_matches.png", img2_bgr)
+        return
+
+    # --- START: Sample 10% of inliers for plotting ---
+    sample_size_plot = int(num_all_inliers * 0.1)
+    if sample_size_plot == 0 and num_all_inliers > 0:
+        sample_size_plot = 1 # Ensure at least one inlier is plotted if there are any
+
+    if sample_size_plot > 0 and sample_size_plot < num_all_inliers:
+        print(f"  Plotting a random sample of {sample_size_plot} inlier(s) (10% of total {num_all_inliers} inliers).")
+        # Generate random indices to select a subset of inliers
+        # Ensure random_state for reproducibility if desired, or remove for different samples each run
+        # We need to import numpy if it's not available here, but it should be via global imports.
+        random_indices = np.random.choice(num_all_inliers, size=sample_size_plot, replace=False)
+        mkpts1_sampled_inliers = mkpts1_all_inliers[random_indices]
+        mkpts2_sampled_inliers = mkpts2_all_inliers[random_indices]
+    else:
+        # If sample_size_plot is 0 (shouldn't happen if num_all_inliers > 0 due to above check)
+        # or if 10% is >= total inliers (e.g. less than 10 inliers total), plot all of them.
+        print(f"  Plotting all {num_all_inliers} inlier(s) (10% sample is >= total inliers or no inliers).")
+        mkpts1_sampled_inliers = mkpts1_all_inliers
+        mkpts2_sampled_inliers = mkpts2_all_inliers
+    # --- END: Sample 10% of inliers for plotting ---
+
+    # 5. Convert SAMPLED keypoints to cv2.KeyPoint objects
+    kp1 = [cv2.KeyPoint(p[0], p[1], 10) for p in mkpts1_sampled_inliers] # size=10 for visibility
+    kp2 = [cv2.KeyPoint(p[0], p[1], 10) for p in mkpts2_sampled_inliers]
+
+    # 6. Create DMatch objects for the SAMPLED keypoints
+    matches = [cv2.DMatch(i, i, 0) for i in range(len(kp1))]
+
+    # This check might now be redundant given the num_all_inliers check above, 
+    # but kept for safety if matches list could be empty for other reasons.
+    if not matches:
+        print(f"  No sampled inlier matches to draw for {filename_prefix} (this might indicate an issue with sampling logic).")
         return
 
     # 7. Draw matches
@@ -343,65 +373,74 @@ if __name__ == "__main__":
     print(f"Loaded {len(stats_gdf)} chip records.")
 
     chips_to_process_gdf = None
+    manual_coords_provided = False
 
-    if TARGET_IDX_VALUE is not None:
-        print(f"Attempting to debug specific feature with idx: {TARGET_IDX_VALUE}")
-        # Find the chip by its 'idx' field value
-        target_chip_gdf = stats_gdf[stats_gdf['idx'] == TARGET_IDX_VALUE]
-        if not target_chip_gdf.empty:
-            chips_to_process_gdf = target_chip_gdf
-            selected_chip_data = chips_to_process_gdf.iloc[0] # Get the Series for checking inlier count
-            # The gdf_idx for this chip will be its original index in stats_gdf
-            original_gdf_idx = chips_to_process_gdf.index[0]
-            print(f"  Found chip with idx {TARGET_IDX_VALUE} at GeoJSON feature index {original_gdf_idx}.")
-            if selected_chip_data['inlier_count'] > 0:
-                print(f"  INFO: Chip with idx {TARGET_IDX_VALUE} (original script idx: {selected_chip_data['idx']}) has {selected_chip_data['inlier_count']} inliers, not 0. Proceeding with debug anyway.")
-        else:
-            print(f"  ERROR: Feature with idx {TARGET_IDX_VALUE} not found in the GeoJSON.")
-            chips_to_process_gdf = gpd.GeoDataFrame([]) # Empty GeoDataFrame
-    # Fallback to old TARGET_FEATURE_INDEX logic if TARGET_IDX_VALUE is not set or not found,
-    # or remove this if TARGET_IDX_VALUE is the sole method for specific targeting.
-    # For now, let's prioritize TARGET_IDX_VALUE and then fall back to 0-inlier search if not used.
-    elif TARGET_FEATURE_INDEX is not None: # This block can be kept for legacy or removed
-        print(f"Attempting to debug specific feature at index: {TARGET_FEATURE_INDEX} (TARGET_IDX_VALUE not set or not found)")
-        if 0 <= TARGET_FEATURE_INDEX < len(stats_gdf):
-            chips_to_process_gdf = stats_gdf.iloc[[TARGET_FEATURE_INDEX]]
-            selected_chip_data = chips_to_process_gdf.iloc[0]
-            if selected_chip_data['inlier_count'] > 0:
-                print(f"  INFO: Chip at feature index {TARGET_FEATURE_INDEX} (original script idx: {selected_chip_data['idx']}) has {selected_chip_data['inlier_count']} inliers, not 0. Proceeding with debug anyway.")
-        else:
-            print(f"  ERROR: Feature index {TARGET_FEATURE_INDEX} is out of bounds (0 to {len(stats_gdf) - 1}).")
-            chips_to_process_gdf = gpd.GeoDataFrame([])
+    if MANUAL_X_COORD is not None and MANUAL_Y_COORD is not None:
+        print(f"Attempting to debug using manually provided coordinates: X={MANUAL_X_COORD}, Y={MANUAL_Y_COORD}")
+        manual_point = Point(MANUAL_X_COORD, MANUAL_Y_COORD)
+        # We need the CRS from the GeoJSON to create a valid GeoDataFrame
+        # If stats_gdf is empty or CRS is None, we might have an issue, but let's assume it's usually populated.
+        # A default CRS might be needed if GEOJSON_PATH is also optional or could be invalid.
+        geojson_crs = stats_gdf.crs
+        if geojson_crs is None:
+            print("  Warning: Could not determine CRS from GeoJSON. Assuming WGS84 (EPSG:4326) for manual point. This might be incorrect.")
+            geojson_crs = "EPSG:4326"
+
+        chips_to_process_gdf = gpd.GeoDataFrame({
+            'geometry': [manual_point],
+            'idx': [-1], # Placeholder idx for manual input
+            'inlier_count': [-1] # Placeholder inlier_count
+        }, crs=geojson_crs)
+        manual_coords_provided = True
+        # gdf_idx will be 0 for this single manual entry
+        # chip_original_script_idx will be -1
+
     else:
-        print("No specific feature targeted by idx or index. Looking for chips with 0 inliers...")
+        print("No specific feature targeted. Looking for chips with 0 inliers...")
         failing_chips = stats_gdf[stats_gdf['inlier_count'] == 0]
         print(f"Found {len(failing_chips)} chips with 0 inliers.")
         if failing_chips.empty:
             print("No failing chips with 0 inliers found to debug.")
             chips_to_process_gdf = gpd.GeoDataFrame([]) # Empty GeoDataFrame
         else:
-            # Debug the first few failing chips if no specific target
-            num_chips_to_debug = min(3, len(failing_chips))
-            chips_to_process_gdf = failing_chips.head(num_chips_to_debug)
-            print(f"Will debug the first {len(chips_to_process_gdf)} of them.")
+            # Sample 10% of the failing chips
+            sample_size = int(len(failing_chips) * 0.1)
+            if sample_size == 0 and len(failing_chips) > 0:
+                sample_size = 1 # Ensure at least one chip is processed if there are any failing chips
+
+            if sample_size > 0:
+                chips_to_process_gdf = failing_chips.sample(n=sample_size, random_state=42) # Added random_state for reproducibility
+                print(f"Will debug a random sample of {len(chips_to_process_gdf)} chip(s) (10% of failing, or at least 1).")
+            else: # This case should ideally not be hit if len(failing_chips) > 0 due to the check above
+                print("No chips to sample after calculating 10%.")
+                chips_to_process_gdf = gpd.GeoDataFrame([])
 
 
     if chips_to_process_gdf.empty:
         print("No chips selected for debugging.")
     else:
         for gdf_idx, chip_data_series in chips_to_process_gdf.iterrows():
-            # gdf_idx is the index from the GeoDataFrame (which corresponds to TARGET_FEATURE_INDEX if set)
+            # gdf_idx is the index from the GeoDataFrame (which corresponds to TARGET_FEATURE_INDEX if set, or 0 for manual)
             # chip_data_series is the Series containing data for that row
-            
-            chip_original_script_idx = chip_data_series['idx'] # The 'idx' field from your stats file
+
+            chip_original_script_idx = chip_data_series['idx'] # The 'idx' field from your stats file, or -1 for manual
             centroid_geom = chip_data_series.geometry
-            
-            print(f"\n--- Debugging Chip (Feature Index in GeoJSON: {gdf_idx}, Original Script Idx: {chip_original_script_idx}) ---")
-            print(f"Centroid: {centroid_geom.x}, {centroid_geom.y}")
-            print(f"Reported inlier_count in GeoJSON: {chip_data_series['inlier_count']}")
+
+            if manual_coords_provided:
+                print(f"\n--- Debugging Manually Specified Area ---")
+                print(f"Centroid (Manual): {centroid_geom.x}, {centroid_geom.y}")
+            else:
+                print(f"\n--- Debugging Chip (Feature Index in GeoJSON: {gdf_idx}, Original Script Idx: {chip_original_script_idx}) ---")
+                print(f"Centroid: {centroid_geom.x}, {centroid_geom.y}")
+                print(f"Reported inlier_count in GeoJSON: {chip_data_series['inlier_count']}")
 
             # Create a GeoDataFrame for the single point for load_chips_for_debug
-            point_gdf = gpd.GeoDataFrame({'geometry': [centroid_geom]}, crs=stats_gdf.crs)
+            # For manual input, chips_to_process_gdf is already the correct single-row GDF with the manual point.
+            # For other cases, we extract the point to create a new GDF. This logic needs to be clean.
+            if manual_coords_provided:
+                point_gdf = chips_to_process_gdf # It's already the one we want
+            else:
+                point_gdf = gpd.GeoDataFrame({'geometry': [centroid_geom]}, crs=stats_gdf.crs)
 
             print("Loading chip image data...")
             try:
@@ -443,15 +482,15 @@ if __name__ == "__main__":
                             mkpts_reg,
                             mkpts_unreg,
                             inliers,
-                            f"debug_chip_{chip_original_script_idx}"
+                            f"debug_chip_{'manual' if manual_coords_provided else chip_original_script_idx}"
                         )
                     elif inliers is not None:
-                         print(f"  No inliers found for chip {chip_original_script_idx}, skipping match visualization.")
+                         print(f"  No inliers found for chip {'manual' if manual_coords_provided else chip_original_script_idx}, skipping match visualization.")
 
                 else:
                     print("  LoFTR analysis skipped due to black image or other error.")
 
             except Exception as e:
-                print(f"  ERROR processing chip {chip_original_script_idx}: {e}")
+                print(f"  ERROR processing chip {'manual' if manual_coords_provided else chip_original_script_idx}: {e}")
                 import traceback
                 traceback.print_exc()
