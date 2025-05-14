@@ -23,6 +23,7 @@ import uuid
 import time
 import concurrent.futures
 import threading
+import pandas as pd
 
 
 
@@ -197,7 +198,7 @@ def apply_clahe_to_grayscale_batch(img_tensor: torch.Tensor,
 
     return torch.stack(enhanced)  # shape: (B, 1, H, W)
 
-def batch_get_loftr_matches(img1_batch, img2_batch, device: str = 'cpu', target_size=(640, 480), 
+def batch_get_loftr_matches(img1_batch, img2_batch, device: str = 'cpu', target_size=(480, 640), #note H X W
                             loftr_space_reproj_threshold_levels: list[float] = [0.5, 0.75, 1.0, 2.0],
                             batch_size: int = None):
     """
@@ -209,7 +210,7 @@ def batch_get_loftr_matches(img1_batch, img2_batch, device: str = 'cpu', target_
         img1_batch: List of registered image arrays
         img2_batch: List of unregistered image arrays
         device: Device to run inference on
-        target_size: Target size for resizing images before matching (default: 640x480)
+        target_size: Target size for resizing images before matching (default: 480x640; note H X W)
         loftr_space_reproj_threshold_levels: List of RANSAC reprojection thresholds in LoFTR's 
                                              resized image space to try (e.g., [0.5, 0.75, 1.0] pixels)
         batch_size: Maximum number of image pairs to process at once on GPU (defaults to input batch size if None)
@@ -222,7 +223,7 @@ def batch_get_loftr_matches(img1_batch, img2_batch, device: str = 'cpu', target_
         return []
     
     # Initialize LoFTR matcher once for the batch
-    matcher = KF.LoFTR(pretrained='outdoor').to(device)
+    matcher = KF.LoFTR(pretrained='outdoor').to(device).eval()
     input_batch_size = len(img1_batch)
     results = []
     
@@ -458,11 +459,13 @@ def process_batch(batch_id, points, unreg_path, reg_path, width_length, temp_dir
         
     start_time = time.time()
     warped_files = []
+    chip_stats = []  # Add this to collect chip statistics
     original_res = None  # To store the original resolution
     try:
         # Load all chips for the batch in parallel
-        un_chips = []
-        reg_chips = []
+        un_chips_list = []
+        reg_chips_list = []
+        original_indices_list = [] # To store original unique indices of loaded chips
         
         def load_chip_for_point(row_data):
             idx, row = row_data
@@ -478,68 +481,111 @@ def process_batch(batch_id, points, unreg_path, reg_path, width_length, temp_dir
         # Use ThreadPoolExecutor for parallel I/O operations
         with ThreadPoolExecutor() as executor:
             # Submit all point loading tasks
-            futures = [executor.submit(load_chip_for_point, (idx, row)) 
+            futures_load_chips = [executor.submit(load_chip_for_point, (idx, row)) 
                       for idx, row in points.iterrows()]
             
             # Collect results as they complete
-            for future in as_completed(futures):
+            for future in as_completed(futures_load_chips):
                 idx, (un_chip, reg_chip, success) = future.result()
                 if success:
-                    un_chips.append(un_chip)
-                    reg_chips.append(reg_chip)
+                    un_chips_list.append(un_chip)
+                    reg_chips_list.append(reg_chip)
+                    original_indices_list.append(idx) # Store the original unique index
                     
                     # Store the original resolution from the first valid chip
                     if original_res is None and un_chip is not None:
                         transform = un_chip['profile']['transform']
                         original_res = (abs(transform[0]), abs(transform[4]))
         
-        # Skip if no chips were loaded
-        if not un_chips or not reg_chips:
+        if not un_chips_list or not reg_chips_list:
             print(f"No valid chips found in batch {batch_id}")
-            return batch_id, [], time.time() - start_time
+            return batch_id, [], [], time.time() - start_time
         
         # Extract arrays for batch processing
-        reg_arrays = [reg_chip['array'] for reg_chip in reg_chips]
-        un_arrays = [un_chip['array'] for un_chip in un_chips]
+        reg_arrays = [reg_chip['array'] for reg_chip in reg_chips_list]
+        un_arrays = [un_chip['array'] for un_chip in un_chips_list]
         
         # Get matches for all pairs in batch
-        batch_results = batch_get_loftr_matches(reg_arrays, un_arrays, device, batch_size=batch_size)
+        batch_match_results = batch_get_loftr_matches(reg_arrays, un_arrays, device, batch_size=batch_size)
         
         # Process each chip in parallel
-        def process_chip(data):
-            i, (match_data, un_chip, reg_chip) = data
+        def process_chip(original_idx, match_data, un_chip, reg_chip):
             mkpts_reg, mkpts_un, inliers = match_data
             
             try:
+                # Count inliers
+                inlier_count = np.sum(inliers)
+                
                 # Generate GCPs for the chip
                 gcps = generate_chip_gcps(un_chip, reg_chip, mkpts_un, mkpts_reg, inliers)
+                gcp_count = len(gcps)
                 
-                if len(gcps) >= 10:  # Only warp if we have enough GCPs
+                # Track if warping succeeded
+                warp_success = False
+                warped_file = None
+                
+                if gcp_count >= 10:  # Only warp if we have enough GCPs
                     # Warp the chip and save to temp file
                     warped_file = warp_chip(un_chip, gcps, temp_dir, polynomial_order, resampling)
-                    return i, (warped_file, un_chip['bounds'], original_res)
-                return i, None
+                    warp_success = True if warped_file else False
+                
+                # Get chip centroid
+                xmin, ymin, xmax, ymax = un_chip['bounds']
+                centroid_x = (xmin + xmax) / 2
+                centroid_y = (ymin + ymax) / 2
+                chip_info = {
+                    "idx": original_idx, # Use the original unique idx
+                    "inlier_count": int(inlier_count),
+                    "gcp_count": gcp_count,
+                    "warp_success": warp_success,
+                    "centroid": (centroid_x, centroid_y)
+                }
+                
+                # Print chip stats
+                print(f"Chip {original_idx} (batch {batch_id}): inliers={inlier_count}, GCPs={gcp_count}, warped={warp_success}")
+                
+                return warped_file, un_chip['bounds'], chip_info
             except Exception as e:
-                print(f"Error processing chip {i} in batch {batch_id}: {str(e)}")
-                return i, None
+                print(f"Error processing chip {original_idx} (batch {batch_id}): {str(e)}")
+                xmin, ymin, xmax, ymax = un_chip['bounds']
+                centroid_x = (xmin + xmax) / 2
+                centroid_y = (ymin + ymax) / 2
+                chip_info = {
+                    "idx": original_idx, # Use the original unique idx
+                    "inlier_count": 0,
+                    "gcp_count": 0,
+                    "warp_success": False,
+                    "centroid": (centroid_x, centroid_y)
+                }
+                return None, un_chip['bounds'], chip_info
         
         # Process chips in parallel
         with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(process_chip, (i, data)) for i, data in 
-                      enumerate(zip(batch_results, un_chips, reg_chips))]
+            futures_chip_processing = []
+            for i in range(len(original_indices_list)): # Iterate over successfully loaded chips
+                future = executor.submit(
+                    process_chip,
+                    original_indices_list[i],      # Pass the unique original_idx
+                    batch_match_results[i],        # Corresponding match data
+                    un_chips_list[i],              # Corresponding un_chip
+                    reg_chips_list[i]              # Corresponding reg_chip
+                )
+                futures_chip_processing.append(future)
             
             # Collect results
-            for future in as_completed(futures):
-                i, result = future.result()
-                if result:
-                    warped_files.append(result)
+            for future in as_completed(futures_chip_processing):
+                warped_file_path, chip_bounds, chip_info_dict = future.result()
+                if warped_file_path:
+                    # original_res is from the process_batch scope
+                    warped_files.append((warped_file_path, chip_bounds, original_res))
+                chip_stats.append(chip_info_dict)  # Store chip info (already has unique idx)
         
         duration = time.time() - start_time
-        return batch_id, warped_files, duration
+        return batch_id, warped_files, chip_stats, duration
     
     except Exception as e:
         print(f"Error in batch {batch_id}: {str(e)}")
-        return batch_id, [], time.time() - start_time
+        return batch_id, [], [], time.time() - start_time
 
 def merge_warped_chips(warped_files, output_path, buffer):
     """
@@ -673,6 +719,7 @@ def register_raster_with_chips(unreg_path, reg_path, output_path, width_length, 
         
         # Setup for monitoring
         warped_files = []
+        all_chip_stats = []  # Add this to collect all chip statistics
         processed_batches = 0
         total_batches = len(point_batches)
         processing_times = []
@@ -712,21 +759,19 @@ def register_raster_with_chips(unreg_path, reg_path, output_path, width_length, 
             for future in as_completed(futures):
                 try:
                     # Get result with 5-minute timeout
-                    batch_id, batch_files, duration = future.result(timeout=300)
+                    batch_id, batch_files, batch_stats, duration = future.result()
                     
                     # Update tracking
                     processed_batches += 1
                     processing_times.append(duration)
                     if batch_files:
                         warped_files.extend(batch_files)
+                    
+                    # Add batch stats to all_chip_stats
+                    all_chip_stats.extend(batch_stats)
                         
                     # Log individual batch completion
                     print(f"Batch {batch_id} completed in {duration:.1f}s with {len(batch_files)} warped chips")
-                    
-                except concurrent.futures.TimeoutError:
-                    # Handle batch timeout
-                    print(f"Batch {futures[future]} timed out after 5 minutes!")
-                    processed_batches += 1
                     
                 except Exception as e:
                     # Handle any other errors
@@ -742,7 +787,30 @@ def register_raster_with_chips(unreg_path, reg_path, output_path, width_length, 
         # Merge all warped chips
         merge_warped_chips(warped_files, output_path, buffer)
         
+        # Save chip statistics as GeoDataFrame
+        stats_df = pd.DataFrame([
+            {
+                "idx": stat["idx"],
+                "inlier_count": stat["inlier_count"],
+                "gcp_count": stat["gcp_count"],
+                "warp_success": stat["warp_success"],
+                "geometry": Point(stat["centroid"])
+            }
+            for stat in all_chip_stats
+        ])
+        
+        # Convert to GeoDataFrame
+        with rasterio.open(unreg_path) as src:
+            crs = src.crs
+        
+        stats_gdf = gpd.GeoDataFrame(stats_df, geometry="geometry", crs=crs)
+        
+        # Save to GeoJSON instead of GeoPackage
+        stats_output_path = os.path.splitext(output_path)[0] + "_chip_stats.geojson"
+        stats_gdf.to_file(stats_output_path, driver="GeoJSON")
+        
         print(f"Registration complete. Output written to {output_path}")
+        print(f"Chip statistics saved to {stats_output_path}")
 
 def calculate_chip_crs_parameters(
     parent_raster_path: str,
