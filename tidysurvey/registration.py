@@ -674,6 +674,9 @@ def register_survey_by_chips(
             chunk_skipped_low_gcps = 0
             chunk_errors = 0
 
+            # Minimum GCPs required by GDAL for different polynomial orders
+            MIN_GCPS_TABLE = {1: 3, 2: 6, 3: 10}
+
             progress_warping = tqdm(loaded_chips_data_current_chunk, desc=f"  Warping chips (Chunk {chunk_idx+1})", unit="chip", leave=False, position=1)
             for loaded_chip_info in progress_warping:
                 original_idx = loaded_chip_info['id']
@@ -711,9 +714,32 @@ def register_survey_by_chips(
                                                                 mkpts_in_un_chip, mkpts_in_reg_chip,
                                                                 inliers_from_loftr)
                     
-                    if len(gcp_list_for_warp) < min_gcps_for_warp:
+                    num_gcps = len(gcp_list_for_warp)
+                    poly_order_for_this_chip = None
+                    chosen_order_found = False
+
+                    # Try polynomial orders from the configured gdal_polynomial_order down to 1
+                    # to find the highest one that satisfies its GCP requirement.
+                    # Assumes gdal_polynomial_order is a sensible positive integer (e.g., 1, 2, or 3)
+                    for order_to_try in range(gdal_polynomial_order, 0, -1): 
+                        min_req_for_order = MIN_GCPS_TABLE.get(order_to_try)
+                        if min_req_for_order is not None: # Ensure the order is defined in our table
+                            if num_gcps >= min_req_for_order:
+                                poly_order_for_this_chip = order_to_try
+                                chosen_order_found = True
+                                break # Found the highest possible order
+                    
+                    if not chosen_order_found:
+                        # Not enough GCPs even for the lowest considered/supported order (typically 1)
+                        min_gcp_for_lowest_supported_order = MIN_GCPS_TABLE.get(1, 3) # Default to 3 for order 1 if not in table
+                        tqdm.write(f"Chip {original_idx}: Skipped. Insufficient GCPs ({num_gcps}) for any supported polynomial order (e.g., order 1 needs {min_gcp_for_lowest_supported_order}).")
                         chunk_skipped_low_gcps += 1
                         continue
+                    else:
+                        # An order was found. Log if it's different from the initially configured/max one.
+                        if poly_order_for_this_chip != gdal_polynomial_order:
+                            tqdm.write(f"Chip {original_idx}: Using polynomial order {poly_order_for_this_chip} ({num_gcps} GCPs). Configured/max order was {gdal_polynomial_order}.")
+                        # else: Using the configured/max order as it met requirements, no special message needed.
 
                     # Define output path for this warped chip (in the main temporary directory)
                     # Base name from original grid index to ensure uniqueness
@@ -721,7 +747,7 @@ def register_survey_by_chips(
                     output_path_for_this_warped_chip = os.path.join(main_processing_tmpdir, warped_chip_filename)
                     
                     warp_chip_gdal(un_chip_to_warp, gcp_list_for_warp, output_path_for_this_warped_chip,
-                                   polynomial_order=gdal_polynomial_order,
+                                   polynomial_order=poly_order_for_this_chip, # Use the dynamically determined order
                                    gdal_resample_algorithm=gdal_resampling_algorithm,
                                    src_nodata_val=gdal_src_nodata,
                                    dst_nodata_val=gdal_dst_nodata
