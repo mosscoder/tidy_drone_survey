@@ -484,22 +484,19 @@ def merge_warped_chips_gdal(
             os.makedirs(output_dir, exist_ok=True)
         
         translate_to_cog_opts = gdal.TranslateOptions(
-            format="GTiff",
-            creationOptions=["COMPRESS=LZW", "PREDICTOR=2", "BIGTIFF=YES", "TILED=YES", "COPY_SRC_OVERVIEWS=YES"],
-            # Add callback for progress if desired, e.g., gdal.TermProgress_nocb
+            format="COG", # Use the COG driver
+            creationOptions=[
+                "COMPRESS=LZW", 
+                "PREDICTOR=2", 
+                "BIGTIFF=YES", 
+                "OVERVIEWS=AUTO",
+                "OVERVIEW_RESAMPLING=NEAREST", # Resampling for overviews
+                "OVERVIEW_COMPRESS=LZW",       # Compression for overviews
+                "OVERVIEW_PREDICTOR=2"         # Predictor for overview compression
+            ],
+            callback=gdal.TermProgress_nocb,
         )
         gdal.Translate(final_output_path, merged_vrt_path, options=translate_to_cog_opts)
-        
-        print("Building overviews for the final COG...")
-        final_ds = gdal.Open(final_output_path, gdal.GA_Update)
-        if final_ds:
-            # Standard overview levels
-            overview_levels = [2, 4, 8, 16, 32] 
-            # Ensure gdal config options are set if they affect overview generation
-            gdal.SetConfigOption("COMPRESS_OVERVIEW", "LZW") 
-            gdal.SetConfigOption("PREDICTOR_OVERVIEW", "2") # For LZW
-            final_ds.BuildOverviews("NEAREST", overview_levels) # NEAREST is common for discrete data, AVERAGE for continuous
-            final_ds = None # Close dataset
         
         try: # Clean up VRT
             gdal.Unlink(merged_vrt_path) 
@@ -550,11 +547,10 @@ def register_survey_by_chips(
     unreg_survey_path: str,
     reg_reference_path: str,
     output_registered_survey_path: str,
-    # Chip geometry and buffering parameters (typically derived from target pixel sizes)
-    core_chip_width_crs: float, # CRS width of the core processing area of a chip
-    core_chip_height_crs: float,# CRS height of the core processing area of a chip
-    buffer_width_crs: float,   # CRS width of buffer to add to each side of a chip for processing
-    buffer_height_crs: float,  # CRS height of buffer to add to each side of a chip for processing
+    # NEW: Parameters for chip dimension calculation
+    target_chip_width_px: int = 640,
+    target_chip_height_px: int = 480,
+    buffer_fraction_of_core: float = 0.1,
     # Processing parameters
     device_for_loftr: str = 'cpu',
     max_loader_workers: int = 4, # For ThreadPoolExecutor loading chips
@@ -583,6 +579,30 @@ def register_survey_by_chips(
     print(f"  Unregistered: {unreg_survey_path}")
     print(f"  Reference: {reg_reference_path}")
     print(f"  Output: {output_registered_survey_path}")
+
+    # Calculate chip CRS parameters internally
+    print("⏳ Calculating chip CRS parameters...")
+    try:
+        core_chip_width_crs, core_chip_height_crs, \
+        buffer_width_crs, buffer_height_crs, \
+        pix_x_res, pix_y_res = calculate_chip_crs_parameters_gdal(
+            parent_raster_path=unreg_survey_path,
+            target_chip_width_px=target_chip_width_px,
+            target_chip_height_px=target_chip_height_px,
+            buffer_fraction_of_core=buffer_fraction_of_core
+        )
+        print("💡 Computed chip dimensions (CRS units):")
+        print(f"    Core size: {core_chip_width_crs:.2f}w × {core_chip_height_crs:.2f}h")
+        print(f"    Buffer to add (each side): {buffer_width_crs:.2f}w × {buffer_height_crs:.2f}h")
+        print(f"    Pixel resolution: {pix_x_res:.4f} (x), {pix_y_res:.4f} (y)\n")
+    except FileNotFoundError:
+        print(f"Error: Unregistered raster not found at {unreg_survey_path}. Cannot calculate parameters.")
+        print("Please ensure the unreg_survey_path is a valid path or URL accessible by rasterio.")
+        return
+    except Exception as e:
+        print(f"Error calculating chip CRS parameters: {e}")
+        return
+
 
     # Generate grid over the unregistered survey based on core chip dimensions
     grid_gdf = generate_grid_points_chip(unreg_survey_path, core_chip_width_crs, core_chip_height_crs)
