@@ -38,19 +38,20 @@ gdal.UseExceptions() # Enable GDAL exceptions
 DEVICE      = 'mps'
 MATCHER     = KF.LoFTR(pretrained='outdoor').to(DEVICE).eval()
 MAX_WORKERS = 10
-BATCH_SIZE  = 20
+BATCH_SIZE  = 16
+CHUNK_SIZE  = 32 # Number of grid points to process in one full load-match-warp cycle
 POLY_ORDER  = 3
 RESAMPLE_ALG= "cubic"
 TARGET_SIZE = (480, 640)       # (H, W)
 BUFFER_FRAC = 0.1
 
 # Constants for LoFTR RANSAC
-LOFTR_REPROJ_THRESH_LEVELS_PX = [1.0, 0.5]  # RANSAC reprojection threshold in LoFTR's input image space (pixels)
+LOFTR_REPROJ_THRESH_LEVELS_PX = [0.5, 1.0, 2.0]  # RANSAC reprojection threshold in LoFTR's input image space (pixels)
 CONFIDENCE_LEVELS = [0.999, 0.95]              # Confidence levels for RANSAC
 MIN_LOFTR_MATCHES_FOR_FUNDAMENTAL_MATRIX = 7   # Minimum number of matches required for cv2.findFundamentalMat
 
-UNREG_URL = '/Users/kdoherty/tidy_drone_survey/data/raster/batch_5_test.tif'
-# UNREG_URL   = "https://storage.googleapis.com/mpg-aerial-survey/surveys/2024_front_country/processing/dronedeploy/multispectral/front_country-batch_5-MS.tif"
+#UNREG_URL = '/Users/kdoherty/tidy_drone_survey/data/raster/batch_5_test.tif'
+UNREG_URL   = "https://storage.googleapis.com/mpg-aerial-survey/surveys/2024_front_country/processing/dronedeploy/multispectral/front_country-batch_5-MS.tif"
 REG_URL     = "https://storage.googleapis.com/mpg-aerial-survey/surveys/2024_front_country/processing/dronedeploy/front_country_2024.tif"
 OUTPUT_PATH = "/Users/kdoherty/tidy_drone_survey/data/raster/batch_5_corrected.tif"
 
@@ -196,6 +197,14 @@ def batch_get_loftr_matches(chip_data_list: List[dict], device=DEVICE, batch_siz
         all_kpts1_un_batch_resized = corr['keypoints1'].cpu().numpy()
         batch_indices = corr['batch_indexes'].cpu().numpy()
 
+        # Explicitly delete GPU tensors now that we have CPU copies or derived data
+        del corr['keypoints0'] # These are tensors on the GPU
+        del corr['keypoints1']
+        del corr['batch_indexes']
+        del corr # Delete the whole dictionary, which might hold other tensors
+        del img0_tensors_reg
+        del img1_tensors_un
+
         for j in range(len(current_gpu_batch_data)):
             original_id = current_gpu_batch_data[j][0] # Get the original_id
             reg_img_scales = current_gpu_batch_data[j][2]
@@ -215,21 +224,22 @@ def batch_get_loftr_matches(chip_data_list: List[dict], device=DEVICE, batch_siz
                 mkpts_un_orig[:, 0] = mkpts_un_resized[:, 0] * un_img_scales[1]  # W scale
                 mkpts_un_orig[:, 1] = mkpts_un_resized[:, 1] * un_img_scales[0]  # H scale
             
+            # Explicitly delete intermediate resized arrays once original scale arrays are computed
+            del mkpts_reg_resized
+            del mkpts_un_resized
+
             inliers = np.zeros(mkpts_reg_orig.shape[0], dtype=bool)
+            Fm = None
+            inliers_mask = None
             if mkpts_reg_orig.shape[0] >= MIN_LOFTR_MATCHES_FOR_FUNDAMENTAL_MATRIX:
-                # Using registered image scales for RANSAC threshold, as it's the 'query' image in findFundamentalMat
                 avg_reg_img_scale_factor = (reg_img_scales[0] + reg_img_scales[1]) / 2.0
                 found_inliers_for_pair = False
                 for loftr_thresh_px in LOFTR_REPROJ_THRESH_LEVELS_PX:
-                    # RANSAC threshold is applied to the 'query' keypoints, which are mkpts_reg_orig
-                    ransac_thresh_orig_px = loftr_thresh_px # * avg_reg_img_scale_factor (LoFTR threshold is in its input image space)
-
+                    ransac_thresh_orig_px = loftr_thresh_px * avg_reg_img_scale_factor
                     for confidence_val in CONFIDENCE_LEVELS:
                         try:
-                            # cv2.findFundamentalMat(query, train, ...)
-                            # Here, query=mkpts_reg_orig, train=mkpts_un_orig based on LoFTR's image0/image1
                             Fm, inliers_mask = cv2.findFundamentalMat(
-                                mkpts_reg_orig, mkpts_un_orig, # Order matters: query (reg), train (unreg)
+                                mkpts_reg_orig, mkpts_un_orig, 
                                 method=cv2.USAC_MAGSAC,
                                 ransacReprojThreshold=ransac_thresh_orig_px,
                                 confidence=confidence_val,
@@ -239,8 +249,14 @@ def batch_get_loftr_matches(chip_data_list: List[dict], device=DEVICE, batch_siz
                                 inliers = inliers_mask.ravel() > 0
                                 found_inliers_for_pair = True
                                 break
-                        except cv2.error:
+                        except cv2.error: # cv2.error can be raised if no fundamental matrix is found
+                            # Explicitly delete potentially partially assigned Fm or inliers_mask on error
+                            del Fm
+                            del inliers_mask
+                            Fm, inliers_mask = None, None # Ensure they are reset
                             continue
+                        if found_inliers_for_pair:
+                            break
                     if found_inliers_for_pair:
                         break
             
@@ -250,6 +266,13 @@ def batch_get_loftr_matches(chip_data_list: List[dict], device=DEVICE, batch_siz
                 'mkpts_un': mkpts_un_orig, 
                 'inliers': inliers
             }
+            # Explicitly delete intermediate arrays from RANSAC
+            del Fm
+            del inliers_mask
+
+        # Attempt to clear PyTorch MPS cache after each GPU batch processing
+        if device == 'mps':
+            torch.mps.empty_cache()
 
     # Populate all_pairs_results using the original list order and the map
     for i in range(N):
@@ -289,21 +312,38 @@ def warp_chip(un_chip: Chip, gcps: List[gdal.GCP], out_path: str):
                       crs=un_chip.profile["crs"],
                       nodata=0) as dst:
             dst.write(un_chip.array)
-        vrt = gdal.Translate("", mem.name,
-                              options=gdal.TranslateOptions(format="VRT", GCPs=gcps))
-        warp_opts = gdal.WarpOptions(
-            format="GTiff",
-            outputBounds=un_chip.bounds,
-            width=int(un_chip.profile["width"]),
-            height=int(un_chip.profile["height"]),
-            polynomialOrder=POLY_ORDER,
-            resampleAlg=RESAMPLE_ALG,
-            dstSRS=un_chip.profile["crs"].to_wkt(),
-            srcNodata=0,
-            dstNodata=0,
-            warpOptions=["SOURCE_EXTRA=5", "WRITE_FLUSH=YES"]
-        )
-        gdal.Warp(out_path, vrt, options=warp_opts)
+        
+        vrt_ds = None  # Initialize to None
+        try:
+            # Create an in-memory VRT dataset from the source chip with GCPs
+            vrt_ds = gdal.Translate("", mem.name, # Output to in-memory dataset
+                                  options=gdal.TranslateOptions(format="VRT", GCPs=gcps))
+            if vrt_ds is None:
+                # This can happen if Translate fails for some reason (e.g. no GCPs, invalid GCPs)
+                # Although generate_chip_gcps and the check for len(gcps_list) < 10 should prevent empty/bad GCPs.
+                raise RuntimeError(f"GDAL Translate to VRT failed for chip data originally from {mem.name}")
+
+            warp_opts = gdal.WarpOptions(
+                format="GTiff",
+                outputBounds=un_chip.bounds,
+                width=int(un_chip.profile["width"]),
+                height=int(un_chip.profile["height"]),
+                polynomialOrder=POLY_ORDER,
+                resampleAlg=RESAMPLE_ALG,
+                dstSRS=un_chip.profile["crs"].to_wkt(),
+                srcNodata=0,
+                dstNodata=0,
+                warpOptions=["SOURCE_EXTRA=5", "WRITE_FLUSH=YES"]
+            )
+            # Warp the in-memory VRT dataset to the output file path
+            # The return value of gdal.Warp when outputting to a file is typically a Dataset object
+            # representing the *output* dataset, or None/True on failure/success without dataset return.
+            # We don't strictly need to keep the output dataset object from gdal.Warp here.
+            gdal.Warp(out_path, vrt_ds, options=warp_opts)
+        finally:
+            # Crucially, dereference the in-memory VRT dataset to allow GDAL to free resources.
+            # This is important because vrt_ds is an actual GDAL Dataset object.
+            vrt_ds = None
 
 def merge_warped_chips(warped, output_path: str, buffer_w: float, buffer_h: float):
     if not warped:
@@ -380,189 +420,145 @@ def register_raster_with_chips(unreg_path: str, reg_path: str,
                                buffer_w: float, buffer_h: float, device=DEVICE,
                                max_workers=MAX_WORKERS, batch_size=BATCH_SIZE):
     grid = generate_grid_points(unreg_path, width, height)
-    warped = []
-    # loaded_chips will store dicts: {'id': original_idx, 'un_chip': Chip, 'reg_chip': Chip}
-    loaded_chips_data: List[dict] = []
-    results = []
-
-    # 1) Load chips
-    futures = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for idx, row in grid.iterrows():
-            # Pass idx as the identifier
-            futures[ex.submit(load_chips, row.geometry,
-                              unreg_path, reg_path, width, height, buffer_w, buffer_h)] = idx
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading chips", unit="chip"):
-            original_idx = futures[fut] # This is the original grid index
-            try:
-                u_chip, r_chip = fut.result()
-                loaded_chips_data.append({'id': original_idx, 'un_chip': u_chip, 'reg_chip': r_chip})
-            except Exception as e:
-                tqdm.write(f"⚠️  Load failure for chip id {original_idx}: {e}")
-
-    if not loaded_chips_data:
-        print("❌  No chips loaded; aborting.")
-        return
-
-    # Sort loaded_chips_data by 'id' to ensure original order if it was jumbled by async loading,
-    # though it might not be strictly necessary if batch_get_loftr_matches handles arbitrary order.
-    # However, for consistency with how all_pairs_results is structured, this is good.
-    loaded_chips_data.sort(key=lambda x: x['id'])
-
-    # 2) LoFTR batch matching
-    # Prepare input for batch_get_loftr_matches
-    loftr_input_data = [{'id': lcd['id'], 'un_img': lcd['un_chip'].array, 'reg_img': lcd['reg_chip'].array} for lcd in loaded_chips_data]
-
-    tmpdir = tempfile.mkdtemp()
     
-    # matches will be a list of dicts: {'id': original_idx, 'mkpts_reg': ..., 'mkpts_un': ..., 'inliers': ...}
-    # The order of this list will correspond to the order of loftr_input_data
-    matches_results = batch_get_loftr_matches(loftr_input_data,
-                                              device=device, batch_size=batch_size)
+    # This list will collect warped chip file paths and metadata for merging
+    warped_all_chunks = [] 
 
-    # Create a dictionary for quick lookup of matches by id
-    matches_map = {match_data['id']: match_data for match_data in matches_results}
+    # Statistics counters aggregated across chunks
+    total_success_warp_count = 0
+    total_skipped_no_data_count = 0
+    total_skipped_no_inliers_count = 0
+    total_skipped_low_gcps_count = 0
+    total_error_count = 0
 
-    # 3) warp & collect stats
-    success_warp_count = 0
-    skipped_no_data_count = 0
-    skipped_no_inliers_count = 0
-    skipped_low_gcps_count = 0
-    error_count = 0
+    # Ensure the output directory for the final merged raster exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # pairs = list(zip(loaded, matches))
-    print("Warping chips...")
+    # Temporary directory for warped chip files
+    with tempfile.TemporaryDirectory() as main_tmpdir:
+        num_chunks = (len(grid) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    # Iterate through loaded_chips_data to process each chip
-    for chip_load_info in tqdm(loaded_chips_data, desc="Warping chips", unit="chip"):
-        original_idx = chip_load_info['id']
-        un_chip = chip_load_info['un_chip']
-        reg_chip = chip_load_info['reg_chip']
+        for chunk_idx in tqdm(range(num_chunks), desc="Total Progress (Chunks)", unit="chunk"):
+            chunk_start_idx = chunk_idx * CHUNK_SIZE
+            chunk_end_idx = min((chunk_idx + 1) * CHUNK_SIZE, len(grid))
+            current_grid_chunk_df = grid.iloc[chunk_start_idx:chunk_end_idx]
 
-        # Retrieve the match data for this chip using its original_idx
-        match_data = matches_map.get(original_idx)
-
-        # Initialize default values for stats in case of early exit or error
-        cnt_in = 0
-        gcps_list = []
-        warp_success_flag = False
-
-        try:
-            if match_data is None:
-                # This should ideally not happen if batch_get_loftr_matches returns a result for every input
-                print(f"Chip {original_idx}: skipped (no match data found).")
-                error_count +=1 # Or a new counter for missing match data
-                # Log to results with failure
-                results.append({
-                    "idx": original_idx, "inlier_count": 0, "gcp_count": 0, "warp_success": False,
-                    "geometry": Polygon([ # Placeholder geometry or calculate actual core
-                        (un_chip.bounds[0] + buffer_w, un_chip.bounds[1] + buffer_h),
-                        (un_chip.bounds[0] + buffer_w, un_chip.bounds[3] - buffer_h),
-                        (un_chip.bounds[2] - buffer_w, un_chip.bounds[3] - buffer_h),
-                        (un_chip.bounds[2] - buffer_w, un_chip.bounds[1] + buffer_h),
-                        (un_chip.bounds[0] + buffer_w, un_chip.bounds[1] + buffer_h)
-                    ])
-                })
+            if current_grid_chunk_df.empty:
                 continue
 
-            mkpts_reg_matched = match_data['mkpts_reg']
-            mkpts_un_matched = match_data['mkpts_un']
-            inliers_matched = match_data['inliers']
+            tqdm.write(f"--- Processing Chunk {chunk_idx + 1}/{num_chunks} (Grid Indices {chunk_start_idx} to {chunk_end_idx-1}) ---")
+
+            # Per-chunk data structures
+            loaded_chips_data_chunk: List[dict] = []
             
-            # 1) no‐data check (on original chip arrays)
-            if un_chip.array.sum() == 0 or reg_chip.array.sum() == 0:
-                skipped_no_data_count += 1
-                # tqdm.write(f"Chip {original_idx}: skipped (no data)") # tqdm.write to avoid breaking bar
-            else:
-                # 2) count inliers
-                cnt_in = int(inliers_matched.sum())
-                # generate_chip_gcps expects (un_chip, reg_chip, mkpts_un, mkpts_reg, inliers)
-                gcps_list = generate_chip_gcps(un_chip, reg_chip, mkpts_un_matched, mkpts_reg_matched, inliers_matched)
+            # 1) Load chips for the current chunk
+            futures_chunk = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                for original_idx, row in current_grid_chunk_df.iterrows():
+                    futures_chunk[ex.submit(load_chips, row.geometry,
+                                            unreg_path, reg_path, width, height, buffer_w, buffer_h)] = original_idx
+                
+                progress_bar_loading = tqdm(as_completed(futures_chunk), total=len(futures_chunk), desc=f"  Loading chips (Chunk {chunk_idx+1})", unit="chip", leave=False)
+                for fut in progress_bar_loading:
+                    original_idx_from_future = futures_chunk[fut]
+                    try:
+                        u_chip, r_chip = fut.result()
+                        loaded_chips_data_chunk.append({'id': original_idx_from_future, 'un_chip': u_chip, 'reg_chip': r_chip})
+                    except Exception as e:
+                        tqdm.write(f"⚠️  Load failure for chip id {original_idx_from_future} in chunk {chunk_idx+1}: {e}")
 
-                if cnt_in == 0:
-                    skipped_no_inliers_count += 1
-                    # tqdm.write(f"Chip {original_idx}: skipped (no inliers)")
-                elif len(gcps_list) < 10: # Check actual GCPs generated, not just inliers
-                    skipped_low_gcps_count += 1
-                    # tqdm.write(f"Chip {original_idx}: skipped ({len(gcps_list)} GCPs only)")
-                else:
-                    # 3) warp it!
-                    out_chip_path = os.path.join(tmpdir, f"chip_{original_idx}.tif")
-                    warp_chip(un_chip, gcps_list, out_chip_path)
-                    success_warp_count += 1
-                    # tqdm.write(f"Chip {original_idx}: warped ✅ (inliers = {cnt_in}, GCPs = {len(gcps_list)})")
-                    pw = abs(un_chip.profile["transform"][0])
-                    ph = abs(un_chip.profile["transform"][4])
-                    warped.append((out_chip_path, un_chip.bounds, (pw, ph)))
-                    warp_success_flag = True
+            if not loaded_chips_data_chunk:
+                tqdm.write(f"❌  No chips loaded for chunk {chunk_idx+1}; skipping further processing for this chunk.")
+                continue
+
+            loaded_chips_data_chunk.sort(key=lambda x: x['id'])
+
+            # 2) LoFTR batch matching for the current chunk
+            loftr_input_data_chunk = [{'id': lcd['id'], 'un_img': lcd['un_chip'].array, 'reg_img': lcd['reg_chip'].array} for lcd in loaded_chips_data_chunk]
             
-            # 4) record stats for every chip
-            xmin_buff, ymin_buff, xmax_buff, ymax_buff = un_chip.bounds
-            core_xmin = xmin_buff + buffer_w
-            core_ymin = ymin_buff + buffer_h
-            core_xmax = xmax_buff - buffer_w
-            core_ymax = ymax_buff - buffer_h
+            matches_results_chunk = batch_get_loftr_matches(loftr_input_data_chunk,
+                                                            device=device, batch_size=batch_size)
+            matches_map_chunk = {match_data['id']: match_data for match_data in matches_results_chunk}
+
+            # 3) Warp & collect stats for the current chunk
+            chunk_success_warp_count = 0
+            chunk_skipped_no_data_count = 0
+            chunk_skipped_no_inliers_count = 0
+            chunk_skipped_low_gcps_count = 0
+            chunk_error_count = 0
+
+            progress_bar_warping = tqdm(loaded_chips_data_chunk, desc=f"  Warping chips (Chunk {chunk_idx+1})", unit="chip", leave=False)
+            for chip_load_info in progress_bar_warping:
+                original_idx = chip_load_info['id']
+                un_chip = chip_load_info['un_chip']
+                reg_chip = chip_load_info['reg_chip']
+                match_data = matches_map_chunk.get(original_idx)
+
+                try:
+                    if match_data is None:
+                        tqdm.write(f"Chip {original_idx}: skipped (no match data found in chunk {chunk_idx+1}).")
+                        chunk_error_count +=1 
+                        continue
+
+                    mkpts_reg_matched = match_data['mkpts_reg']
+                    mkpts_un_matched = match_data['mkpts_un']
+                    inliers_matched = match_data['inliers']
+                    
+                    if un_chip.array.sum() == 0 or reg_chip.array.sum() == 0:
+                        chunk_skipped_no_data_count += 1
+                    else:
+                        cnt_in = int(inliers_matched.sum())
+                        gcps_list = generate_chip_gcps(un_chip, reg_chip, mkpts_un_matched, mkpts_reg_matched, inliers_matched)
+                        if cnt_in == 0:
+                            chunk_skipped_no_inliers_count += 1
+                        elif len(gcps_list) < 10:
+                            chunk_skipped_low_gcps_count += 1
+                        else:
+                            out_chip_path = os.path.join(main_tmpdir, f"chip_{original_idx}.tif")
+                            warp_chip(un_chip, gcps_list, out_chip_path)
+                            chunk_success_warp_count += 1
+                            pw = abs(un_chip.profile["transform"][0])
+                            ph = abs(un_chip.profile["transform"][4])
+                            warped_all_chunks.append((out_chip_path, un_chip.bounds, (pw, ph)))
+
+                except Exception as e:
+                    chunk_error_count += 1
+                    tqdm.write(f"Chip {original_idx}: ERROR during warping in chunk {chunk_idx+1} — {e}")
             
-            core_polygon = Polygon([
-                (core_xmin, core_ymin),  # bottom-left
-                (core_xmin, core_ymax),  # top-left
-                (core_xmax, core_ymax),  # top-right
-                (core_xmax, core_ymin),  # bottom-right
-                (core_xmin, core_ymin)   # close polygon
-            ])
+            # Aggregate chunk stats to total stats
+            total_success_warp_count += chunk_success_warp_count
+            total_skipped_no_data_count += chunk_skipped_no_data_count
+            total_skipped_no_inliers_count += chunk_skipped_no_inliers_count
+            total_skipped_low_gcps_count += chunk_skipped_low_gcps_count
+            total_error_count += chunk_error_count
 
-            results.append({
-                "idx": original_idx,
-                "inlier_count": cnt_in,
-                "gcp_count": len(gcps_list),
-                "warp_success": warp_success_flag,
-                "geometry": core_polygon
-            })
+            tqdm.write(f"  Chunk {chunk_idx+1} Summary: Warped: {chunk_success_warp_count}, Skipped (NoData: {chunk_skipped_no_data_count}, NoInliers: {chunk_skipped_no_inliers_count}, LowGCPs: {chunk_skipped_low_gcps_count}), Errors: {chunk_error_count}")
 
-        except Exception as e:
-            error_count += 1
-            print(f"Chip {original_idx}: ERROR — {e}")
-            
-            # Calculate core bounds even in case of error for consistent GeoJSON structure
-            xmin_buff, ymin_buff, xmax_buff, ymax_buff = un_chip.bounds
-            core_xmin = xmin_buff + buffer_w
-            core_ymin = ymin_buff + buffer_h
-            core_xmax = xmax_buff - buffer_w
-            core_ymax = ymax_buff - buffer_h
+            # Explicitly delete large chunk-specific data structures to help free memory
+            del loaded_chips_data_chunk
+            del loftr_input_data_chunk
+            del matches_results_chunk
+            del matches_map_chunk
+            import gc
+            gc.collect()
+        
+        # --- End of chunk processing loop ---
 
-            core_polygon = Polygon([
-                (core_xmin, core_ymin),  # bottom-left
-                (core_xmin, core_ymax),  # top-left
-                (core_xmax, core_ymax),  # top-right
-                (core_xmax, core_ymin),  # bottom-right
-                (core_xmin, core_ymin)   # close polygon
-            ])
-            
-            results.append({
-                "idx": original_idx,
-                "inlier_count": 0,
-                "gcp_count": 0,
-                "warp_success": False,
-                "geometry": core_polygon
-            })
+        print("Overall Warping Summary:")
+        print(f"  Successfully warped: {total_success_warp_count}")
+        print(f"  Skipped (no data): {total_skipped_no_data_count}")
+        print(f"  Skipped (no inliers): {total_skipped_no_inliers_count}")
+        print(f"  Skipped (low GCPs): {total_skipped_low_gcps_count}")
+        print(f"  Errors during processing: {total_error_count}")
 
-    print("\nWarping summary:")
-    print(f"  Successfully warped: {success_warp_count}")
-    print(f"  Skipped (no data): {skipped_no_data_count}")
-    print(f"  Skipped (no inliers): {skipped_no_inliers_count}")
-    print(f"  Skipped (low GCPs): {skipped_low_gcps_count}")
-    print(f"  Errors: {error_count}\n")
+        # Merge (operates on files in main_tmpdir)
+        if warped_all_chunks:
+            merge_warped_chips(warped_all_chunks, output_path, buffer_w, buffer_h)
+        else:
+            print("⚠️  No chips were successfully warped. Output raster will not be created.")
 
-    # 4) Merge
-    merge_warped_chips(warped, output_path, buffer_w, buffer_h)
-
-    # 5) Write stats
-    df  = pd.DataFrame(results)
-    gdf = gpd.GeoDataFrame(df, geometry="geometry",
-                           crs=rasterio.open(unreg_path).crs)
-    stats_path = output_path.replace(".tif", "_chip_stats.geojson")
-    gdf.to_file(stats_path, driver="GeoJSON")
-    print(f"✅  Stats written to: {stats_path}")
+    # No final stats file to write.
+    print("ℹ️  GeoJSON chip statistics logging has been removed.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
