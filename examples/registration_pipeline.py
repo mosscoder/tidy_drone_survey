@@ -14,7 +14,7 @@ def main():
     REG_URL     = "https://storage.googleapis.com/mpg-aerial-survey/surveys/2024_front_country/processing/dronedeploy/front_country_2024.tif"
     OUTPUT_PATH = "/Users/kdoherty/tidy_drone_survey/data/raster/batch_5_corrected.tif"
     STATS_PATH = "/Users/kdoherty/tidy_drone_survey/data/raster/batch_5_stats.tif"
-    DEBUG_WARPED_CHIPS_DIR = "/Users/kdoherty/tidy_drone_survey/data/debug_warped_chips" # Directory to save individual warped chips
+    #DEBUG_WARPED_CHIPS_DIR = "/Users/kdoherty/tidy_drone_survey/data/debug_warped_chips" # Directory to save individual warped chips
 
     # Processing parameters (configurable by user for the run)
     DEVICE      = 'mps'      # 'cpu', 'cuda', 'mps'
@@ -41,7 +41,7 @@ def main():
             max_loader_workers=MAX_WORKERS,
             loftr_batch_size=BATCH_SIZE,
             processing_chunk_size=CHUNK_SIZE,
-            debug_output_dir_for_warped_chips=DEBUG_WARPED_CHIPS_DIR # Pass the debug directory
+            #debug_output_dir_for_warped_chips=DEBUG_WARPED_CHIPS_DIR # Pass the debug directory
         )
 
         print(f"Registration pipeline finished. Output saved to: {OUTPUT_PATH}")

@@ -686,14 +686,6 @@ def register_survey_by_chips(
     num_chip_cols = 0
     num_chip_rows = 0
     if not grid_gdf.empty:
-        # Sort unique coordinates to ensure consistent ordering for num_chip_rows/cols
-        # unique_x_coords = np.sort(grid_gdf.geometry.x.unique())
-        # unique_y_coords = np.sort(grid_gdf.geometry.y.unique()) # Sorted bottom-to-top
-        # num_chip_cols = len(unique_x_coords)
-        # num_chip_rows = len(unique_y_coords)
-
-        # A more direct way to get counts if grid is regular and fully populated by generate_grid_points_chip
-        # This assumes generate_grid_points_chip fills out a complete grid based on its arange steps.
         with rasterio.open(unreg_survey_path) as src_main_raster: # Re-open to get bounds for arange logic
             left_bound, bottom_bound, right_bound, top_bound = src_main_raster.bounds
         
