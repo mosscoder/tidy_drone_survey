@@ -18,6 +18,8 @@ from shapely.geometry import shape
 from shapely.ops import unary_union
 
 from affine import Affine
+import joblib
+import shutil
 
 # Define a progress callback function
 def my_progress_callback(complete, message, user_data):
@@ -234,7 +236,7 @@ def define_hull(
             except OSError as e:
                 warnings.warn(f"Error removing temporary file {temp_gdal_file_path}: {e}")
 
-def find_seamlines(input_hulls, output_dir, tol):
+def find_seamlines(input_hulls, output_dir, tol, buffer_m: float):
     """
     Partition the full union of input hulls into seam regions via rasterized
     distance transforms, catch mis‑assigned islands, then write & return.
@@ -316,6 +318,16 @@ def find_seamlines(input_hulls, output_dir, tol):
     seam_gdf = parts.dissolve(by="owner").reset_index().rename(columns={"owner": "name"})
     print(f"  Dissolved to {len(seam_gdf)} seam polygons")
 
+    if buffer_m > 0:
+        print(f"  Buffering seam polygons by {buffer_m} (CRS units)...")
+        seam_gdf['geometry'] = seam_gdf.geometry.buffer(buffer_m)
+        # Ensure geometry is valid after buffering and remove empty ones
+        seam_gdf['geometry'] = seam_gdf.geometry.apply(lambda geom: geom if geom.is_valid else geom.buffer(0))
+        seam_gdf = seam_gdf[~seam_gdf.geometry.is_empty]
+        if seam_gdf.empty:
+            print("Warning: All seam polygons became empty after buffering. No seamlines will be saved.")
+            return [None] * len(input_hulls) # Return list of Nones if all are empty
+
     # Save each seamline as a separate GeoJSON file
     for i, row in seam_gdf.iterrows():
         print(f"row: {row}")  # Debug: see what columns are present and their types
@@ -345,9 +357,9 @@ def clip(input_raster, seamline_geojson, output_raster, keep_bands=None):
     """
 
     if keep_bands is None:
-        warp_options = gdal.WarpOptions(cutlineDSName=seamline_geojson, cropToCutline=True, dstAlpha=True)
+        warp_options = gdal.WarpOptions(cutlineDSName=seamline_geojson, cropToCutline=True, dstAlpha=True, callback=gdal.TermProgress_nocb)
     else:
-        warp_options = gdal.WarpOptions(srcBands=keep_bands, cutlineDSName=seamline_geojson, cropToCutline=True, dstAlpha=True)
+        warp_options = gdal.WarpOptions(srcBands=keep_bands, cutlineDSName=seamline_geojson, cropToCutline=True, dstAlpha=True, callback=gdal.TermProgress_nocb)
     
     print(f"Clipping {input_raster} using seamlines from {seamline_geojson}...")
     ds = gdal.Warp(output_raster, input_raster, options=warp_options)
@@ -373,18 +385,167 @@ def mosaic(raster_files, output_merged, n_jobs='ALL_CPUS'):
         gdal.BuildVRT(output_vrt, raster_files, options=vrt_options)
 
         print(f"Merging rasters into {output_merged}...")
-        ds = gdal.Translate(
-            output_merged,
-            output_vrt,
+        translate_to_cog_opts = gdal.TranslateOptions(
             format='COG',
             creationOptions=[
                 'COMPRESS=DEFLATE',
                 'BLOCKSIZE=256',
                 'OVERVIEWS=AUTO',
                 'BIGTIFF=YES',
-                f'NUM_THREADS={n_jobs}'
-            ]
+                f'NUM_THREADS={n_jobs}',
+            ],
+            callback=gdal.TermProgress_nocb,
+        )
+        ds = gdal.Translate(
+            output_merged,
+            output_vrt,
+            options=translate_to_cog_opts
         )
         ds.FlushCache()
         ds = None
         print(f"Merged raster created: {output_merged}")
+
+def meta_mosaic(orthos_in: list, output_path: str, keep_bands: list = None, intermediary_dir: str = None, tol: float = 1.0, n_workers: int = 4, buffer_m: float = 0.5):
+    """
+    Processes a list of input orthomosaics to produce a single, merged mosaic.
+
+    The workflow includes:
+    1. Defining hulls for each input orthomosaic.
+    2. Finding seamlines between the hulls.
+    3. Clipping each orthomosaic to its corresponding seamline region.
+    4. Mosaicking the clipped rasters into a final output.
+
+    Args:
+        orthos_in (list): List of paths to input orthomosaic GeoTIFF files.
+        output_path (str): Path to save the final merged mosaic GeoTIFF.
+        keep_bands (list, optional): List of 1-based band indices to keep from the input rasters. 
+                                     If None, all bands are kept. Defaults to None.
+        intermediary_dir (str, optional): Directory to store intermediate files (hulls, seamlines, clipped rasters).
+                                          If None, a temporary directory is created and deleted upon completion.
+                                          Defaults to None.
+        tol (float, optional): Tolerance used for hull generation and seamline finding. Defaults to 1.0.
+        n_workers (int, optional): Number of parallel workers to use for processing. Defaults to 4.
+        buffer_m (float, optional): Buffer distance in meters (or CRS units) to apply to seamlines. Defaults to 0.5.
+    """
+    
+    manage_temp_dir = False
+    if intermediary_dir is None:
+        temp_dir_obj = tempfile.TemporaryDirectory()
+        work_dir = temp_dir_obj.name
+        manage_temp_dir = True
+        print(f"Using temporary directory for intermediate files: {work_dir}")
+    else:
+        work_dir = intermediary_dir
+        os.makedirs(work_dir, exist_ok=True)
+        print(f"Using provided directory for intermediate files: {work_dir}")
+
+    try:
+        # Step 1: Define Hulls
+        print(f"Step 1: Defining hulls for {len(orthos_in)} orthomosaics...")
+        
+        def _extract_hull_batch(ortho_path, idx):
+            output_hull_geojson = os.path.join(work_dir, f"hull_{idx}_{os.path.basename(ortho_path).replace('.tif', '.geojson')}")
+            _, hull_file_out = define_hull(
+                geotiff_path_in=ortho_path,
+                hull_geojson_path=output_hull_geojson,
+                tol=tol
+            )
+            return ortho_path, hull_file_out
+
+        hull_results = joblib.Parallel(n_jobs=n_workers)(
+            joblib.delayed(_extract_hull_batch)(ortho_path, i) for i, ortho_path in enumerate(orthos_in)
+        )
+        
+        # Filter out None results from failed hull definitions
+        valid_hull_results = [res for res in hull_results if res is not None and res[1] is not None]
+        if not valid_hull_results:
+            raise RuntimeError("No valid hulls could be generated. Aborting meta_mosaic.")
+
+        processed_orthos_in = [r[0] for r in valid_hull_results]
+        hulls_out = [r[1] for r in valid_hull_results]
+        print(f"Successfully generated {len(hulls_out)} hulls.")
+
+        # Step 2: Find Seamlines
+        print("Step 2: Finding seamlines...")
+        seamline_files = find_seamlines(
+            input_hulls=hulls_out,
+            output_dir=work_dir, # find_seamlines will create files like seamline_1.geojson, seamline_2.geojson etc.
+            tol=tol,
+            buffer_m=buffer_m
+        )
+        
+        # Ensure seamline_files align with processed_orthos_in based on the order from find_seamlines
+        # find_seamlines returns a list that should correspond to the order of hulls_out.
+        # If find_seamlines modifies the order or can return fewer items, this needs careful handling.
+        # Assuming find_seamlines preserves order and number corresponding to hulls_out.
+        if len(seamline_files) != len(processed_orthos_in):
+             # This might happen if some hulls lead to no seamlines or if find_seamlines filters.
+             # For now, we'll proceed, but this could be a point of failure if indexing mismatches.
+            print(f"Warning: Number of seamlines ({len(seamline_files)}) does not match number of processed orthos ({len(processed_orthos_in)}).")
+            # Attempt to filter orthos that don't have a corresponding seamline (if None is placeholder)
+            valid_seamlines_with_orthos = []
+            temp_processed_orthos_in = []
+            for i, seam_file in enumerate(seamline_files):
+                if seam_file is not None and i < len(processed_orthos_in) : # check ortho index exists
+                    valid_seamlines_with_orthos.append(seam_file)
+                    temp_processed_orthos_in.append(processed_orthos_in[i])
+                else:
+                    print(f"Warning: No seamline generated or index issue for an ortho. Original index {i}")
+
+            seamline_files = valid_seamlines_with_orthos
+            processed_orthos_in = temp_processed_orthos_in
+            
+            if not seamline_files:
+                raise RuntimeError("No valid seamlines available to proceed with clipping.")
+
+
+        print(f"Generated {len(seamline_files)} seamline files.")
+        print("Input orthomosaics for clipping:")
+        for f_idx, f_path in enumerate(processed_orthos_in):
+            print(f"  Ortho {f_idx}: {f_path} -> Seamline {f_idx}: {seamline_files[f_idx] if f_idx < len(seamline_files) else 'N/A'}")
+
+
+        # Step 3: Clip Rasters
+        print("Step 3: Clipping rasters...")
+        
+        def _clip_single_raster(ortho_path, seamline_geojson_path, clip_idx, bands_to_keep):
+            output_clipped_raster = os.path.join(work_dir, f"clipped_{clip_idx}_{os.path.basename(ortho_path)}")
+            # Ensure seamline_geojson_path is not None
+            if seamline_geojson_path is None:
+                print(f"Warning: Skipping clipping for {ortho_path} as its seamline is missing.")
+                return None
+            return clip(ortho_path, seamline_geojson_path, output_clipped_raster, keep_bands=bands_to_keep)
+
+        clipped_rasters_paths = joblib.Parallel(n_jobs=n_workers)(
+            joblib.delayed(_clip_single_raster)(
+                processed_orthos_in[i],
+                seamline_files[i], # Use the seamline file corresponding to the ortho
+                i,
+                keep_bands
+            )
+            for i in range(len(processed_orthos_in)) if i < len(seamline_files) # Ensure we don't go out of bounds for seamline_files
+        )
+        
+        # Filter out None results from failed clippings
+        final_clipped_rasters = [p for p in clipped_rasters_paths if p is not None]
+        if not final_clipped_rasters:
+            raise RuntimeError("No rasters were successfully clipped. Aborting mosaic.")
+        print(f"Successfully clipped {len(final_clipped_rasters)} rasters.")
+
+        # Step 4: Mosaic Rasters
+        print("Step 4: Mosaicking clipped rasters...")
+        # Ensure n_jobs for mosaic is at least 1
+        mosaic_n_jobs = max(1, n_workers) if isinstance(n_workers, int) else 'ALL_CPUS'
+        
+        mosaic(final_clipped_rasters, output_path, n_jobs=mosaic_n_jobs)
+        print(f"Successfully created final mosaic: {output_path}")
+
+    finally:
+        if manage_temp_dir:
+            try:
+                temp_dir_obj.cleanup()
+                print(f"Temporary directory {work_dir} cleaned up.")
+            except Exception as e:
+                warnings.warn(f"Could not clean up temporary directory {work_dir}: {e}")
+    
+    return output_path
