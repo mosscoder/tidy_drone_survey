@@ -17,6 +17,10 @@ Geometric truth is declared explicitly, exactly one of:
 
 Resolutions may be "auto": the median of the named inputs' native pixel
 sizes, rounded to the millimetre (resolved once, at load).
+
+Credentials never live in the TOML — it only NAMES an environment variable
+(credentials_env). A `.env` beside the TOML may supply that variable's value
+(the path to a key file); variables already exported in the shell always win.
 """
 from __future__ import annotations
 
@@ -188,6 +192,7 @@ class Config:
     calibrate: CalibrateCfg = dc_field(default_factory=CalibrateCfg)
     paths: Paths = None
     source: Optional[str] = None            # the TOML this came from
+    dotenv_loaded: int = 0                  # vars applied from a .env beside the TOML
 
     # ---------------------------------------------------------------- plan -- #
     def plan(self) -> List[str]:
@@ -228,6 +233,35 @@ class Config:
 # --------------------------------------------------------------------------- #
 # load
 # --------------------------------------------------------------------------- #
+def _load_dotenv_beside(config_path) -> int:
+    """Apply a `.env` sitting next to the survey TOML: plain KEY=VALUE lines
+    (# comment lines and an `export ` prefix tolerated, matching quotes
+    stripped). Setdefault semantics — a variable already exported in the
+    shell ALWAYS wins, so the file is a fallback, never an override. This is
+    the ergonomic home for credentials_env's variable; the value is still a
+    path to a key file, never key material."""
+    envf = Path(config_path).resolve().parent / ".env"
+    if not envf.is_file():
+        return 0
+    applied = 0
+    for line in envf.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or not key or any(ch.isspace() for ch in key):
+            continue
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if key not in os.environ:
+            os.environ[key] = val
+            applied += 1
+    return applied
+
+
 def _named(items) -> List[NamedInput]:
     out = []
     for it in items or []:
@@ -246,9 +280,11 @@ def _median_native_gsd(inputs: List[NamedInput]) -> float:
 
 
 def load(path: str, resolve_auto: bool = True) -> Config:
-    """Parse + validate a survey TOML. With resolve_auto (default), "auto"
-    resolutions are resolved by opening each named input (any GDAL-openable
-    path: local, gs://, https://, /vsicurl/...)."""
+    """Parse + validate a survey TOML. A `.env` beside it is applied first
+    (variables already in the environment win). With resolve_auto (default),
+    "auto" resolutions are resolved by opening each named input (any
+    GDAL-openable path: local, gs://, https://, /vsicurl/...)."""
+    dotenv_n = _load_dotenv_beside(path)
     raw = _toml.loads(Path(path).read_text())
 
     cfg = Config(
@@ -259,6 +295,7 @@ def load(path: str, resolve_auto: bool = True) -> Config:
         anchor=raw.get("anchor"),
         credentials_env=raw.get("credentials_env"),
         source=str(path),
+        dotenv_loaded=dotenv_n,
     )
 
     # exactly one source of geometric truth — neither/both is a loud error

@@ -190,6 +190,9 @@ def main(argv=None):
     truth = (f'anchor = {cfg.anchor}' if cfg.anchor
              else 'georeferencing = "gcp" (stitched visible becomes the anchor)')
     print(f"  config OK — {truth}")
+    if cfg.dotenv_loaded:
+        print(f"  env     .env beside config applied ({cfg.dotenv_loaded} var"
+              f"{'s' if cfg.dotenv_loaded != 1 else ''}; exported shell vars win)")
     print(f"  plan    {' → '.join(cfg.plan())}")
     print(f"  run_dir {cfg.run_dir}  (products/ = deliverables · work/ = intermediates)")
 

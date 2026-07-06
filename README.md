@@ -49,6 +49,14 @@ pip install -e ".[match,sentinel,report]"   # LoFTR matching, GEE download, repo
 
 Python ≥ 3.10 (`tomli` is pulled in below 3.11).
 
+## Credentials
+
+The TOML never holds credentials — it names an environment variable
+(`credentials_env = "MPG_PROJECTS_CREDENTIALS"`) whose value is the path to a
+GEE service-account JSON. Export it in the shell, or put it in a `.env` file
+**beside the survey TOML** (plain `KEY=VALUE` lines); loading a config applies
+that file with setdefault semantics, so an exported variable always wins.
+
 ## Provenance
 
 The methods are the audited implementations from the 2024 front-country
