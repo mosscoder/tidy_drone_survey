@@ -588,7 +588,9 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             if key not in seen:
                 seen.add(key); seeds.append((int(y), int(x)))
         ans, dss, n_tiles = [], [], 0
-        for (y, x) in seeds:
+        for n_seed, (y, x) in enumerate(seeds, 1):
+            if n_seed % 100 == 0:
+                _F.release_matcher_cache(dev)   # cap MPS allocator growth
             r0 = min(max(y - _TILE_H // 2, 0), OUT_H - _TILE_H)
             c0 = min(max(x - _TILE_W // 2, 0), OUT_W - _TILE_W)
             a = vmain[ia].read(window=Window(c0, r0, _TILE_W, _TILE_H))
@@ -621,6 +623,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                           med_shift_cm=round(med_cm, 1)))
         log(f"    seam {names[ia]}-{names[ib]}: {n_tiles} tiles -> {len(an)} matches "
             f"-> {len(pts)} nodes (|e|={med_cm:.1f} cm)")
+    del matcher
+    _F.release_matcher_cache(dev)   # GPU work is done; composite runs for hours
     if not efield_c:
         raise RuntimeError("seam_merge: no seams matched")
 

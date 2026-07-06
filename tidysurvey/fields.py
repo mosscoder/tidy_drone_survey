@@ -106,6 +106,25 @@ def build_matcher(device=None):
     return KF.LoFTR(pretrained="outdoor").to(device).eval(), device
 
 
+def release_matcher_cache(device):
+    """Return the accelerator's cached allocator memory to the OS. torch's
+    MPS (and CUDA) caching allocator grows across thousands of match_tile
+    calls and never shrinks on its own — on Apple Silicon unified memory
+    that growth counts against system RAM (observed ~100 GB process
+    footprint over a long seam walk). Frees only cached, unused blocks, so
+    it is always safe; the next allocations just pay to re-allocate. Call
+    every ~100 tiles and at phase boundaries (del the matcher first at a
+    boundary so its weights free too)."""
+    import gc
+    import torch
+    gc.collect()
+    dtype = getattr(device, "type", None)
+    if dtype == "mps":
+        torch.mps.empty_cache()
+    elif dtype == "cuda":
+        torch.cuda.empty_cache()
+
+
 def match_tile(matcher, device, ga, gb, reject_px=4.0, min_tile=8):
     """LoFTR on one grayscale tile pair -> (anchors_px, deltas_px) after the
     per-tile robust gate: keep matches within reject_px of the tile's median

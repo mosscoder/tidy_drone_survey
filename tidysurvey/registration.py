@@ -109,9 +109,12 @@ def register_survey_dense(
     camera-geometry model, no per-chip polynomials, no dropped-chip holes.
     Output carries the mission's bands + a real alpha band.
 
-    Note: the audited runner isolates LoFTR in chunked subprocesses to dodge
-    an MPS per-process slowdown (m2_full.py telemetry); this in-process port
-    is the same math. If long missions crawl on Apple GPUs, chunk externally.
+    Note: torch's MPS allocator grows across long match passes; the cache is
+    released every 100 tiles and fully at the end of the pass
+    (fields.release_matcher_cache). The audited runner's stronger remedy —
+    LoFTR in chunked subprocesses (m2_full.py telemetry, which also dodged an
+    MPS per-process slowdown) — remains the fallback if a mission's footprint
+    still climbs or throughput decays: chunk externally.
     """
     t0 = _time.time()
     workers = workers or max(1, (os.cpu_count() or 4) - 1)
@@ -188,9 +191,13 @@ def register_survey_dense(
             continue
         k0, d = m
         buf_an.append(k0 + [c0, r0]); buf_d.append(d); n_used += 1
+        if n_run % 100 == 0:
+            _F.release_matcher_cache(dev)   # cap MPS allocator growth
         if n_run % 250 == 0:
             log(f"    [{n_run}/{len(tiles)}] tiles, {n_used} with matches")
     vrt_m.close(); vrt_a.close()
+    del matcher
+    _F.release_matcher_cache(dev)   # match pass done; solve + warp run on CPU
     if not buf_an:
         raise RuntimeError("register_survey_dense: no matches")
     an = np.concatenate(buf_an); d = np.concatenate(buf_d)
