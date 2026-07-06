@@ -169,6 +169,9 @@ def _report(cfg, failed_stage=None):
 
 # --------------------------------------------------------------------------- #
 def main(argv=None):
+    # progress must stream through pipes/tee live, not sit in an 8 KB buffer
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(prog="tidysurvey", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["run", "scenes", "stitch", "align",

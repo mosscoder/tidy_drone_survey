@@ -532,14 +532,20 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     tr_c = Affine.translation(OUT_TR.c, OUT_TR.f) * Affine.scale(res * _GEOM_DS, -res * _GEOM_DS)
     cres = res * _GEOM_DS
 
+    log(f"    coarse pass: validity masks for {N} inputs @ {cres:.2f} m "
+        f"({Wc}x{Hc} px each) ...")
+
     def read_alpha_c(i):
         with rasterio.open(paths[i]) as s:
             with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
                             resampling=Resampling.nearest) as v:
-                return v.read(aidx[i]) > 127
+                m = v.read(aidx[i]) > 127
+        log(f"      {names[i]}: {m.mean() * 100:.1f}% of the union grid")
+        return m
 
     with _TPE(max_workers=min(N, 8)) as ex:
         valid_c = list(ex.map(read_alpha_c, range(N)))
+    log("    coarse pass: EDT ownership + faultlines ...")
     ds_c = [_edt(v).astype(np.float32) * cres for v in valid_c]
     vstack = np.stack(valid_c)
     cov2_c = vstack.sum(0) >= 2
@@ -554,6 +560,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
            else np.full((Hc, Wc), 1e9, np.float32))
     if not fault_c.any():
         raise RuntimeError("seam_merge: no flight<->flight faultline — nothing to merge")
+    log(f"    coarse pass done: {int(fault_c.sum())} faultline cells "
+        f"(~{int(fault_c.sum()) * cres / 2000:.1f} km of seam; both sides marked)")
 
     if ownership_out:
         cat = np.zeros((Hc, Wc), np.uint8)
@@ -587,10 +595,15 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             key = (y // _TILE_H, x // _TILE_W)
             if key not in seen:
                 seen.add(key); seeds.append((int(y), int(x)))
+        log(f"    seam {names[ia]}-{names[ib]}: walking {len(seeds)} corridor tiles "
+            f"(LoFTR on {dev.type}) ...")
         ans, dss, n_tiles = [], [], 0
         for n_seed, (y, x) in enumerate(seeds, 1):
             if n_seed % 100 == 0:
                 _F.release_matcher_cache(dev)   # cap MPS allocator growth
+            if n_seed % 25 == 0:
+                log(f"      [{n_seed}/{len(seeds)}] tiles read+matched, "
+                    f"{n_tiles} usable")
             r0 = min(max(y - _TILE_H // 2, 0), OUT_H - _TILE_H)
             c0 = min(max(x - _TILE_W // 2, 0), OUT_W - _TILE_W)
             a = vmain[ia].read(window=Window(c0, r0, _TILE_W, _TILE_H))
@@ -719,15 +732,24 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         return kind
 
     blocks = [(r0, c0) for r0 in range(0, OUT_H, block) for c0 in range(0, OUT_W, block)]
-    log(f"    streaming {len(blocks)} blocks ({workers} workers) ...")
+    log(f"    composite: {len(blocks)} blocks of {block}x{block} px, {workers} workers "
+        f"(copy = one owner, byte-identical; own/seam = overlap blocks)")
+    t_comp = _time.perf_counter()
+    t_last = t_comp
     with _TPE(max_workers=workers) as ex:
         futs = {ex.submit(process_block, r0, c0): (r0, c0) for r0, c0 in blocks}
         n_done = 0
         for fut in _as_completed(futs):
             counts[fut.result()] += 1; n_done += 1
-            if n_done % 200 == 0 or n_done == len(blocks):
-                log(f"    [{n_done}/{len(blocks)}] copy={counts['copy']} "
-                    f"own={counts['own']} seam={counts['seam']} skip={counts['skip']}")
+            now = _time.perf_counter()
+            if n_done == len(blocks) or n_done % 100 == 0 or now - t_last >= 120:
+                t_last = now
+                gb = os.path.getsize(out) / 1e9 if os.path.exists(out) else 0.0
+                rate = n_done / max(now - t_comp, 1e-9)
+                eta_m = (len(blocks) - n_done) / rate / 60
+                log(f"    [{n_done}/{len(blocks)}] {100 * n_done / len(blocks):4.1f}%  "
+                    f"copy={counts['copy']} own={counts['own']} seam={counts['seam']} "
+                    f"skip={counts['skip']}  {gb:.1f} GB on disk  ETA ~{eta_m:.0f} min")
     dst.close()
     for v in vmain.values():
         v.close()
