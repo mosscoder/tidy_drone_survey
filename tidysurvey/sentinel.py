@@ -316,6 +316,12 @@ def pick_scene(
     _, b = transformer.transform(bounds[2], bounds[1])
     region = [[l, t], [r, t], [r, b], [l, b], [l, t]]
 
+    if not gee_credentials_path or not os.path.exists(gee_credentials_path):
+        raise FileNotFoundError(
+            f"GEE credentials not found: {gee_credentials_path!r} — the config's "
+            "credentials_env names an environment variable whose value must be the "
+            "path to a service-account JSON; set it in the shell or in a .env "
+            "beside the survey TOML")
     scopes = ['https://www.googleapis.com/auth/earthengine']
     credentials = service_account.Credentials.from_service_account_file(
         gee_credentials_path, scopes=scopes)
