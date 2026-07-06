@@ -16,7 +16,10 @@ Geometric truth is declared explicitly, exactly one of:
                                          to this before stitching (spring/fall)
 
 Resolutions may be "auto": the median of the named inputs' native pixel
-sizes, rounded to the millimetre (resolved once, at load).
+sizes, rounded to the millimetre (resolved once, at load). Mission dates
+resolve the same way: an explicit per-mission date = "YYYY-MM-DD" wins,
+otherwise the date is read from the raster's own metadata tags at load
+(DroneDeploy's acquisitionStartDate, then TIFFTAG_DATETIME).
 
 Credentials never live in the TOML — it only NAMES an environment variable
 (credentials_env). A `.env` beside the TOML may supply that variable's value
@@ -28,6 +31,7 @@ import json
 import os
 import statistics
 from dataclasses import dataclass, field as dc_field
+from datetime import date as _iso_date
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -46,7 +50,8 @@ class NamedInput:
     seam tables and report rows, so every number traces to an input."""
     name: str
     path: str
-    date: Optional[str] = None      # optional 'YYYY-MM-DD' (used by date="auto")
+    date: Optional[str] = None      # 'YYYY-MM-DD'; omitted -> read from raster
+                                    # tags at load (explicit value = override)
 
 
 @dataclass
@@ -279,11 +284,51 @@ def _median_native_gsd(inputs: List[NamedInput]) -> float:
     return round(statistics.median(res), 3)
 
 
+_DATE_TAGS = ("acquisitionStartDate", "acquisitionEndDate", "TIFFTAG_DATETIME")
+
+
+def _date_from_tags(tags: dict) -> Optional[str]:
+    """'YYYY-MM-DD' from raster metadata: DroneDeploy's acquisitionStartDate
+    (ISO), else acquisitionEndDate, else baseline TIFFTAG_DATETIME (which
+    writes 'YYYY:MM:DD HH:MM:SS'). None when nothing parseable is present."""
+    for key in _DATE_TAGS:
+        val = tags.get(key)
+        if not val:
+            continue
+        d = val[:10].replace(":", "-") if key == "TIFFTAG_DATETIME" else val[:10]
+        try:
+            _iso_date.fromisoformat(d)
+            return d
+        except ValueError:
+            continue
+    return None
+
+
+def _scan_missions(missions: List[NamedInput], need_gsd: bool) -> Optional[float]:
+    """One header-open per mission serves both autos: native GSDs (when the
+    resolution is 'auto') and acquisition dates from tags for missions
+    without an explicit date. Missions whose header holds no usable date
+    keep date=None — pick_scene medians over whatever dates exist."""
+    import rasterio
+    res = []
+    for m in missions:
+        need_date = m.date is None
+        if not (need_gsd or need_date):
+            continue
+        with rasterio.open(m.path) as s:
+            if need_gsd:
+                res.append(abs(s.res[0]))
+            if need_date:
+                m.date = _date_from_tags(s.tags())
+    return round(statistics.median(res), 3) if res else None
+
+
 def load(path: str, resolve_auto: bool = True) -> Config:
     """Parse + validate a survey TOML. A `.env` beside it is applied first
     (variables already in the environment win). With resolve_auto (default),
-    "auto" resolutions are resolved by opening each named input (any
-    GDAL-openable path: local, gs://, https://, /vsicurl/...)."""
+    "auto" resolutions and missing mission dates are resolved by opening each
+    named input (any GDAL-openable path: local, gs://, https://, /vsicurl/...);
+    dates come from the rasters' own metadata tags."""
     dotenv_n = _load_dotenv_beside(path)
     raw = _toml.loads(Path(path).read_text())
 
@@ -344,9 +389,11 @@ def load(path: str, resolve_auto: bool = True) -> Config:
         if vres == "auto" and cfg.visible.orthos:
             vres = _median_native_gsd(cfg.visible.orthos)
             cfg.visible.resolution_m = vres
-        if mres == "auto" and cfg.ms.missions:
-            mres = _median_native_gsd(cfg.ms.missions)
-            cfg.ms.resolution_m = mres
+        if cfg.ms.missions:
+            scanned = _scan_missions(cfg.ms.missions, need_gsd=(mres == "auto"))
+            if mres == "auto":
+                mres = scanned
+                cfg.ms.resolution_m = mres
     cfg.paths = Paths(cfg.run_dir, cfg.survey,
                       visible_res=vres if isinstance(vres, float) else None,
                       ms_res=mres if isinstance(mres, float) else None)
