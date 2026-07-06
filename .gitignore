@@ -120,3 +120,6 @@ ENV/
 
 #
 *.tif
+
+# macOS
+.DS_Store

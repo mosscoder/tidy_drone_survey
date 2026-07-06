@@ -1,0 +1,332 @@
+"""One TOML per survey drives the whole pipeline.
+
+The config declares WHAT the survey is (named inputs, bands, the source of
+geometric truth); the pipeline derives WHERE everything lands (`Paths`) and
+WHICH stages run (`Config.plan()`). File paths are not settings — the run
+layout under `run_dir` is a guarantee of the tool, identical for every survey:
+
+    <run_dir>/products/                  the deliverables (copy this = shipped)
+    <run_dir>/products/quality/          reliability rasters + quality report
+    <run_dir>/work/                      intermediates, deletable once accepted
+
+Geometric truth is declared explicitly, exactly one of:
+    georeferencing = "gcp"               orthos carry ground control; their
+                                         stitched product becomes the anchor
+    anchor = "<path to prior base map>"  no GCPs; the visible layer is aligned
+                                         to this before stitching (spring/fall)
+
+Resolutions may be "auto": the median of the named inputs' native pixel
+sizes, rounded to the millimetre (resolved once, at load).
+"""
+from __future__ import annotations
+
+import json
+import os
+import statistics
+from dataclasses import dataclass, field as dc_field
+from pathlib import Path
+from typing import List, Optional, Union
+
+try:  # tomllib is stdlib from 3.11; tomli is the same parser for 3.10
+    import tomllib as _toml
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as _toml
+
+
+# --------------------------------------------------------------------------- #
+# pieces
+# --------------------------------------------------------------------------- #
+@dataclass
+class NamedInput:
+    """Every input is named; the name follows it through registered files,
+    seam tables and report rows, so every number traces to an input."""
+    name: str
+    path: str
+    date: Optional[str] = None      # optional 'YYYY-MM-DD' (used by date="auto")
+
+
+@dataclass
+class VisibleCfg:
+    resolution_m: Union[float, str] = "auto"
+    orthos: List[NamedInput] = dc_field(default_factory=list)
+
+
+@dataclass
+class MultispectralCfg:
+    resolution_m: Union[float, str] = "auto"
+    bands: List[str] = dc_field(default_factory=lambda: ["Red", "Green", "NIR", "RedEdge"])
+    missions: List[NamedInput] = dc_field(default_factory=list)
+
+
+@dataclass
+class StitchCfg:
+    band_width_m: float = 1.0        # blend width; the one aesthetic knob
+    gauge: str = "free"              # "free" = split evenly; "anchored" = pin to the first input
+    seam_tripwire_cm: float = 20.0   # hard gate on post-stitch seams
+
+
+@dataclass
+class CalibrateCfg:
+    reference: str = "sentinel-2"
+    date: str = "auto"               # "auto" = median mission date + scene menu; or 'YYYY-MM-DD'
+    search_days: int = 14
+    max_scene_cloud_pct: float = 20.0
+    band_map: dict = dc_field(default_factory=lambda: {"B4": "Red", "B3": "Green",
+                                                       "B8": "NIR", "B5": "RedEdge"})
+    block_m: float = 100.0           # tile size — a reasoned choice, not tuned
+    model: str = "ridge"             # per-tile cross-band linear fit
+    blend: str = "bilinear"          # coefficient interpolation; exact for a linear fit
+    clip: str = "scene"              # clamp output to the reference scene's range
+
+
+def gsd_slug(res_m: float) -> str:
+    """0.032 -> '3p2cm', 0.059 -> '5p9cm', 0.10 -> '10cm'."""
+    cm = res_m * 100.0
+    txt = f"{cm:g}"
+    return txt.replace(".", "p") + "cm"
+
+
+class Paths:
+    """The run layout, derived from run_dir + survey. Every stage writes
+    through this object, so the on-disk tree is a guarantee, not a habit."""
+
+    def __init__(self, run_dir: str, survey: str,
+                 visible_res: Optional[float] = None, ms_res: Optional[float] = None):
+        self.run_dir = Path(run_dir)
+        self.survey = survey
+        self._vres = visible_res
+        self._mres = ms_res
+
+        self.products = self.run_dir / "products"
+        self.quality = self.products / "quality"
+        self.work = self.run_dir / "work"
+        self.registered = self.work / "registered"
+        self.reports = self.work / "reports"
+
+    # -- deliverables (self-describing names: survey slug + resolved GSD) --- #
+    def _need(self, res, what):
+        if res is None:
+            raise ValueError(f"{what} resolution not resolved yet — "
+                             "load the config with resolve_auto=True")
+        return res
+
+    @property
+    def visible_base(self) -> Path:
+        r = self._need(self._vres, "visible")
+        return self.products / f"{self.survey}_visible_{gsd_slug(r)}.tif"
+
+    @property
+    def ms_calibrated(self) -> Path:
+        r = self._need(self._mres, "multispectral")
+        return self.products / f"{self.survey}_ms_calibrated_{gsd_slug(r)}.tif"
+
+    @property
+    def manifest(self) -> Path:
+        return self.products / "_run_manifest.json"
+
+    # -- quality (shipped evidence) ----------------------------------------- #
+    @property
+    def reg_qa(self) -> Path:
+        return self.quality / "ms_registration_reliability_7p55m.tif"
+
+    @property
+    def visible_reg_qa(self) -> Path:
+        return self.quality / "visible_registration_reliability_7p55m.tif"
+
+    @property
+    def calib_qa(self) -> Path:
+        return self.quality / "ms_calibrated_reliability_100m.tif"
+
+    @property
+    def calib_model(self) -> Path:
+        return self.quality / "calibration_model.json"
+
+    @property
+    def report_html(self) -> Path:
+        return self.quality / "quality_report.html"
+
+    @property
+    def report_json(self) -> Path:
+        return self.quality / "quality_report.json"
+
+    # -- work (intermediates) ------------------------------------------------ #
+    @property
+    def ms_mosaic(self) -> Path:
+        return self.work / "ms_uncalibrated.tif"
+
+    @property
+    def ms_mosaic_ownership(self) -> Path:
+        return self.work / "ms_uncalibrated.ownership.tif"
+
+    @property
+    def visible_ownership(self) -> Path:
+        return self.work / "visible_base.ownership.tif"
+
+    def stage_report(self, stage: str) -> Path:
+        return self.reports / f"{stage}.json"
+
+    def sentinel_scene(self, date_yymmdd: str = "{date}") -> Path:
+        return self.work / f"sentinel_2_bands_{date_yymmdd}.tif"
+
+    def ensure(self):
+        for d in (self.products, self.quality, self.work, self.registered, self.reports):
+            d.mkdir(parents=True, exist_ok=True)
+        return self
+
+
+@dataclass
+class Config:
+    survey: str
+    crs: str
+    run_dir: str
+    georeferencing: Optional[str] = None    # "gcp" | None
+    anchor: Optional[str] = None            # path to a prior base map | None
+    credentials_env: Optional[str] = None
+    visible: VisibleCfg = dc_field(default_factory=VisibleCfg)
+    ms: MultispectralCfg = dc_field(default_factory=MultispectralCfg)
+    stitch: StitchCfg = dc_field(default_factory=StitchCfg)
+    calibrate: CalibrateCfg = dc_field(default_factory=CalibrateCfg)
+    paths: Paths = None
+    source: Optional[str] = None            # the TOML this came from
+
+    # ---------------------------------------------------------------- plan -- #
+    def plan(self) -> List[str]:
+        """The stage list is DERIVED from the config — the command line never
+        decides pipeline shape. A borrowed anchor inserts the visible-align
+        pass; a multispectral layer appends align/stitch/calibrate."""
+        stages = []
+        if self.ms.missions and self.calibrate.reference:
+            stages.append("scene")                       # settled before heavy work
+        if self.anchor:
+            stages.append("align/visible")               # borrowed truth: align first
+        if self.visible.orthos:
+            stages.append("stitch/visible")
+        if self.ms.missions:
+            stages += ["align/ms", "stitch/ms", "calibrate"]
+        stages.append("report")
+        return stages
+
+    def credentials_path(self) -> Optional[str]:
+        if not self.credentials_env:
+            return None
+        return os.environ.get(self.credentials_env)
+
+    def snapshot(self) -> dict:
+        """The resolved config (autos filled in), for the manifest + report."""
+        return {
+            "survey": self.survey, "crs": self.crs, "run_dir": self.run_dir,
+            "georeferencing": self.georeferencing, "anchor": self.anchor,
+            "visible": {"resolution_m": self.visible.resolution_m,
+                        "orthos": [vars(o) for o in self.visible.orthos]},
+            "multispectral": {"resolution_m": self.ms.resolution_m, "bands": self.ms.bands,
+                              "missions": [vars(m) for m in self.ms.missions]},
+            "stitch": vars(self.stitch), "calibrate": dict(vars(self.calibrate)),
+            "plan": self.plan(), "source": self.source,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# load
+# --------------------------------------------------------------------------- #
+def _named(items) -> List[NamedInput]:
+    out = []
+    for it in items or []:
+        out.append(NamedInput(name=it["name"], path=it["path"], date=it.get("date")))
+    return out
+
+
+def _median_native_gsd(inputs: List[NamedInput]) -> float:
+    """The 'auto' rule: median of the inputs' native pixel sizes, to the mm."""
+    import rasterio
+    res = []
+    for it in inputs:
+        with rasterio.open(it.path) as s:
+            res.append(abs(s.res[0]))
+    return round(statistics.median(res), 3)
+
+
+def load(path: str, resolve_auto: bool = True) -> Config:
+    """Parse + validate a survey TOML. With resolve_auto (default), "auto"
+    resolutions are resolved by opening each named input (any GDAL-openable
+    path: local, gs://, https://, /vsicurl/...)."""
+    raw = _toml.loads(Path(path).read_text())
+
+    cfg = Config(
+        survey=raw["survey"],
+        crs=raw.get("crs", "EPSG:6514"),
+        run_dir=raw.get("run_dir", "."),
+        georeferencing=raw.get("georeferencing"),
+        anchor=raw.get("anchor"),
+        credentials_env=raw.get("credentials_env"),
+        source=str(path),
+    )
+
+    # exactly one source of geometric truth — neither/both is a loud error
+    has_gcp = cfg.georeferencing is not None
+    has_anchor = cfg.anchor is not None
+    if has_gcp and cfg.georeferencing != "gcp":
+        raise ValueError(f'georeferencing = "{cfg.georeferencing}" — the only '
+                         'accepted value is "gcp" (or set anchor = "<path>" instead)')
+    if has_gcp == has_anchor:
+        raise ValueError(
+            'declare where geometric truth comes from: exactly ONE of '
+            'georeferencing = "gcp" (orthos carry ground control) or '
+            'anchor = "<path to a prior GCP-stitched base map>". '
+            f'Got georeferencing={cfg.georeferencing!r}, anchor={cfg.anchor!r}.')
+    if has_anchor and resolve_auto and not Path(cfg.anchor).exists() \
+            and "://" not in cfg.anchor and not cfg.anchor.startswith("/vsi"):
+        raise FileNotFoundError(f"anchor not found: {cfg.anchor}")
+
+    v = raw.get("visible", {})
+    cfg.visible = VisibleCfg(resolution_m=v.get("resolution_m", "auto"),
+                             orthos=_named(v.get("orthos")))
+    m = raw.get("multispectral", {})
+    cfg.ms = MultispectralCfg(resolution_m=m.get("resolution_m", "auto"),
+                              bands=m.get("bands", ["Red", "Green", "NIR", "RedEdge"]),
+                              missions=_named(m.get("missions")))
+    s = raw.get("stitch", {})
+    cfg.stitch = StitchCfg(band_width_m=s.get("band_width_m", 1.0),
+                           gauge=s.get("gauge", "free"),
+                           seam_tripwire_cm=s.get("seam_tripwire_cm", 20.0))
+    c = raw.get("calibrate", {})
+    cfg.calibrate = CalibrateCfg(
+        reference=c.get("reference", "sentinel-2"),
+        date=c.get("date", "auto"),
+        search_days=c.get("search_days", 14),
+        max_scene_cloud_pct=c.get("max_scene_cloud_pct", 20.0),
+        band_map=c.get("band_map", {"B4": "Red", "B3": "Green", "B8": "NIR", "B5": "RedEdge"}),
+        block_m=c.get("block_m", 100.0),
+        model=c.get("model", "ridge"),
+        blend=c.get("blend", "bilinear"),
+        clip=c.get("clip", "scene"),
+    )
+
+    vres = cfg.visible.resolution_m
+    mres = cfg.ms.resolution_m
+    if resolve_auto:
+        if vres == "auto" and cfg.visible.orthos:
+            vres = _median_native_gsd(cfg.visible.orthos)
+            cfg.visible.resolution_m = vres
+        if mres == "auto" and cfg.ms.missions:
+            mres = _median_native_gsd(cfg.ms.missions)
+            cfg.ms.resolution_m = mres
+    cfg.paths = Paths(cfg.run_dir, cfg.survey,
+                      visible_res=vres if isinstance(vres, float) else None,
+                      ms_res=mres if isinstance(mres, float) else None)
+    return cfg
+
+
+def write_manifest(cfg: Config, extra: dict = None) -> Path:
+    """Config snapshot + resolved autos (+ scene lock, versions, timings)."""
+    cfg.paths.ensure()
+    manifest = {"config": cfg.snapshot()}
+    if cfg.paths.manifest.exists():
+        try:
+            manifest = json.loads(cfg.paths.manifest.read_text())
+            manifest["config"] = cfg.snapshot()
+        except Exception:
+            pass
+    if extra:
+        manifest.update(extra)
+    cfg.paths.manifest.write_text(json.dumps(manifest, indent=2))
+    return cfg.paths.manifest

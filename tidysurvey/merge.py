@@ -1,17 +1,13 @@
 import os
-import warnings
-import tempfile
 import tempfile
 
 import numpy as np
-from scipy.ndimage import binary_fill_holes
 from scipy import ndimage
 
 import rasterio
-from rasterio.enums import Resampling, ColorInterp
+from rasterio.enums import Resampling, ColorInterp  # noqa: F401 (ColorInterp used by seam_merge)
 from rasterio import features as rio_features
-
-from osgeo import gdal
+from rasterio.windows import Window
 
 import geopandas as gpd
 from shapely.geometry import shape
@@ -19,238 +15,200 @@ from shapely.ops import unary_union
 
 from affine import Affine
 import joblib
-import shutil
 
-# Define a progress callback function
-def my_progress_callback(complete, message, user_data):
+def _process_tile_for_hull(args):
     """
-    Prints the progress of the GDAL operation.
-    
+    Process a single tile and return unioned polygon.
+    Module-level function for joblib compatibility.
+    Each call opens its own file handle for thread safety.
+
     Args:
-        complete (float): Progress percentage (0.0 to 1.0).
-        message (str): Message from GDAL.
-        user_data: Custom data passed to the callback.
+        args: Tuple of (raster_path, window_tuple, alpha_idx, decimation)
+              - decimation: Factor to downsample the tile (1 = no downsampling)
+
+    Returns:
+        A single geometry (unary_union of tile polygons) or None if no data.
     """
-    # The message can be empty, so handle that for cleaner output
-    if message:
-        print(f"gdal_translate Progress: {complete*100:.2f}% - {message}")
-    else:
-        print(f"gdal_translate Progress: {complete*100:.2f}%")
-    return 1 # Must return 1 to continue processing
+    raster_path, window_tuple, alpha_idx, decimation = args
+    window = Window(*window_tuple)
+    tile_polys = []
 
-def define_hull(
-    geotiff_path_in: str,
-    hull_geojson_path: str,
-    tol: float = 1.0
-):
-    if tol <= 0: raise ValueError("tol must be positive.")
-    cutline_simplify_tolerance = tol
-
-    print(f"Starting hull definition for: {geotiff_path_in}")
-    print(f"  Output Hull GeoJSON: {hull_geojson_path}")
-    print(f"  Target tolerance for hull: {tol}m")
-
-    source_alpha_band_index_1based = None
-    with rasterio.open(geotiff_path_in) as pre_src:
-        print("Reading source GeoTIFF profile for initial dimensions, CRS, and alpha band detection...")
-        profile_orig = pre_src.profile.copy()
-        original_width, original_height = pre_src.width, pre_src.height
-        original_transform, source_crs = pre_src.transform, pre_src.crs
-        src_bounds = pre_src.bounds
-
-        if pre_src.colorinterp:
-            for i, interp in enumerate(pre_src.colorinterp):
-                if interp == ColorInterp.alpha:
-                    source_alpha_band_index_1based = i + 1
-                    print(f"Source GeoTIFF has an alpha band (index {source_alpha_band_index_1based}). This band will be used for hull generation.")
-                    break
-
-        if source_crs and source_crs.is_geographic:
-            warnings.warn("Geographic CRS: 'tol' in degrees. Projected CRS recommended.")
-
-    print("Determining mask generation grid dimensions...")
-    mask_gen_width = max(1, min(original_width, round(abs(src_bounds.right - src_bounds.left) / tol)))
-    mask_gen_height = max(1, min(original_height, round(abs(src_bounds.top - src_bounds.bottom) / tol)))
-    print(f"Calculated mask generation grid: {mask_gen_width}x{mask_gen_height}")
-
-    temp_gdal_file_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmpfile:
-            temp_gdal_file_path = tmpfile.name
-        print(f"Creating temporary local GeoTIFF for mask grid: {temp_gdal_file_path}")
+        with rasterio.open(raster_path) as src:
+            # Calculate downsampled dimensions
+            out_height = max(1, int(window.height / decimation))
+            out_width = max(1, int(window.width / decimation))
 
-        gdal_input_path = geotiff_path_in
-        
-        translate_options_dict = {
-            "format": "GTiff",
-            "width": int(mask_gen_width),
-            "height": int(mask_gen_height),
-            "callback": my_progress_callback,
-            "callback_data": None # Optional: pass custom data to the callback
-        }
+            if alpha_idx is not None:
+                data = src.read(
+                    alpha_idx,
+                    window=window,
+                    out_shape=(out_height, out_width),
+                    resampling=Resampling.nearest
+                )
+                mask = data > 0
+            else:
+                data = src.read(
+                    window=window,
+                    out_shape=(src.count, out_height, out_width),
+                    resampling=Resampling.nearest
+                )
+                mask = np.any(data != 0, axis=0)
 
-        if source_alpha_band_index_1based is not None:
-            translate_options_dict["bandList"] = [int(source_alpha_band_index_1based)]
-            print(f"gdal.Translate will use source alpha band: {source_alpha_band_index_1based}")
-        else:
-            print("gdal.Translate will process all bands (no source alpha band specified for dedicated use).")
+            if not mask.any():
+                return None
 
-        gdal_translate_options = gdal.TranslateOptions(**translate_options_dict)
+            # Exact scale factors for edge tiles (handles non-divisible sizes)
+            scale_x = window.width / out_width
+            scale_y = window.height / out_height
+            base_transform = src.window_transform(window)
+            scaled_transform = base_transform * Affine.scale(scale_x, scale_y)
 
-        print(f"Executing gdal.Translate from {gdal_input_path} to {temp_gdal_file_path}")
-        # Replace subprocess call with gdal.Translate
-        ds = gdal.Translate(temp_gdal_file_path, gdal_input_path, options=gdal_translate_options)
-        
-        if ds is None:
-            raise RuntimeError(f"gdal.Translate failed for {gdal_input_path}. Output dataset is None.")
-        
-        # It's good practice to dereference the dataset object when done if not used further,
-        # allowing GDAL to close it and flush writes.
-        ds = None 
+            shapes_gen = rio_features.shapes(
+                mask.astype('uint8'),
+                mask=mask,
+                transform=scaled_transform
+            )
 
-        with rasterio.open(temp_gdal_file_path) as src:
-            profile = src.profile.copy()
+            for geom, val in shapes_gen:
+                if val == 1:
+                    tile_polys.append(shape(geom))
 
-            color_band_indices_1based, color_band_indices_0based = [], []
-            alpha_idx_0based = -1
+        # Return unioned geometry (reduces pickle overhead)
+        if tile_polys:
+            return unary_union(tile_polys)
+        return None
 
+    except Exception:
+        return None
+
+
+def define_hull_tiled(
+    raster_path: str,
+    output_geojson: str,
+    tile_size: int = 2048,
+    tol: float = 0.5,
+    simplify_tolerance: float = 1.0,
+    n_workers: int = 8,
+    show_progress: bool = True,
+) -> tuple:
+    """
+    Extract hull polygon from raster using tile-based streaming with decimation.
+
+    Args:
+        raster_path: Path or URL to input raster (supports /vsicurl/)
+        output_geojson: Path to output hull GeoJSON
+        tile_size: Tile size in pixels for streaming
+        tol: Resolution tolerance for decimation (in CRS units). Determines how
+             much to downsample tiles. Lower = finer detail, higher = faster.
+        simplify_tolerance: Tolerance for final polygon simplification (in CRS units)
+        n_workers: Number of parallel workers for tile processing
+        show_progress: Whether to show tqdm progress bar
+
+    Returns:
+        Tuple of (raster_path, output_geojson) or (raster_path, None) on failure
+    """
+    from tqdm import tqdm
+
+    print(f"Extracting hull (tiled) for: {raster_path}")
+
+    try:
+        # First pass: get metadata and build window list
+        with rasterio.open(raster_path) as src:
+            crs = src.crs
+            width, height = src.width, src.height
+            native_res = src.res[0]  # meters/pixel (assumes square pixels)
+
+            # Calculate decimation factor: tol is the target resolution
+            decimation = max(1, int(tol / native_res))
+            print(f"  Native res: {native_res:.4f}m, target: {tol:.4f}m, decimation: {decimation}x")
+
+            # Find alpha band
+            alpha_idx = None
             if src.colorinterp:
                 for i, interp in enumerate(src.colorinterp):
-                    if interp == ColorInterp.alpha: alpha_idx_0based = i
-                    else:
-                        color_band_indices_1based.append(i + 1)
-                        color_band_indices_0based.append(i)
-            
-            if not color_band_indices_1based:
-                warnings.warn("No specific color band interpretation found in temp file or only alpha. Assuming all non-alpha bands are color/data.")
-                for i in range(src.count):
-                    if i != alpha_idx_0based:
-                        color_band_indices_1based.append(i + 1)
-                        color_band_indices_0based.append(i)
+                    if interp == ColorInterp.alpha:
+                        alpha_idx = i + 1  # 1-based
+                        break
 
-            if not color_band_indices_1based: raise ValueError("No color/data bands identified to process from temp file.")
-            num_output_color_bands = len(color_band_indices_0based)
-            print(f"Identified {num_output_color_bands} color/data band(s) to process from temp file.")
-            if alpha_idx_0based != -1: print("Temp file contains an alpha band (original source might have had one).")
-
-            transform_mask_grid = src.transform
-            print(f"Using temp file resolution for mask/hull generation: {src.width}x{src.height}")
-            
-            if source_alpha_band_index_1based is not None:
-                print("Reading the single (alpha) band from the temporary file for mask generation...")
-                alpha_band_data = src.read(1)
-                interior_mask = binary_fill_holes(alpha_band_data != 0)
-                del alpha_band_data
+            if alpha_idx is None:
+                print(f"  No alpha band found, will check all bands for zeros")
             else:
-                print("No source alpha band explicitly used. Identifying color/data bands from temporary file for mask generation...")
-                
-                color_band_indices_1based, color_band_indices_0based = [], []
-                alpha_idx_0based_in_temp = -1
+                print(f"  Using alpha band {alpha_idx}")
 
-                if src.colorinterp:
-                    for i, interp_val in enumerate(src.colorinterp):
-                        if interp_val == ColorInterp.alpha: 
-                            alpha_idx_0based_in_temp = i
-                        else:
-                            color_band_indices_1based.append(i + 1)
-                            color_band_indices_0based.append(i)
-                
-                if not color_band_indices_1based:
-                    warnings.warn("No specific color band interpretation found in temp file (post gdal_translate) or only alpha. Assuming all non-alpha bands are color/data.")
-                    for i in range(src.count):
-                        if i != alpha_idx_0based_in_temp:
-                            color_band_indices_1based.append(i + 1)
-                            color_band_indices_0based.append(i)
+        # Build list of tile windows (as tuples for serialization)
+        windows = []
+        for row_off in range(0, height, tile_size):
+            for col_off in range(0, width, tile_size):
+                win_height = min(tile_size, height - row_off)
+                win_width = min(tile_size, width - col_off)
+                windows.append((col_off, row_off, win_width, win_height))
 
-                if not color_band_indices_1based: 
-                    if src.count > 0 :
-                         raise ValueError("No non-alpha data bands identified in the temporary file to process for hull (multi-band path). Ensure the source has usable data bands if no explicit alpha band is present.")
-                    else:
-                         raise ValueError("Temporary file has 0 bands after gdal_translate. Cannot proceed.")
+        print(f"  Processing {len(windows)} tiles with {n_workers} workers...")
 
-                print(f"Identified {len(color_band_indices_1based)} color/data band(s) from temp file to process.")
-                if alpha_idx_0based_in_temp != -1: 
-                    print("Note: The temporary file (post gdal_translate) also contains an alpha band, which is being ignored for mask generation in this multi-band path.")
+        # Build args for parallel processing (includes decimation)
+        tile_args = [(raster_path, w, alpha_idx, decimation) for w in windows]
 
-                print("Reading color data for mask grid from local temp file (multi-band path)...")
-                color_data_mask_grid = src.read(color_band_indices_1based, resampling=Resampling.nearest)
-                
-                if color_data_mask_grid.ndim == 2 and len(color_band_indices_1based) == 1: 
-                    color_data_mask_grid = color_data_mask_grid[np.newaxis, :, :]
-                
-                print("Generating interior mask for vectorization (from identified data bands)...")
-                interior_mask = binary_fill_holes(np.any(color_data_mask_grid != 0, axis=0))
-                del color_data_mask_grid
-            
-            print("Interior mask generated.")
+        # Process tiles in parallel with progress bar
+        results = joblib.Parallel(n_jobs=n_workers, backend='loky')(
+            joblib.delayed(_process_tile_for_hull)(args)
+            for args in tqdm(tile_args, desc="  Tiles", disable=not show_progress, leave=False)
+        )
 
-            print("Vectorizing interior mask to shapes...")
-            shapes = list(rio_features.shapes(interior_mask.astype(np.uint8), mask=interior_mask, transform=transform_mask_grid))
-            del interior_mask
-            print(f"Vectorization resulted in {len(shapes)} shapes.")
-            
-            final_shapely_geom = None
-            if shapes:
-                print("Processing shapes to generate final hull geometry...")
-                geoms = [shape(s_dict) for s_dict, val in shapes if s_dict and s_dict.get("type")]
-                valid_geoms = [g.buffer(0) if not g.is_valid else g for g in geoms] 
-                valid_geoms = [g for g in valid_geoms if g.is_valid and not g.is_empty]
-                if valid_geoms:
-                    print(f"Uniting {len(valid_geoms)} valid geometries...")
-                    unioned_geom = unary_union(valid_geoms)
-                    if cutline_simplify_tolerance is not None and cutline_simplify_tolerance > 0:
-                        print(f"Simplifying geometry with tolerance {cutline_simplify_tolerance}...")
-                        unioned_geom = unioned_geom.simplify(cutline_simplify_tolerance, preserve_topology=True)
-                    if not unioned_geom.is_empty: final_shapely_geom = unioned_geom
-                print("Hull geometry processing complete.")
-            
-            num_cutline_features = 0
-            print(f"Saving hull to GeoJSON: {hull_geojson_path}")
-            if final_shapely_geom:
-                gdf = gpd.GeoDataFrame(
-                    {'id': [1], 'description': ['Hull of valid data']},
-                    geometry=[final_shapely_geom],
-                    crs=source_crs
-                )
-                gdf.to_file(hull_geojson_path, driver='GeoJSON', encoding='utf-8')
-                num_cutline_features = len(gdf)
-            else:
-                warnings.warn(f"No valid hull geometry found for {geotiff_path_in}. Empty GeoJSON will be created.")
-                gdf = gpd.GeoDataFrame(geometry=[], crs=source_crs)
-                gdf.to_file(hull_geojson_path, driver='GeoJSON', encoding='utf-8')
-            print(f"Hull saved ({num_cutline_features} feature(s)).")
+        # Collect results - now single geometries or None
+        tile_geometries = [r for r in results if r is not None]
+        n_tiles_with_data = len(tile_geometries)
 
-            print(f"Hull definition process for {geotiff_path_in} finished. GeoJSON saved to {hull_geojson_path}")
+        print(f"  Processed {len(windows)} tiles, {n_tiles_with_data} with data")
 
-            return geotiff_path_in, hull_geojson_path
+        if not tile_geometries:
+            print(f"  Warning: No valid data found")
+            return raster_path, None
+
+        # Union all tile geometries, close gaps, and simplify
+        print(f"  Unioning {n_tiles_with_data} tile geometries...")
+        hull = unary_union(tile_geometries)
+        hull = hull.buffer(1.0).buffer(-1.0)  # close tile boundary gaps
+        if simplify_tolerance > 0:
+            hull = hull.simplify(simplify_tolerance, preserve_topology=True)
+
+        # Save to GeoJSON
+        gdf = gpd.GeoDataFrame({'geometry': [hull]}, crs=crs)
+        gdf.to_file(output_geojson, driver='GeoJSON')
+        print(f"  Saved hull to {output_geojson}")
+
+        return raster_path, output_geojson
 
     except Exception as e:
-        print(f"An error occurred during hull definition: {e}")
-        return None, None  # Ensure to return None for both outputs
+        print(f"  Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return raster_path, None
 
-    finally:
-        if temp_gdal_file_path and os.path.exists(temp_gdal_file_path):
-            try:
-                os.remove(temp_gdal_file_path)
-                print(f"Temporary file {temp_gdal_file_path} removed.")
-            except OSError as e:
-                warnings.warn(f"Error removing temporary file {temp_gdal_file_path}: {e}")
 
-def find_seamlines(input_hulls, output_dir, tol, buffer_m: float):
+def find_seamlines(input_hulls, output_dir, tol, buffer_m: float, grid_res: float = None):
     """
     Partition the full union of input hulls into seam regions via rasterized
     distance transforms, catch mis‑assigned islands, then write & return.
-    
+
     Args:
         input_hulls (list): List of paths to input hull GeoJSON files.
         output_dir (str): Directory to save the output seamlines GeoJSON files.
         tol (float): Tolerance for hull generation.
-    
+        buffer_m (float): Buffer distance in CRS units to apply to seamlines.
+        grid_res (float, optional): Grid resolution for distance transform. If None,
+            defaults to bounded value: max(1.0, min(tol * 2, 5.0)). Coarser grids
+            are faster for large areas.
+
     Returns:
         list: List of paths to the created seamline GeoJSON files.
     """
     seamline_files = [None] * len(input_hulls)  # Initialize a list to hold seamline file paths
-    
+
+    # Bounded grid resolution: floor of 1.0, ceiling of 5.0
+    if grid_res is None:
+        grid_res = max(1.0, min(tol * 2, 5.0))
+
     print("Step 1: Reading and standardizing input hulls...")
     gdfs, names = [], []
     for path in input_hulls:
@@ -270,10 +228,10 @@ def find_seamlines(input_hulls, output_dir, tol, buffer_m: float):
     print("Step 2: Building union bounds and grid metadata...")
     minx, miny, maxx, maxy = unary_union(polys).bounds
     print(f"  Bounds: ({minx:.3f}, {miny:.3f}, {maxx:.3f}, {maxy:.3f})")
-    nx = int(np.ceil((maxx - minx) / tol))
-    ny = int(np.ceil((maxy - miny) / tol))
-    print(f"  Grid: {nx}×{ny} cells (tol={tol})")
-    transform = Affine.translation(minx, miny) * Affine.scale(tol, tol)
+    nx = int(np.ceil((maxx - minx) / grid_res))
+    ny = int(np.ceil((maxy - miny) / grid_res))
+    print(f"  Grid: {nx}×{ny} cells (grid_res={grid_res}, tol={tol})")
+    transform = Affine.translation(minx, miny) * Affine.scale(grid_res, grid_res)
 
     print("Step 3: Rasterizing each hull to mask...")
     masks = []
@@ -305,13 +263,10 @@ def find_seamlines(input_hulls, output_dir, tol, buffer_m: float):
         for geom, val in shards
     ], crs=crs)
 
-    print("Step 7: Correcting island assignments via spatial join...")
-    hulls = gpd.GeoDataFrame({"name": names, "geometry": polys}, crs=crs)
-    parts["rep_pt"] = parts.geometry.representative_point()
-    parts = parts.set_geometry("rep_pt")
-    parts = gpd.sjoin(parts, hulls, how="left", predicate="within")
-    parts = parts.rename(columns={"name": "owner"}).set_geometry("geometry")
-    parts = parts.drop(columns=["rep_pt", "label", "index_right"])
+    print("Step 7: Mapping labels to mission names...")
+    parts["owner"] = parts["label"].apply(lambda x: names[x-1] if 1 <= x <= len(names) else None)
+    parts = parts[parts["owner"].notna()]
+    parts = parts.drop(columns=["label"])
     print(f"  {parts['owner'].nunique()} unique owners found")
 
     print("Step 8: Dissolving back to one polygon per hull...")
@@ -345,207 +300,461 @@ def find_seamlines(input_hulls, output_dir, tol, buffer_m: float):
 
     return seamline_files  # Return the list of seamline file paths
 
-def clip(input_raster, seamline_geojson, output_raster, keep_bands=None):
+def generate_combined_boundaries(
+    raster_paths: list,
+    mission_names: list,
+    output_geojson: str,
+    tol: float = 0.5,
+    simplify_tolerance: float = None,
+    buffer_m: float = 0.0,
+    n_workers: int = 4,
+    tile_size: int = 2048,
+    clip_to: str = None,
+    output_epsg: int = 6514,
+) -> str:
     """
-    Create a VRT from the input raster using the seamline GeoJSON as a cutline.
-    
-    Args:
-        input_raster (str): Path to the input raster file.
-        seamline_geojson (str): Path to the seamline GeoJSON file.
-        output_raster (str): Path to save the output raster file.
-        keep_bands (list): List of band indices to keep (1-based).
-    """
+    Generate non-overlapping boundaries for multiple rasters and save as combined GeoJSON.
 
-    if keep_bands is None:
-        warp_options = gdal.WarpOptions(cutlineDSName=seamline_geojson, cropToCutline=True, dstAlpha=True, callback=gdal.TermProgress_nocb)
-    else:
-        warp_options = gdal.WarpOptions(srcBands=keep_bands, cutlineDSName=seamline_geojson, cropToCutline=True, dstAlpha=True, callback=gdal.TermProgress_nocb)
-    
-    print(f"Clipping {input_raster} using seamlines from {seamline_geojson}...")
-    ds = gdal.Warp(output_raster, input_raster, options=warp_options)
-    ds.FlushCache()
-    ds = None
-
-    print(f"Clipped raster created: {output_raster}")
-    
-    return output_raster
-
-def mosaic(raster_files, output_merged, n_jobs='ALL_CPUS'):
-    """
-    Merge multiple raster files into a single raster with Cloud-Optimized GeoTIFF (COG) options.
+    Uses distance transforms to partition overlapping regions, assigning each pixel
+    to the raster whose boundary is furthest away (prioritizing better-georectified
+    interior pixels).
 
     Args:
-        raster_files (list): List of paths to raster files to merge.
-        output_merged (str): Path to save the merged raster (COG).
+        raster_paths: List of paths/URLs to input rasters
+        mission_names: List of names for each mission (same order as raster_paths)
+        output_geojson: Path to output combined GeoJSON
+        tol: Boundary precision tolerance for mask generation. Default 0.5.
+        simplify_tolerance: Tolerance for geometry simplification. If None, uses tol.
+        buffer_m: Buffer to expand final boundaries. Default 0.0 (no expansion).
+        n_workers: Parallel workers for hull generation. Default 4.
+        tile_size: Tile size in pixels for streaming reads. Default 2048.
+        clip_to: Path to GeoJSON/shapefile to clip output boundaries. Default None.
+        output_epsg: EPSG code for output CRS. Default 6514 (Montana State Plane).
+
+    Returns:
+        Path to output GeoJSON file.
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        gdal.SetConfigOption("GDAL_CACHEMAX", "4096")  
-        output_vrt = os.path.join(tmpdir, "merged.vrt")
-        vrt_options = gdal.BuildVRTOptions(srcNodata=0, resolution='highest')
-        gdal.BuildVRT(output_vrt, raster_files, options=vrt_options)
+    if len(raster_paths) != len(mission_names):
+        raise ValueError("raster_paths and mission_names must have the same length")
 
-        print(f"Merging rasters into {output_merged}...")
-        translate_to_cog_opts = gdal.TranslateOptions(
-            format='COG',
-            creationOptions=[
-                'COMPRESS=DEFLATE',
-                'BLOCKSIZE=256',
-                'OVERVIEWS=AUTO',
-                'BIGTIFF=YES',
-                f'NUM_THREADS={n_jobs}',
-            ],
-            callback=gdal.TermProgress_nocb,
-        )
-        ds = gdal.Translate(
-            output_merged,
-            output_vrt,
-            options=translate_to_cog_opts
-        )
-        ds.FlushCache()
-        ds = None
-        print(f"Merged raster created: {output_merged}")
+    with tempfile.TemporaryDirectory() as work_dir:
+        print(f"Generating boundaries for {len(raster_paths)} missions...")
 
-def meta_mosaic(orthos_in: list, output_path: str, keep_bands: list = None, intermediary_dir: str = None, tol: float = 1.0, n_workers: int = 4, buffer_m: float = 0.5):
-    """
-    Processes a list of input orthomosaics to produce a single, merged mosaic.
+        # Step 1: Generate hulls for each raster sequentially (parallelism is within each mission's tiles)
+        print("Step 1: Defining hulls...")
 
-    The workflow includes:
-    1. Defining hulls for each input orthomosaic.
-    2. Finding seamlines between the hulls.
-    3. Clipping each orthomosaic to its corresponding seamline region.
-    4. Mosaicking the clipped rasters into a final output.
-
-    Args:
-        orthos_in (list): List of paths to input orthomosaic GeoTIFF files.
-        output_path (str): Path to save the final merged mosaic GeoTIFF.
-        keep_bands (list, optional): List of 1-based band indices to keep from the input rasters. 
-                                     If None, all bands are kept. Defaults to None.
-        intermediary_dir (str, optional): Directory to store intermediate files (hulls, seamlines, clipped rasters).
-                                          If None, a temporary directory is created and deleted upon completion.
-                                          Defaults to None.
-        tol (float, optional): Tolerance used for hull generation and seamline finding. Defaults to 1.0.
-        n_workers (int, optional): Number of parallel workers to use for processing. Defaults to 4.
-        buffer_m (float, optional): Buffer distance in meters (or CRS units) to apply to seamlines. Defaults to 0.5.
-    """
-    
-    manage_temp_dir = False
-    if intermediary_dir is None:
-        temp_dir_obj = tempfile.TemporaryDirectory()
-        work_dir = temp_dir_obj.name
-        manage_temp_dir = True
-        print(f"Using temporary directory for intermediate files: {work_dir}")
-    else:
-        work_dir = intermediary_dir
-        os.makedirs(work_dir, exist_ok=True)
-        print(f"Using provided directory for intermediate files: {work_dir}")
-
-    try:
-        # Step 1: Define Hulls
-        print(f"Step 1: Defining hulls for {len(orthos_in)} orthomosaics...")
-        
-        def _extract_hull_batch(ortho_path, idx):
-            output_hull_geojson = os.path.join(work_dir, f"hull_{idx}_{os.path.basename(ortho_path).replace('.tif', '.geojson')}")
-            _, hull_file_out = define_hull(
-                geotiff_path_in=ortho_path,
-                hull_geojson_path=output_hull_geojson,
-                tol=tol
+        hull_results = []
+        for i, (raster_path, name) in enumerate(zip(raster_paths, mission_names)):
+            print(f"\n[{i+1}/{len(raster_paths)}] Processing {name}...")
+            output_hull = os.path.join(work_dir, f"hull_{i}_{name}.geojson")
+            _, hull_file = define_hull_tiled(
+                raster_path=raster_path,
+                output_geojson=output_hull,
+                tile_size=tile_size,
+                tol=tol,
+                simplify_tolerance=simplify_tolerance if simplify_tolerance else tol,
+                n_workers=n_workers,
+                show_progress=True
             )
-            return ortho_path, hull_file_out
+            hull_results.append((name, hull_file))
 
-        hull_results = joblib.Parallel(n_jobs=n_workers)(
-            joblib.delayed(_extract_hull_batch)(ortho_path, i) for i, ortho_path in enumerate(orthos_in)
-        )
-        
-        # Filter out None results from failed hull definitions
-        valid_hull_results = [res for res in hull_results if res is not None and res[1] is not None]
-        if not valid_hull_results:
-            raise RuntimeError("No valid hulls could be generated. Aborting meta_mosaic.")
+        # Filter successful results and maintain order
+        valid_results = [(name, hull) for name, hull in hull_results if hull is not None]
+        if not valid_results:
+            raise RuntimeError("No valid hulls could be generated.")
 
-        processed_orthos_in = [r[0] for r in valid_hull_results]
-        hulls_out = [r[1] for r in valid_hull_results]
-        print(f"Successfully generated {len(hulls_out)} hulls.")
+        names_ordered = [r[0] for r in valid_results]
+        hulls_ordered = [r[1] for r in valid_results]
+        print(f"\nSuccessfully generated {len(hulls_ordered)} hulls.")
 
-        # Step 2: Find Seamlines
-        print("Step 2: Finding seamlines...")
+        # Step 2: Find seamlines (non-overlapping regions)
+        print("Step 2: Finding seamlines (non-overlapping regions)...")
         seamline_files = find_seamlines(
-            input_hulls=hulls_out,
-            output_dir=work_dir, # find_seamlines will create files like seamline_1.geojson, seamline_2.geojson etc.
+            input_hulls=hulls_ordered,
+            output_dir=work_dir,
             tol=tol,
             buffer_m=buffer_m
         )
-        
-        # Ensure seamline_files align with processed_orthos_in based on the order from find_seamlines
-        # find_seamlines returns a list that should correspond to the order of hulls_out.
-        # If find_seamlines modifies the order or can return fewer items, this needs careful handling.
-        # Assuming find_seamlines preserves order and number corresponding to hulls_out.
-        if len(seamline_files) != len(processed_orthos_in):
-             # This might happen if some hulls lead to no seamlines or if find_seamlines filters.
-             # For now, we'll proceed, but this could be a point of failure if indexing mismatches.
-            print(f"Warning: Number of seamlines ({len(seamline_files)}) does not match number of processed orthos ({len(processed_orthos_in)}).")
-            # Attempt to filter orthos that don't have a corresponding seamline (if None is placeholder)
-            valid_seamlines_with_orthos = []
-            temp_processed_orthos_in = []
-            for i, seam_file in enumerate(seamline_files):
-                if seam_file is not None and i < len(processed_orthos_in) : # check ortho index exists
-                    valid_seamlines_with_orthos.append(seam_file)
-                    temp_processed_orthos_in.append(processed_orthos_in[i])
-                else:
-                    print(f"Warning: No seamline generated or index issue for an ortho. Original index {i}")
 
-            seamline_files = valid_seamlines_with_orthos
-            processed_orthos_in = temp_processed_orthos_in
-            
-            if not seamline_files:
-                raise RuntimeError("No valid seamlines available to proceed with clipping.")
+        # Step 3: Combine seamlines into single GeoJSON with mission names
+        print("Step 3: Combining into single GeoJSON...")
+        combined_features = []
 
+        for i, seamline_file in enumerate(seamline_files):
+            if seamline_file is None:
+                print(f"  Warning: No seamline for {names_ordered[i]}, skipping")
+                continue
 
-        print(f"Generated {len(seamline_files)} seamline files.")
-        print("Input orthomosaics for clipping:")
-        for f_idx, f_path in enumerate(processed_orthos_in):
-            print(f"  Ortho {f_idx}: {f_path} -> Seamline {f_idx}: {seamline_files[f_idx] if f_idx < len(seamline_files) else 'N/A'}")
+            gdf = gpd.read_file(seamline_file)
+            if gdf.empty:
+                print(f"  Warning: Empty seamline for {names_ordered[i]}, skipping")
+                continue
 
+            # Get the geometry and assign mission name
+            geom = gdf.geometry.unary_union
+            combined_features.append({
+                "name": names_ordered[i],
+                "geometry": geom
+            })
+            print(f"  Added boundary for {names_ordered[i]}")
 
-        # Step 3: Clip Rasters
-        print("Step 3: Clipping rasters...")
-        
-        def _clip_single_raster(ortho_path, seamline_geojson_path, clip_idx, bands_to_keep):
-            output_clipped_raster = os.path.join(work_dir, f"clipped_{clip_idx}_{os.path.basename(ortho_path)}")
-            # Ensure seamline_geojson_path is not None
-            if seamline_geojson_path is None:
-                print(f"Warning: Skipping clipping for {ortho_path} as its seamline is missing.")
-                return None
-            return clip(ortho_path, seamline_geojson_path, output_clipped_raster, keep_bands=bands_to_keep)
+        if not combined_features:
+            raise RuntimeError("No valid boundaries to combine.")
 
-        clipped_rasters_paths = joblib.Parallel(n_jobs=n_workers)(
-            joblib.delayed(_clip_single_raster)(
-                processed_orthos_in[i],
-                seamline_files[i], # Use the seamline file corresponding to the ortho
-                i,
-                keep_bands
-            )
-            for i in range(len(processed_orthos_in)) if i < len(seamline_files) # Ensure we don't go out of bounds for seamline_files
+        # Create combined GeoDataFrame
+        combined_gdf = gpd.GeoDataFrame(
+            [{"name": f["name"]} for f in combined_features],
+            geometry=[f["geometry"] for f in combined_features],
+            crs=gpd.read_file(hulls_ordered[0]).crs
         )
-        
-        # Filter out None results from failed clippings
-        final_clipped_rasters = [p for p in clipped_rasters_paths if p is not None]
-        if not final_clipped_rasters:
-            raise RuntimeError("No rasters were successfully clipped. Aborting mosaic.")
-        print(f"Successfully clipped {len(final_clipped_rasters)} rasters.")
 
-        # Step 4: Mosaic Rasters
-        print("Step 4: Mosaicking clipped rasters...")
-        # Ensure n_jobs for mosaic is at least 1
-        mosaic_n_jobs = max(1, n_workers) if isinstance(n_workers, int) else 'ALL_CPUS'
-        
-        mosaic(final_clipped_rasters, output_path, n_jobs=mosaic_n_jobs)
-        print(f"Successfully created final mosaic: {output_path}")
+        # Clip to boundary if provided
+        if clip_to is not None:
+            print(f"Step 4: Clipping to {clip_to}...")
+            clip_gdf = gpd.read_file(clip_to)
+            if clip_gdf.crs != combined_gdf.crs:
+                clip_gdf = clip_gdf.to_crs(combined_gdf.crs)
+            clip_geom = clip_gdf.unary_union
+            combined_gdf = gpd.clip(combined_gdf, clip_geom)
+            print(f"  Clipped to {len(combined_gdf)} features")
 
-    finally:
-        if manage_temp_dir:
-            try:
-                temp_dir_obj.cleanup()
-                print(f"Temporary directory {work_dir} cleaned up.")
-            except Exception as e:
-                warnings.warn(f"Could not clean up temporary directory {work_dir}: {e}")
-    
-    return output_path
+        # Reproject to output CRS
+        print(f"Step {'5' if clip_to else '4'}: Reprojecting to EPSG:{output_epsg}...")
+        combined_gdf = combined_gdf.to_crs(epsg=output_epsg)
+
+        # Save to output
+        os.makedirs(os.path.dirname(output_geojson) or ".", exist_ok=True)
+        combined_gdf.to_file(output_geojson, driver="GeoJSON")
+        print(f"Combined boundaries saved to: {output_geojson}")
+        print(f"  Total features: {len(combined_gdf)}")
+
+    return output_geojson
+
+# =========================================================================== #
+# seam_merge — the audited seam-walk blend (replaces the hard cut)
+# =========================================================================== #
+"""Everything below is the refactor's seam-walk engine, ported from the audited
+implementation (audit repo: 01_merge/poc/seamwalk/seamwalk_full.py) that built
+the 2024 4-batch visible base map (seam texture-r 0.40 -> 0.62, interiors
+byte-identical, blend footprint 0.10%). The legacy hull/seamline/mosaic
+functions above are retained; `find_seamlines`-style ownership is computed
+internally here on a coarse grid."""
+
+import json as _json
+import threading as _threading
+import time as _time
+from collections import defaultdict as _dd
+from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+from itertools import combinations as _combinations
+from pathlib import Path as _Path
+
+from rasterio.vrt import WarpedVRT as _WarpedVRT
+from rasterio.warp import transform_bounds as _transform_bounds
+from scipy.ndimage import distance_transform_edt as _edt
+
+from . import fields as _F
+
+_TILE_H, _TILE_W = 480, 640          # LoFTR tile
+_FS = 120                            # seam pooling cell (px)
+_SOLVE_S = 120                       # solve node spacing (px)
+_W_GAUGE = 0.05                      # gauge ridge (free translation pin)
+_REJECT_PX, _MIN_TILE, _MIN_CELL = 4.0, 8, 2
+_SOLVE_CORR_M = 4.0                  # solve corridor half-width (m)
+_GEOM_DS = 8                         # coarse geometry decimation
+_HALO = 64                           # block halo so band shifts never sample off-block
+
+
+def _alpha_index(path):
+    with rasterio.open(path) as s:
+        if s.colorinterp:
+            for i, ci in enumerate(s.colorinterp):
+                if ci == ColorInterp.alpha:
+                    return i + 1
+        return s.count      # convention: last band is validity when no alpha tag
+
+
+def _union_grid(paths, out_crs, res):
+    bs = []
+    for p in paths:
+        with rasterio.open(p) as s:
+            bs.append(_transform_bounds(s.crs, out_crs, *s.bounds, densify_pts=21))
+    minx = min(b[0] for b in bs); miny = min(b[1] for b in bs)
+    maxx = max(b[2] for b in bs); maxy = max(b[3] for b in bs)
+    W = int(np.ceil((maxx - minx) / res)); H = int(np.ceil((maxy - miny) / res))
+    tr = Affine.translation(minx, maxy) * Affine.scale(res, -res)
+    return tr, W, H, dict(zip(range(len(paths)), bs))
+
+
+def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=None,
+               workers=None, block=2048, ownership_out=None, report_json=None,
+               nspec=None, log=print):
+    """Merge N overlapping orthomosaics with the 1 m seam-walk blend.
+
+    inputs   : list of (name, path) pairs — every input is named; names carry
+               into the seam table and the stage report.
+    out      : output GeoTIFF (tiled ZSTD; run cog.finalize_cog for delivery).
+    gauge    : "free" (no input is the reference; corrections split evenly) or
+               "anchored" (pin the FIRST input; others move fully — fallback).
+    res      : output pixel size; None = median of the inputs' native GSDs.
+    nspec    : spectral band count to carry (None = all non-alpha bands of the
+               first input). Alpha/validity = tagged alpha band, else the last.
+
+    Geometry only — raw band values are never altered outside the seam band,
+    and inside it only cross-faded between the meeting owners. Writes a stage
+    report (per-seam matches, median shift, post-solve residual) for the seam
+    tripwire and the quality report.
+    """
+    t0 = _time.perf_counter()
+    names = [n for n, _ in inputs]
+    paths = [p for _, p in inputs]
+    N = len(paths)
+    if out_crs is None:
+        with rasterio.open(paths[0]) as s:
+            out_crs = str(s.crs)
+    if res is None:
+        rs = []
+        for p in paths:
+            with rasterio.open(p) as s:
+                rs.append(abs(s.res[0]))
+        res = round(float(np.median(rs)), 3)
+    aidx = {i: _alpha_index(p) for i, p in enumerate(paths)}
+    if nspec is None:
+        with rasterio.open(paths[0]) as s:
+            nspec = min(aidx[0] - 1, s.count - 1) if s.count > 1 else 1
+    workers = workers or max(1, (os.cpu_count() or 4) - 1)
+
+    OUT_TR, OUT_W, OUT_H, bounds = _union_grid(paths, out_crs, res)
+    log(f"[seam_merge] {N} inputs -> {OUT_W}x{OUT_H} @ {res} m {out_crs} "
+        f"(gauge={gauge}, band={band_width_m} m)")
+
+    # ---- coarse geometry: validity, EDT owner, faultlines ------------------ #
+    Wc, Hc = -(-OUT_W // _GEOM_DS), -(-OUT_H // _GEOM_DS)
+    tr_c = Affine.translation(OUT_TR.c, OUT_TR.f) * Affine.scale(res * _GEOM_DS, -res * _GEOM_DS)
+    cres = res * _GEOM_DS
+
+    def read_alpha_c(i):
+        with rasterio.open(paths[i]) as s:
+            with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
+                            resampling=Resampling.nearest) as v:
+                return v.read(aidx[i]) > 127
+
+    with _TPE(max_workers=min(N, 8)) as ex:
+        valid_c = list(ex.map(read_alpha_c, range(N)))
+    ds_c = [_edt(v).astype(np.float32) * cres for v in valid_c]
+    vstack = np.stack(valid_c)
+    cov2_c = vstack.sum(0) >= 2
+    owner_c = np.where(vstack.any(0), np.argmax(np.stack(ds_c), 0).astype(np.int16),
+                       np.int16(-1))
+    fault_c = np.zeros((Hc, Wc), bool)
+    chg = (owner_c[:, :-1] != owner_c[:, 1:]) & cov2_c[:, :-1] & cov2_c[:, 1:]
+    fault_c[:, :-1] |= chg; fault_c[:, 1:] |= chg
+    chg = (owner_c[:-1, :] != owner_c[1:, :]) & cov2_c[:-1, :] & cov2_c[1:, :]
+    fault_c[:-1, :] |= chg; fault_c[1:, :] |= chg
+    D_c = (_edt(~fault_c).astype(np.float32) * cres if fault_c.any()
+           else np.full((Hc, Wc), 1e9, np.float32))
+    if not fault_c.any():
+        raise RuntimeError("seam_merge: no flight<->flight faultline — nothing to merge")
+
+    if ownership_out:
+        cat = np.zeros((Hc, Wc), np.uint8)
+        for i in range(N):
+            cat[owner_c == i] = i + 1
+        cat[(D_c <= band_width_m) & cov2_c] = N + 1
+        prof = dict(driver="GTiff", height=Hc, width=Wc, count=1, dtype="uint8",
+                    crs=out_crs, transform=tr_c, nodata=0, tiled=True,
+                    compress="zstd", predictor=2, BIGTIFF="IF_SAFER")
+        _Path(ownership_out).parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(ownership_out, "w", **prof) as d:
+            d.write(cat, 1)
+            d.update_tags(names=",".join(names), seam_band_value=str(N + 1))
+
+    # ---- per-pair seam walk (LoFTR) ---------------------------------------- #
+    matcher, dev = _F.build_matcher()
+    vmain = {i: _WarpedVRT(rasterio.open(paths[i]), crs=out_crs, transform=OUT_TR,
+                           width=OUT_W, height=OUT_H, resampling=Resampling.bilinear)
+             for i in range(N)}
+    efield_c, seams = {}, []
+    for ia, ib in _combinations(range(N), 2):
+        A = owner_c == ia; B = owner_c == ib
+        f_ij = np.zeros((Hc, Wc), bool)
+        adj = (A[:, :-1] & B[:, 1:]) | (B[:, :-1] & A[:, 1:]); f_ij[:, :-1] |= adj; f_ij[:, 1:] |= adj
+        adj = (A[:-1, :] & B[1:, :]) | (B[:-1, :] & A[1:, :]); f_ij[:-1, :] |= adj; f_ij[1:, :] |= adj
+        if not f_ij.any():
+            continue
+        ys, xs = np.where(f_ij)
+        seen, seeds = set(), []
+        for y, x in zip(ys * _GEOM_DS + _GEOM_DS // 2, xs * _GEOM_DS + _GEOM_DS // 2):
+            key = (y // _TILE_H, x // _TILE_W)
+            if key not in seen:
+                seen.add(key); seeds.append((int(y), int(x)))
+        ans, dss, n_tiles = [], [], 0
+        for (y, x) in seeds:
+            r0 = min(max(y - _TILE_H // 2, 0), OUT_H - _TILE_H)
+            c0 = min(max(x - _TILE_W // 2, 0), OUT_W - _TILE_W)
+            a = vmain[ia].read(window=Window(c0, r0, _TILE_W, _TILE_H))
+            b = vmain[ib].read(window=Window(c0, r0, _TILE_W, _TILE_H))
+            va, vb = a[aidx[ia] - 1] > 127, b[aidx[ib] - 1] > 127
+            if va.mean() < 0.4 or vb.mean() < 0.4:
+                continue
+            m = _F.match_tile(matcher, dev,
+                              _F.gray_stretch(a[:min(3, nspec)].astype(np.float32)),
+                              _F.gray_stretch(b[:min(3, nspec)].astype(np.float32)),
+                              _REJECT_PX, _MIN_TILE)
+            if m is None:
+                continue
+            an, d = m
+            ans.append(an + [c0, r0]); dss.append(d); n_tiles += 1
+        if not ans:
+            log(f"    seam {names[ia]}-{names[ib]}: no usable matches (skipped)")
+            continue
+        an = np.concatenate(ans); d = np.concatenate(dss)
+        pts, vx, vy = _F.pool_to_cells(an, d, _FS, _MIN_CELL)
+        if len(pts) == 0:
+            continue
+        efield_c[(ia, ib)] = (_F.fill_field(np.stack([pts[:, 0] / _GEOM_DS,
+                                                      pts[:, 1] / _GEOM_DS], 1), vx, Wc, Hc),
+                              _F.fill_field(np.stack([pts[:, 0] / _GEOM_DS,
+                                                      pts[:, 1] / _GEOM_DS], 1), vy, Wc, Hc))
+        med_cm = float(np.median(np.hypot(vx, vy)) * res * 100)
+        seams.append(dict(pair=f"{names[ia]}-{names[ib]}", tiles=n_tiles,
+                          matches=int(len(an)), nodes=int(len(pts)),
+                          med_shift_cm=round(med_cm, 1)))
+        log(f"    seam {names[ia]}-{names[ib]}: {n_tiles} tiles -> {len(an)} matches "
+            f"-> {len(pts)} nodes (|e|={med_cm:.1f} cm)")
+    if not efield_c:
+        raise RuntimeError("seam_merge: no seams matched")
+
+    # ---- joint solve -------------------------------------------------------- #
+    corridor_c = (D_c <= _SOLVE_CORR_M) & cov2_c
+    anchored = 0 if gauge == "anchored" else None
+    fields_c, n_nodes, n_var = _F.solve_free_gauge(
+        valid_c, efield_c, corridor_c, max(1, round(_SOLVE_S / _GEOM_DS)),
+        N, _W_GAUGE, anchored_index=anchored)
+    log(f"    solve: {n_nodes} corridor nodes, {n_var} unknowns "
+        f"({'anchored to ' + names[0] if anchored is not None else 'free gauge'})")
+
+    # post-solve residual per seam: |(x_j - x_i) - f_meas| at fault nodes
+    for s, ((ia, ib), (fx, fy)) in zip(seams, efield_c.items()):
+        A = owner_c == ia; B = owner_c == ib
+        f_ij = np.zeros((Hc, Wc), bool)
+        adj = (A[:, :-1] & B[:, 1:]) | (B[:, :-1] & A[:, 1:]); f_ij[:, :-1] |= adj; f_ij[:, 1:] |= adj
+        adj = (A[:-1, :] & B[1:, :]) | (B[:-1, :] & A[1:, :]); f_ij[:-1, :] |= adj; f_ij[1:, :] |= adj
+        m = f_ij & np.isfinite(fx) & np.isfinite(fy)
+        if not m.any():
+            s["residual_cm"] = None
+            continue
+        rx = (fields_c[ib][0] - fields_c[ia][0])[m] - fx[m]
+        ry = (fields_c[ib][1] - fields_c[ia][1])[m] - fy[m]
+        s["residual_cm"] = round(float(np.median(np.hypot(rx, ry)) * res * 100), 1)
+
+    # ---- streamed N-way composite ------------------------------------------ #
+    prof = dict(driver="GTiff", height=OUT_H, width=OUT_W, count=nspec + 1, dtype="uint8",
+                crs=out_crs, transform=OUT_TR, tiled=True, blockxsize=512, blockysize=512,
+                compress="zstd", predictor=2, ZSTD_LEVEL=3, BIGTIFF="YES",
+                num_threads=str(workers))
+    _Path(out).parent.mkdir(parents=True, exist_ok=True)
+    dst = rasterio.open(out, "w", **prof)
+    if nspec == 3:
+        dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue,
+                           ColorInterp.alpha]
+    wlock = _threading.Lock()
+    tls = _threading.local()
+    counts = _dd(int)
+
+    def src_vrts():
+        if not hasattr(tls, "v"):
+            tls.v = {i: _WarpedVRT(rasterio.open(paths[i]), crs=out_crs, transform=OUT_TR,
+                                   width=OUT_W, height=OUT_H, resampling=Resampling.average)
+                     for i in range(N)}
+        return tls.v
+
+    def covers(i, bx0, by0, bx1, by1):
+        l, b, r, t = bounds[i]
+        return not (bx1 <= l or bx0 >= r or by1 <= b or by0 >= t)
+
+    def process_block(r0, c0):
+        bh = min(block, OUT_H - r0); bw = min(block, OUT_W - c0)
+        hr0, hc0 = max(0, r0 - _HALO), max(0, c0 - _HALO)
+        hr1, hc1 = min(OUT_H, r0 + bh + _HALO), min(OUT_W, c0 + bw + _HALO)
+        hh, hw = hr1 - hr0, hc1 - hc0
+        iy, ix = r0 - hr0, c0 - hc0
+        bx0, by0 = OUT_TR * (hc0, hr1); bx1, by1 = OUT_TR * (hc1, hr0)
+        present = [i for i in range(N) if covers(i, bx0, by0, bx1, by1)]
+        if not present:
+            return "skip"
+        V = src_vrts()
+        rg = {i: V[i].read(window=Window(hc0, hr0, hw, hh)) for i in present}
+        val = {i: rg[i][aidx[i] - 1] > 127 for i in present}
+        present = [i for i in present if val[i].any()]
+        if not present:
+            return "skip"
+        if len(present) == 1:
+            i = present[0]
+            outh = np.concatenate([rg[i][:nspec],
+                                   np.where(val[i], 255, 0)[None].astype(np.uint8)], 0)
+            kind = "copy"
+        else:
+            valids = [val[i] for i in present]
+            specs = [rg[i][:nspec].astype(np.float32) for i in present]
+            geom = _seam_geom_block(hr0, hc0, hh, hw, present, valids, ds_c, D_c,
+                                    res, band_width_m)
+            if geom["in_band"][iy:iy + bh, ix:ix + bw].any():
+                flds = [( _F.upsample_block(fields_c[i][0], _GEOM_DS, hr0, hc0, hh, hw),
+                          _F.upsample_block(fields_c[i][1], _GEOM_DS, hr0, hc0, hh, hw))
+                        for i in present]
+                sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
+                                                  fields=flds, geom=geom)
+                kind = "seam"
+            else:
+                sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
+                                                  fields=None, geom=geom)
+                kind = "own"
+            outh = np.concatenate([np.clip(sf, 0, 255).astype(np.uint8), al[None]], 0)
+        with wlock:
+            dst.write(outh[:, iy:iy + bh, ix:ix + bw], window=Window(c0, r0, bw, bh))
+        return kind
+
+    blocks = [(r0, c0) for r0 in range(0, OUT_H, block) for c0 in range(0, OUT_W, block)]
+    log(f"    streaming {len(blocks)} blocks ({workers} workers) ...")
+    with _TPE(max_workers=workers) as ex:
+        futs = {ex.submit(process_block, r0, c0): (r0, c0) for r0, c0 in blocks}
+        n_done = 0
+        for fut in _as_completed(futs):
+            counts[fut.result()] += 1; n_done += 1
+            if n_done % 200 == 0 or n_done == len(blocks):
+                log(f"    [{n_done}/{len(blocks)}] copy={counts['copy']} "
+                    f"own={counts['own']} seam={counts['seam']} skip={counts['skip']}")
+    dst.close()
+    for v in vmain.values():
+        v.close()
+
+    report = dict(kind="stitch", inputs=names, n_seams=len(seams), seams=seams,
+                  gauge=gauge, band_width_m=band_width_m, res_m=res, crs=out_crs,
+                  grid=[OUT_W, OUT_H], blocks=dict(counts),
+                  seconds=round(_time.perf_counter() - t0, 1), out=str(out),
+                  ownership=str(ownership_out) if ownership_out else None)
+    if report_json:
+        _Path(report_json).parent.mkdir(parents=True, exist_ok=True)
+        _Path(report_json).write_text(_json.dumps(report, indent=2))
+    log(f"[seam_merge] done ({report['seconds']:.0f}s) -> {out}")
+    return report
+
+
+def _seam_geom_block(r0, c0, bh, bw, present, valids, ds_c, D_c, res, band_m):
+    """Native-res seam geometry for one block, upsampled from the GLOBAL coarse
+    EDTs (so ownership is globally correct even at block edges)."""
+    ds = np.stack([_F.upsample_block(ds_c[i], _GEOM_DS, r0, c0, bh, bw) / res
+                   for i in present])
+    D = _F.upsample_block(D_c, _GEOM_DS, r0, c0, bh, bw) / res
+    vstack = np.stack(valids)
+    cov2 = vstack.sum(0) >= 2
+    any_valid = vstack.any(0)
+    B = max(band_m / res, 1.0)
+    owner = np.where(cov2, np.argmax(ds, 0).astype(np.int16), np.int16(-1))
+    single = any_valid & ~cov2
+    for p in range(len(present)):
+        owner = np.where(single & valids[p], np.int16(p), owner)
+    in_band = (D <= B) & cov2
+    taper = (np.clip(1.0 - D / B, 0.0, 1.0) * in_band).astype(np.float32)
+    return dict(B=B, ds=ds, any_valid=any_valid, owner=owner, D=D,
+                in_band=in_band, taper=taper, edt_max=ds.max(0))

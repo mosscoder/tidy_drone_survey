@@ -1,27 +1,41 @@
-# Make functions/classes from submodules available at the package level
-from .merge import define_hull
-from .merge import find_seamlines
-from .merge import clip
-from .merge import mosaic
-from .merge import meta_mosaic
-from .registration import Chip
-from .registration import resolve_height_chip
-from .registration import get_bbox_bounds_chip
-from .registration import generate_grid_points_chip
-from .registration import load_chip_gdal
-from .registration import load_chips_gdal
-from .registration import raster_to_tensor_chip
-from .registration import resize_image_chip
-from .registration import batch_get_loftr_matches_chip
-from .registration import generate_chip_gcps_gdal
-from .registration import warp_chip_gdal
-from .registration import merge_warped_chips_gdal
-from .registration import calculate_chip_crs_parameters_gdal
-from .registration import register_survey_by_chips
+# tidysurvey — the config-driven survey pipeline (refactor, branch dev).
+#
+# Lean surface: one module per stage + the shared engine. Retired first-gen
+# machinery (per-chip registration internals, hard-cut mosaic + meta_mosaic,
+# clip-and-fill, geo neighbour helpers) lives on branch `main` / git history.
+# One compatibility promise is kept: register_survey_by_chips retains its
+# exact signature, running the audited dense internals.
 
-# Optionally, define __all__ to control what `from tidysurvey import *` imports
-__all__ = ['define_hull', 'find_seamlines', 'clip', 'mosaic', 'meta_mosaic',
-           'Chip', 'resolve_height_chip', 'get_bbox_bounds_chip', 'generate_grid_points_chip',
-           'load_chip_gdal', 'load_chips_gdal', 'raster_to_tensor_chip', 'resize_image_chip',
-           'batch_get_loftr_matches_chip', 'generate_chip_gcps_gdal', 'warp_chip_gdal',
-           'merge_warped_chips_gdal', 'calculate_chip_crs_parameters_gdal', 'register_survey_by_chips'] 
+from . import config
+from . import fields
+from . import cog
+from . import validate
+from . import report
+from . import calibrate
+
+# stitch (seam-walk blend) + mission-boundary products
+from .merge import (
+    seam_merge,
+    define_hull_tiled,
+    find_seamlines,
+    generate_combined_boundaries,
+)
+
+# align (dense corroborated field)
+from .registration import register_survey_dense
+from .registration import register_survey_by_chips   # same signature, dense internals
+
+# satellite reference
+from .sentinel import download_sentinel2_bands, pick_scene
+
+__all__ = [
+    # modules
+    'config', 'fields', 'cog', 'validate', 'report', 'calibrate',
+    # stitch + boundaries
+    'seam_merge', 'define_hull_tiled', 'find_seamlines',
+    'generate_combined_boundaries',
+    # align
+    'register_survey_dense', 'register_survey_by_chips',
+    # sentinel
+    'download_sentinel2_bands', 'pick_scene',
+]
