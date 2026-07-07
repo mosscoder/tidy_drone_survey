@@ -7,6 +7,7 @@
     tidysurvey calibrate --config ...                       # 4. reflectance + reliability
     tidysurvey report    --config ...                       # regenerate the quality report
     tidysurvey tiles     --config ...                       # visible base -> .pmtiles web map
+    tidysurvey serve     --config ...                       # view products/ locally (byte ranges)
     tidysurvey run       --config ...                       # the whole plan, in order
     tidysurvey run       --config ... --detach               # same, fire-and-forget
 
@@ -266,6 +267,20 @@ def _tiles(cfg, args):
     return rep
 
 
+def _serve(cfg, args):
+    from .serve import serve_dir
+    root = Path(args.dir) if args.dir else cfg.paths.products
+    say(f"serving {root}")
+    for m in sorted(root.glob("*_map.html")):
+        say(f"  map:    http://localhost:{args.port}/{m.name}")
+    rep_html = root / "quality" / "quality_report.html"
+    if rep_html.exists():
+        say(f"  report: http://localhost:{args.port}/quality/quality_report.html")
+    say(f"  root:   http://localhost:{args.port}/   (Ctrl-C stops)")
+    serve_dir(root, args.port, log=say)
+    return True
+
+
 def _report(cfg, failed_stage=None):
     from . import report
     return report.build(cfg, failed_stage=failed_stage, log=say)
@@ -280,7 +295,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tidysurvey", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["run", "scenes", "stitch", "align",
-                                        "calibrate", "report", "tiles"])
+                                        "calibrate", "report", "tiles", "serve"])
     ap.add_argument("--config", required=True)
     ap.add_argument("--product", choices=["visible", "multispectral", "ms"],
                     default=None, help="for stitch/align")
@@ -295,6 +310,8 @@ def main(argv=None):
     ap.add_argument("--min-zoom", type=int, default=8, help="tiles: lowest zoom")
     ap.add_argument("--max-zoom", type=int, default=None,
                     help="tiles: highest zoom (default: derived from the GSD)")
+    ap.add_argument("--port", type=int, default=8080, help="serve: port")
+    ap.add_argument("--dir", default=None, help="serve: directory (default products/)")
     args = ap.parse_args(argv)
 
     if args.detach:
@@ -312,7 +329,8 @@ def main(argv=None):
         say(f"detached: pid {proc.pid} · follow with  tail -f {log_path}")
         return 0
 
-    cfg = _config.load(args.config)
+    # serve only needs run_dir/products — skip the remote-header resolve
+    cfg = _config.load(args.config, resolve_auto=(args.command != "serve"))
     if args.date:
         cfg.calibrate.date = args.date
     product = {"ms": "multispectral"}.get(args.product, args.product)
@@ -339,6 +357,8 @@ def main(argv=None):
         return _report(cfg) and 0
     if args.command == "tiles":
         return _tiles(cfg, args) and 0
+    if args.command == "serve":
+        return _serve(cfg, args) and 0
 
     # ---- run: the whole plan, report always written ------------------------- #
     plan = cfg.plan()

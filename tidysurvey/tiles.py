@@ -238,9 +238,9 @@ _VIEWER_HTML = """<!doctype html>
     const n = document.getElementById("note");
     n.style.display = "block";
     n.textContent = "Could not read {pmtiles_name}: " + err + " — PMTiles needs HTTP " +
-      "range requests, which file:// cannot serve. Run e.g. `python3 -m http.server` " +
-      "in this folder and open this page via http://localhost:8000/, or host both " +
-      "files on any static server or bucket.";
+      "byte-range requests. Serve this folder with `tidysurvey serve --config <survey>.toml` " +
+      "(python -m http.server does NOT support ranges), or host both files on any " +
+      "static server/bucket that does (S3 and GCS do).";
   }});
 </script>
 </body>
@@ -252,13 +252,14 @@ def write_leaflet_html(out_html, pmtiles_name, title, lonlat, min_zoom, max_zoom
                        log=print):
     """The archive's double-clickable face: a self-contained Leaflet page that
     references the .pmtiles by RELATIVE name, so the pair works from any
-    static host (and from `python3 -m http.server` locally — file:// cannot
-    do range requests, and the page says so instead of showing a blank map)."""
+    byte-range-capable static host (and locally via `tidysurvey serve` —
+    python's stock http.server ignores Range headers, and file:// has none;
+    the page says so instead of showing a blank map)."""
     west, south, east, north = lonlat
     html = _VIEWER_HTML.format(title=title, pmtiles_name=pmtiles_name,
                                west=west, south=south, east=east, north=north,
                                min_zoom=min_zoom, max_zoom=max_zoom,
                                overzoom=max_zoom + 2)
     Path(out_html).write_text(html)
-    log(f"[pmtiles] viewer -> {out_html} (serve over http; file:// can't range-read)")
+    log(f"[pmtiles] viewer -> {out_html} (view via `tidysurvey serve`)")
     return str(out_html)

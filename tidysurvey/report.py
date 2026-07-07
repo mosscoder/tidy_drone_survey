@@ -291,9 +291,10 @@ def build(cfg, failed_stage=None, log=print):
         if map_name:
             tiles_html += (
                 f'<p>Interactive map: <a href="../{map_name}">{map_name}</a> '
-                f"(lives beside the archive in products/ — open over http, e.g. "
-                f"<span class='mono'>python3 -m http.server</span> in products/; "
-                f"file:// cannot do range requests).</p>")
+                f"(lives beside the archive in products/ — view locally with "
+                f"<span class='mono'>tidysurvey serve --config &lt;survey&gt;.toml</span>; "
+                f"needs byte-range HTTP, which file:// and python's stock "
+                f"http.server don't provide).</p>")
 
     snapshot = json.dumps(manifest.get("config", cfg.snapshot()), indent=2)
     stamp = time.strftime("%Y-%m-%d %H:%M")

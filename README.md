@@ -30,13 +30,17 @@ tidysurvey stitch    --config 2024.toml --product multispectral
 tidysurvey calibrate --config 2024.toml                       # reflectance + reliability rasters
 tidysurvey report    --config 2024.toml                       # regenerate the quality report
 tidysurvey tiles     --config 2024.toml                       # visible base -> .pmtiles web map
+tidysurvey serve     --config 2024.toml                       # view products/ locally
 ```
 
 `tiles` renders the visible COG into a single-file
 [PMTiles](https://docs.protomaps.com/pmtiles/) archive (WebMercator XYZ,
-512 px WEBP tiles, max zoom derived from the GSD) servable as a slippy map
-from any static host or bucket via range requests — no tile server. It is a
-viewing artifact like the COG's overviews; analysis stays on the COG.
+512 px WEBP tiles, max zoom derived from the GSD) plus a Leaflet viewer
+(`*_map.html`) beside it — a slippy map servable from any static host or
+bucket that supports byte-range requests, no tile server. View locally with
+`tidysurvey serve` (python's stock `http.server` ignores Range headers and
+cannot serve PMTiles). It is a viewing artifact like the COG's overviews;
+analysis stays on the COG.
 
 Every run leaves the same shape on disk:
 
