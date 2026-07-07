@@ -57,6 +57,7 @@ class NamedInput:
 @dataclass
 class VisibleCfg:
     resolution_m: Union[float, str] = "auto"
+    web_map: bool = True                # ship .pmtiles + Leaflet viewer with the base
     orthos: List[NamedInput] = dc_field(default_factory=list)
 
 
@@ -218,6 +219,8 @@ class Config:
             stages.append("stitch/visible")
         if self.ms.missions:
             stages += ["align/ms", "stitch/ms", "calibrate"]
+        if self.visible.orthos and self.visible.web_map:
+            stages.append("tiles")              # the web map, from the finished base
         stages.append("report")
         return stages
 
@@ -232,6 +235,7 @@ class Config:
             "survey": self.survey, "crs": self.crs, "run_dir": self.run_dir,
             "georeferencing": self.georeferencing, "anchor": self.anchor,
             "visible": {"resolution_m": self.visible.resolution_m,
+                        "web_map": self.visible.web_map,
                         "orthos": [vars(o) for o in self.visible.orthos]},
             "multispectral": {"resolution_m": self.ms.resolution_m, "bands": self.ms.bands,
                               "missions": [vars(m) for m in self.ms.missions]},
@@ -366,6 +370,7 @@ def load(path: str, resolve_auto: bool = True) -> Config:
 
     v = raw.get("visible", {})
     cfg.visible = VisibleCfg(resolution_m=v.get("resolution_m", "auto"),
+                             web_map=bool(v.get("web_map", True)),
                              orthos=_named(v.get("orthos")))
     m = raw.get("multispectral", {})
     cfg.ms = MultispectralCfg(resolution_m=m.get("resolution_m", "auto"),

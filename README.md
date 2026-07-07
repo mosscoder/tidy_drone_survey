@@ -9,7 +9,7 @@ One TOML per survey drives everything — the command line never decides
 pipeline shape:
 
 ```
-tidysurvey run --config 2024.toml            # scene pick → stitch → align → stitch → calibrate → report
+tidysurvey run --config 2024.toml            # scene → stitch → align → stitch → calibrate → tiles → report
 tidysurvey run --config 2024.toml --detach   # same, fire-and-forget → tail -f <run_dir>/run.log
 ```
 
@@ -33,7 +33,8 @@ tidysurvey tiles     --config 2024.toml                       # visible base -> 
 tidysurvey serve     --config 2024.toml                       # view products/ locally
 ```
 
-`tiles` renders the visible COG into a single-file
+`tiles` runs inside every plan by default (`web_map = true` under
+`[visible]`; set false to skip) and renders the visible COG into a single-file
 [PMTiles](https://docs.protomaps.com/pmtiles/) archive (WebMercator XYZ,
 512 px WEBP tiles, max zoom derived from the GSD) plus a Leaflet viewer
 (`*_map.html`) beside it — a slippy map servable from any static host or
@@ -63,7 +64,7 @@ rasters beside the products — read per survey, no fixed thresholds.
 
 ```
 pip install -e .                      # core
-pip install -e ".[match,sentinel,report]"   # LoFTR matching, GEE download, report thumbnails
+pip install -e ".[match,sentinel,report,tiles]"   # LoFTR, GEE, report thumbnails, web map
 ```
 
 Python ≥ 3.10 (`tomli` is pulled in below 3.11).

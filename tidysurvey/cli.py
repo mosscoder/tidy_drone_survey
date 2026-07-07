@@ -9,6 +9,7 @@
     tidysurvey tiles     --config ...                       # visible base -> .pmtiles web map
     tidysurvey serve     --config ...                       # view products/ locally (byte ranges)
     tidysurvey run       --config ...                       # the whole plan, in order
+    #   plan: scene -> stitch/visible -> align/ms -> stitch/ms -> calibrate -> tiles -> report
     tidysurvey run       --config ... --detach               # same, fire-and-forget
 
 `run` is RERUNNABLE: completed stages leave durable outputs and skip
@@ -246,6 +247,9 @@ def _stage_done(cfg, stage):
     if stage == "calibrate" and p.ms_calibrated.exists() \
             and p.stage_report("calibrate").exists():
         return f"{p.ms_calibrated.name} exists"
+    if stage == "tiles" and p.visible_pmtiles.exists() \
+            and p.stage_report("tiles").exists():
+        return f"{p.visible_pmtiles.name} exists"
     return None
 
 
@@ -389,6 +393,15 @@ def main(argv=None):
                 _score_after_stitch(cfg, "multispectral")
             elif stage == "calibrate":
                 _calibrate(cfg, args)
+            elif stage == "tiles":
+                try:
+                    _tiles(cfg, args)
+                except ImportError as e:        # optional extra; a missing
+                    say(f"  web map skipped ({e}) — "   # viewer must not kill
+                        "pip install -e '.[tiles]'")    # a 15-hour run
+                except Exception as e:
+                    say(f"  web map failed ({e}) — continuing; "
+                        "rerun `tidysurvey tiles` after the run")
             elif stage == "report":
                 pass                                    # built in finally, below
     except Exception as e:
