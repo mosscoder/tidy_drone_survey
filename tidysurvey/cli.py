@@ -50,20 +50,23 @@ def _scene(cfg, args):
 
 
 def _stitch(cfg, product):
-    from . import merge, validate
+    from . import cog, merge, validate
     paths = cfg.paths.ensure()
     if product == "visible":
         inputs = [(o.name, o.path) for o in cfg.visible.orthos]
         if cfg.anchor:  # borrowed truth: stitch the ALIGNED orthos, not the raw ones
             inputs = [(o.name, str(paths.registered / f"visible_{o.name}.tif"))
                       for o in cfg.visible.orthos]
-        out = paths.visible_base
+        # stream the master into work/; only the finalized COG lands in products/
+        out = paths.work / "_visible_stitch_master.tif"
+        final = paths.visible_base
         ownership = paths.visible_ownership
         rep_path = paths.stage_report("stitch_visible")
         res = cfg.visible.resolution_m
     else:
         inputs = [(m.name, str(paths.registered / f"{m.name}.tif")) for m in cfg.ms.missions]
-        out = paths.ms_mosaic
+        out = paths.ms_mosaic          # intermediate: calibrate finalizes its product
+        final = None
         ownership = paths.ms_mosaic_ownership
         rep_path = paths.stage_report("stitch_ms")
         res = cfg.ms.resolution_m
@@ -75,6 +78,13 @@ def _stitch(cfg, product):
     validate.seam_tripwire(rep, max_cm=cfg.stitch.seam_tripwire_cm).assert_ok()
     validate.assert_interiors_unchanged(inputs, str(out), str(ownership),
                                         band_width_m=cfg.stitch.band_width_m).assert_ok()
+    if final is not None:
+        # gates passed on the master; deliver as COG — lossless ZSTD base,
+        # WEBP overviews (the visible viewing recipe). Base pixels unchanged.
+        cog.finalize_cog(str(out), str(final), lossless=False)
+        out.unlink()
+        rep["out"] = str(final)
+        rep_path.write_text(json.dumps(rep, indent=2))
     return rep
 
 
