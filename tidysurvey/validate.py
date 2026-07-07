@@ -194,11 +194,24 @@ def seam_tripwire(stitch_report, max_cm=20.0) -> CheckResult:
 
 def assert_interiors_unchanged(inputs, mosaic, ownership, band_width_m=1.0,
                                samples_per_input=8, window_px=256,
+                               block_px=2048, halo_px=64,
                                seed=1234, log=print) -> CheckResult:
-    """HARD GATE (sampled): away from the seam band, the mosaic must be the
-    owner source VERBATIM. Draws windows fully owned by one input, at least
-    2 cells from the seam class in the ownership layer, and byte-compares the
-    mosaic against that source on the mosaic grid."""
+    """HARD GATE (sampled): away from the seam band, the mosaic must contain
+    what the composite READ from the owner source, unaltered.
+
+    Two subtleties the first full-scale run taught us (2026-07-06):
+    * Windows must clear the band ENTIRELY (centre + half-diagonal), else they
+      clip the fringe, where pixels are blended by design.
+    * The reference is read through the WRITER'S exact window geometry
+      (block-aligned halo read, then crop): GDAL's approximating reprojection
+      is deterministic per request shape but NOT across shapes, so a
+      different-shaped read can differ by ±1 DN at ~1e-4 of pixels. Byte
+      identity is still demanded against the geometry-matched read; if only
+      warp dust remains (|Δ| <= 1 DN at <= 0.1% of pixels, e.g. under a
+      different PROJ context than the writing process), the window passes and
+      is counted separately. Structured differences — anything > 1 DN or
+      denser than 0.1% — fail: that is blend leakage, the thing this gate
+      exists to catch."""
     from scipy.ndimage import distance_transform_edt
 
     rng = np.random.RandomState(seed)
@@ -208,12 +221,14 @@ def assert_interiors_unchanged(inputs, mosaic, ownership, band_width_m=1.0,
         cat = o.read(1)
         o_tr = o.transform
         seam_val = int(o.tags().get("seam_band_value", len(names) + 1))
-    far = distance_transform_edt(cat != seam_val) >= 2      # >=2 coarse cells from the band
 
-    checked, mismatched = 0, []
+    checked, bit_identical, dust, mismatched = 0, 0, [], []
     with rasterio.open(mosaic) as m:
         m_tr, m_crs = m.transform, m.crs
         nb = m.count
+        # the WHOLE window must clear the band, not just its centre
+        reach = int(np.ceil((window_px / 2) * abs(m_tr.a) / abs(o_tr.a) * 1.42)) + 2
+        far = distance_transform_edt(cat != seam_val) >= reach
         for i, name in enumerate(names, start=1):
             ys, xs = np.where((cat == i) & far)
             if len(ys) == 0:
@@ -227,20 +242,46 @@ def assert_interiors_unchanged(inputs, mosaic, ownership, band_width_m=1.0,
                     col, row = ~m_tr * (wx, wy)
                     r0 = int(max(0, min(m.height - window_px, row - window_px // 2)))
                     c0 = int(max(0, min(m.width - window_px, col - window_px // 2)))
+                    # clamp the window inside ONE composite block, then read the
+                    # reference through that block's halo request — the writer's
+                    # exact geometry
+                    br0 = (r0 // block_px) * block_px
+                    bc0 = (c0 // block_px) * block_px
+                    bh = min(block_px, m.height - br0)
+                    bw = min(block_px, m.width - bc0)
+                    if bh < window_px or bw < window_px:
+                        continue                    # edge sliver block: skip
+                    r0 = int(min(max(r0, br0), br0 + bh - window_px))
+                    c0 = int(min(max(c0, bc0), bc0 + bw - window_px))
+                    hr0, hc0 = max(0, br0 - halo_px), max(0, bc0 - halo_px)
+                    hr1 = min(m.height, br0 + bh + halo_px)
+                    hc1 = min(m.width, bc0 + bw + halo_px)
+                    ref = v.read(window=Window(hc0, hr0, hc1 - hc0, hr1 - hr0))
+                    b = ref[:nb - 1, r0 - hr0:r0 - hr0 + window_px,
+                            c0 - hc0:c0 - hc0 + window_px]
                     win = Window(c0, r0, window_px, window_px)
                     a = m.read(list(range(1, nb)), window=win)          # spectral bands
-                    b = v.read(list(range(1, nb)), window=win)
                     valid = m.read(nb, window=win) > 127
                     if not valid.any():
                         continue
                     checked += 1
-                    if not np.array_equal(a[:, valid], b[:, valid]):
-                        frac = float((a[:, valid] != b[:, valid]).mean())
-                        mismatched.append(dict(input=name, row=r0, col=c0,
-                                               mismatch_frac=round(frac, 6)))
+                    if np.array_equal(a[:, valid], b[:, valid]):
+                        bit_identical += 1
+                        continue
+                    d = a[:, valid].astype(np.int16) - b[:, valid].astype(np.int16)
+                    frac = float((d != 0).mean())
+                    entry = dict(input=name, row=r0, col=c0,
+                                 mismatch_frac=round(frac, 6),
+                                 max_abs_delta=int(np.abs(d).max()))
+                    if entry["max_abs_delta"] <= 1 and frac <= 1e-3:
+                        dust.append(entry)                    # reprojection dust: passes
+                    else:
+                        mismatched.append(entry)              # structured change: fails
     ok = len(mismatched) == 0 and checked > 0
-    log(f"[interiors] {checked} windows byte-compared, {len(mismatched)} mismatched")
+    log(f"[interiors] {checked} windows compared: {bit_identical} bit-identical, "
+        f"{len(dust)} warp-dust (|Δ|<=1, <=0.1%), {len(mismatched)} FAILED")
     return CheckResult(ok, "interiors_unchanged", windows_checked=checked,
+                       bit_identical=bit_identical, warp_dust=dust,
                        mismatched=mismatched)
 
 

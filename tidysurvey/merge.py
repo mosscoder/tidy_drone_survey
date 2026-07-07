@@ -726,7 +726,10 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                 sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
                                                   fields=None, geom=geom)
                 kind = "own"
-            outh = np.concatenate([np.clip(sf, 0, 255).astype(np.uint8), al[None]], 0)
+            # rint, not truncate: on the band fringe the blend is the owner value
+            # ± sub-LSB float dust; truncation would turn that into a 1-DN error
+            outh = np.concatenate([np.clip(np.rint(sf), 0, 255).astype(np.uint8),
+                                   al[None]], 0)
         with wlock:
             dst.write(outh[:, iy:iy + bh, ix:ix + bw], window=Window(c0, r0, bw, bh))
         return kind
