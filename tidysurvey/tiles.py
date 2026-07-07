@@ -76,8 +76,15 @@ def build_pmtiles(src, dst, tile_px=512, quality=85, min_zoom=8, max_zoom=None,
         lonlat = transform_bounds(s.crs, "EPSG:4326", *s.bounds, densify_pts=21)
         src_res = abs(s.res[0])
         n_bands = s.count
+        n_px = s.width * s.height
         ov_factors = s.overviews(1)              # the COG's pyramid rungs
     center_lat = (lonlat[1] + lonlat[3]) / 2
+    if not ov_factors and n_px > 4e8:
+        raise ValueError(
+            f"{src} has NO overviews ({n_px / 1e9:.1f} Gpx): every zoomed-out tile "
+            "would resample the full base (measured >20 min and >10 GB per tile). "
+            "Finalize the source as a COG first (cog.finalize_cog) — the pipeline's "
+            "products already are.")
     if max_zoom is None:
         max_zoom = auto_max_zoom(src_res, center_lat, tile_px)
     if min_zoom > max_zoom:
@@ -189,6 +196,17 @@ def build_pmtiles(src, dst, tile_px=512, quality=85, min_zoom=8, max_zoom=None,
                     "bounds": ",".join(f"{v:.7f}" for v in lonlat)}
         w.finalize(header, metadata)
 
+    # read the archive back like a client would — silent corruption is the
+    # failure mode a build log cannot see
+    from pmtiles.reader import MmapSource, Reader
+    with open(dst, "rb") as f:
+        hdr = Reader(MmapSource(f)).header()
+    if hdr["tile_type"] != TileType.WEBP or hdr["min_zoom"] != min_zoom \
+            or hdr["max_zoom"] != max_zoom:
+        raise RuntimeError(f"pmtiles read-back mismatch: {hdr}")
+    log(f"    read-back OK: webp, z{hdr['min_zoom']}..z{hdr['max_zoom']}, "
+        f"{hdr['addressed_tiles_count']} addressed tiles")
+
     out_mb = os.path.getsize(dst) / 1e6
     rep = dict(kind="tiles", out=dst, tiles_written=written, tiles_empty=skipped,
                min_zoom=min_zoom, max_zoom=max_zoom, tile_px=tile_px,
@@ -202,64 +220,183 @@ def build_pmtiles(src, dst, tile_px=512, quality=85, min_zoom=8, max_zoom=None,
     return rep
 
 
-_VIEWER_HTML = """<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{title}</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+_VIEWER_HTML = r"""<!doctype html>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root{--bg:#15171a;--panel:#1d2024;--line:#2c3036;--ink:#e7eaee;--dim:#8b929c;
+    --amber:#ffb02e;--bad:#ff6363;--mono:ui-monospace,Menlo,monospace;
+    --cond:system-ui,sans-serif}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:var(--mono)}
+  #map{position:absolute;inset:0;background:#0d0f11}
+  .leaflet-container{background:#0d0f11}
+  #hud{position:absolute;top:14px;left:14px;z-index:1000;width:330px;
+    max-width:calc(100vw - 28px);background:linear-gradient(180deg,#202327,#191b1f);
+    border:1px solid var(--line);border-radius:10px;overflow:hidden;
+    box-shadow:0 18px 40px -18px #000}
+  #hud header{display:flex;align-items:center;gap:9px;padding:11px 13px;
+    border-bottom:1px solid var(--line)}
+  #hud header .dot{width:9px;height:9px;border-radius:50%;background:var(--amber);
+    box-shadow:0 0 10px var(--amber)}
+  #hud header h1{font:700 13px/1.2 var(--cond);letter-spacing:.1em;
+    text-transform:uppercase;margin:0;word-break:break-all}
+  .body{padding:12px 13px 14px}
+  .stat{display:flex;justify-content:space-between;gap:10px;padding:4px 0;font-size:11.5px}
+  .stat .k{color:var(--dim);font-family:var(--cond);font-weight:600;
+    letter-spacing:.06em;text-transform:uppercase}
+  .stat .v{text-align:right;font-variant-numeric:tabular-nums;word-break:break-all}
+  .stat .v.amber{color:var(--amber)}
+  .rule{height:1px;background:var(--line);margin:9px -13px}
+  .ctl label{display:block;font:600 9.5px/1 var(--cond);letter-spacing:.12em;
+    text-transform:uppercase;color:var(--dim);margin:4px 0 6px}
+  input[type=range]{width:100%;accent-color:var(--amber);height:3px}
+  .row{display:flex;gap:8px;margin-top:10px}
+  .btn{flex:1;cursor:pointer;border:1px solid var(--line);background:#23262b;
+    color:var(--ink);font:600 10.5px/1 var(--cond);letter-spacing:.08em;
+    text-transform:uppercase;padding:8px;border-radius:6px}
+  .btn:hover{border-color:var(--amber);color:var(--amber)}
+  .btn[aria-pressed=false]{opacity:.5}
+  #err{display:none;margin-top:10px;padding:9px 10px;border:1px solid #5a2a2a;
+    background:#2a1818;border-radius:6px;color:var(--bad);font-size:11px;line-height:1.45}
+  #err code{color:var(--amber);background:#0004;padding:0 4px;border-radius:3px}
+  #strip{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);z-index:1000;
+    display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;
+    background:#1b1e22cc;backdrop-filter:blur(6px);font-size:11px}
+  #strip div{padding:6px 12px;border-right:1px solid var(--line);
+    font-variant-numeric:tabular-nums}
+  #strip div:last-child{border-right:0}
+  #strip b{color:var(--amber);font-weight:600}
+  .leaflet-control-attribution{background:#1b1e22cc!important;color:#7a818b!important}
+  .leaflet-control-attribution a{color:#9aa1ab!important}
+</style>
+
+<div id="map"></div>
+
+<div id="hud">
+  <header><span class="dot"></span><h1 id="ttl">__TITLE__</h1></header>
+  <div class="body">
+    <div class="stat"><span class="k">Archive</span><span class="v" id="src">—</span></div>
+    <div class="stat"><span class="k">Tile type</span><span class="v amber" id="ttype">—</span></div>
+    <div class="stat"><span class="k">Zoom range</span><span class="v" id="zrange">—</span></div>
+    <div class="stat"><span class="k">Center</span><span class="v" id="center">—</span></div>
+    <div class="rule"></div>
+    <div class="ctl">
+      <label>Overlay opacity · <span id="opval">100</span>%</label>
+      <input type="range" id="opacity" min="0" max="100" value="100">
+    </div>
+    <div class="row">
+      <button class="btn" id="fit">Fit survey</button>
+      <button class="btn" id="tgl-base" aria-pressed="true">Basemap</button>
+      <button class="btn" id="tgl-ov" aria-pressed="true">Overlay</button>
+    </div>
+    <div id="err"></div>
+  </div>
+</div>
+
+<div id="strip">
+  <div>lat <b id="clat">—</b></div>
+  <div>lon <b id="clon">—</b></div>
+  <div>zoom <b id="cz">—</b></div>
+</div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/pmtiles@3.2.1/dist/pmtiles.js"></script>
-<style>
-  html, body, #map {{ height: 100%; margin: 0; }}
-  .note {{ position: absolute; z-index: 1000; bottom: 12px; left: 12px; right: 12px;
-           background: #fff; border: 1px solid #c33; color: #922; padding: 8px 12px;
-           font: 13px/1.5 system-ui; border-radius: 8px; display: none; }}
-</style>
-</head>
-<body>
-<div id="map"></div>
-<div class="note" id="note"></div>
 <script>
-  // 512px WEBP tiles rendered on Leaflet's default 256px grid (leafletRasterLayer
-  // maps display z -> archive z directly); maxNativeZoom overzooms the deepest
-  // archive level so display z{overzoom} shows the native-GSD pixels 1:1.
-  const map = L.map("map", {{ minZoom: {min_zoom}, maxZoom: {overzoom} }});
-  map.fitBounds([[{south}, {west}], [{north}, {east}]]);
-  L.control.scale({{ imperial: false }}).addTo(map);
-  L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
-    maxNativeZoom: 19, maxZoom: {overzoom}, opacity: 0.5,
-    attribution: "&copy; OpenStreetMap" }}).addTo(map);
-  const p = new pmtiles.PMTiles("{pmtiles_name}");
-  pmtiles.leafletRasterLayer(p, {{ maxNativeZoom: {max_zoom}, maxZoom: {overzoom},
-    attribution: "{title}" }}).addTo(map);
-  p.getHeader().catch(err => {{
-    const n = document.getElementById("note");
-    n.style.display = "block";
-    n.textContent = "Could not read {pmtiles_name}: " + err + " — PMTiles needs HTTP " +
-      "byte-range requests. Serve this folder with `tidysurvey serve --config <survey>.toml` " +
-      "(python -m http.server does NOT support ranges), or host both files on any " +
-      "static server/bucket that does (S3 and GCS do).";
-  }});
+// Generated by `tidysurvey tiles`. Default archive: the sibling .pmtiles;
+// point at any other with ?src=<url>. Needs a byte-range HTTP server:
+//   tidysurvey serve --config <survey>.toml     (file:// cannot work)
+const SRC = new URLSearchParams(location.search).get("src") || "__PMTILES__";
+const TILE_TYPE = {0:"unknown",1:"MVT (vector)",2:"PNG",3:"JPEG",4:"WEBP",5:"AVIF"};
+const $ = id => document.getElementById(id);
+$("src").textContent = SRC.replace(/^.*\//, "");
+
+const baked = L.latLngBounds([__SOUTH__, __WEST__], [__NORTH__, __EAST__]);
+const map = L.map("map", {zoomControl:true, maxZoom:26, preferCanvas:true});
+map.fitBounds(baked, {padding:[24,24]});          // no world-flash before the header lands
+L.control.scale({imperial:false}).addTo(map);
+const base = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  {maxZoom:26, maxNativeZoom:19, attribution:"&copy; OpenStreetMap"}).addTo(map);
+
+map.on("mousemove", e => {
+  $("clat").textContent = e.latlng.lat.toFixed(6);
+  $("clon").textContent = e.latlng.lng.toFixed(6);
+});
+map.on("zoomend", () => $("cz").textContent = map.getZoom().toFixed(0));
+
+function fail(msg){ const e = $("err"); e.style.display = "block"; e.innerHTML = msg; }
+
+let overlay = null, bounds = baked;
+const p = new pmtiles.PMTiles(SRC);
+p.getHeader().then(h => {
+  $("ttype").textContent = TILE_TYPE[h.tileType] ?? h.tileType;
+  $("zrange").textContent = `z${h.minZoom} – z${h.maxZoom}`;
+  $("center").textContent = `${h.centerLon.toFixed(5)}, ${h.centerLat.toFixed(5)}`;
+  if (h.tileType === 1){
+    fail("This archive holds <code>MVT vector</code> tiles; this viewer renders raster PMTiles.");
+    return;
+  }
+  bounds = L.latLngBounds([h.minLat, h.minLon], [h.maxLat, h.maxLon]);
+  overlay = pmtiles.leafletRasterLayer(p, {attribution:"__TITLE__",
+    maxNativeZoom:h.maxZoom, maxZoom:26,
+    bounds:bounds});
+  overlay.addTo(map);
+  map.fitBounds(bounds, {padding:[24,24]});
+  // diagnose "header loaded but nothing renders" (tile errors, or a browser
+  // that cannot decode WEBP) instead of showing a silent blank overlay
+  let ok = 0, err = 0;
+  overlay.on("tileload", () => { ok++; });
+  overlay.on("tileerror", () => { err++; });
+  setTimeout(() => {
+    if (ok > 0) return;
+    fail("Header loaded (z" + h.minZoom + "–z" + h.maxZoom + ") but <b>no tiles rendered</b>"
+      + (err ? " (" + err + " tile errors)" : "")
+      + (h.tileType === 4 ? " — tiles are WEBP; a browser without WEBP decode shows blank." : "")
+      + " Check the console / Network tab.");
+  }, 4000);
+}).catch(e => {
+  fail("Could not load <code>" + SRC + "</code>.<br>Most common cause: opened via "
+    + "<code>file://</code> or a server without HTTP Range support "
+    + "(<code>python -m http.server</code> does NOT have it). Run "
+    + "<code>tidysurvey serve --config &lt;survey&gt;.toml</code> and use the printed URL."
+    + "<br><br><span style='color:#8b929c'>" + (e && e.message ? e.message : e) + "</span>");
+});
+
+$("opacity").addEventListener("input", e => {
+  const v = +e.target.value; $("opval").textContent = v;
+  if (overlay) overlay.setOpacity(v/100);
+});
+$("fit").addEventListener("click", () => map.fitBounds(bounds, {padding:[24,24]}));
+function toggle(btn, layer){
+  const on = btn.getAttribute("aria-pressed") === "true";
+  btn.setAttribute("aria-pressed", String(!on));
+  if (layer) on ? map.removeLayer(layer) : map.addLayer(layer);
+}
+$("tgl-base").addEventListener("click", e => toggle(e.target, base));
+$("tgl-ov").addEventListener("click", e => toggle(e.target, overlay));
 </script>
-</body>
-</html>
 """
 
 
 def write_leaflet_html(out_html, pmtiles_name, title, lonlat, min_zoom, max_zoom,
                        log=print):
-    """The archive's double-clickable face: a self-contained Leaflet page that
-    references the .pmtiles by RELATIVE name, so the pair works from any
-    byte-range-capable static host (and locally via `tidysurvey serve` —
-    python's stock http.server ignores Range headers, and file:// has none;
-    the page says so instead of showing a blank map)."""
+    """The archive's double-clickable face — an inspector, not just a map:
+    header-driven metadata HUD, opacity slider, basemap/overlay toggles, live
+    coordinate strip, ?src= override to point at any other archive, and loud
+    diagnoses for the two classic failure modes (no byte ranges; WEBP decode).
+    The .pmtiles is referenced by RELATIVE name so the pair works from any
+    byte-range-capable static host, and locally via `tidysurvey serve`.
+    (Patterns adopted from the user's cog2pmtiles inspector, 2026-06.)"""
     west, south, east, north = lonlat
-    html = _VIEWER_HTML.format(title=title, pmtiles_name=pmtiles_name,
-                               west=west, south=south, east=east, north=north,
-                               min_zoom=min_zoom, max_zoom=max_zoom,
-                               overzoom=max_zoom + 2)
+    html = (_VIEWER_HTML
+            .replace("__TITLE__", str(title))
+            .replace("__PMTILES__", str(pmtiles_name))
+            .replace("__WEST__", f"{west:.7f}")
+            .replace("__SOUTH__", f"{south:.7f}")
+            .replace("__EAST__", f"{east:.7f}")
+            .replace("__NORTH__", f"{north:.7f}"))
     Path(out_html).write_text(html)
     log(f"[pmtiles] viewer -> {out_html} (view via `tidysurvey serve`)")
     return str(out_html)

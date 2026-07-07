@@ -41,6 +41,7 @@ class RangeRequestHandler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def end_headers(self):
+        self.send_header("Accept-Ranges", "bytes")
         self.send_header("Access-Control-Allow-Origin", "*")
         super().end_headers()
 
