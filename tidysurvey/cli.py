@@ -110,9 +110,18 @@ def _align(cfg, product):
         scored = paths.ms_mosaic
     summaries = []
     for it in items:
-        s = registration.register_survey_dense(
-            it.path, reference, str(paths.registered / f"{prefix}{it.name}.tif"),
-            qa_json=str(paths.reports / f"align_{prefix}{it.name}.json"))
+        out = paths.registered / f"{prefix}{it.name}.tif"
+        qa = paths.reports / f"align_{prefix}{it.name}.json"
+        if out.exists() and qa.exists():
+            # resume: a mission is ~an hour of dense matching; keep completed
+            # ones (the qa json only lands after a successful write — a killed
+            # run leaves no qa, so partial outputs are redone, not trusted)
+            print(f"    {it.name}: already registered, skipping "
+                  f"(delete {out.name} to redo)")
+            s = json.loads(qa.read_text())
+        else:
+            s = registration.register_survey_dense(
+                it.path, reference, str(out), qa_json=str(qa))
         s["name"] = it.name
         summaries.append(s)
     rep = dict(kind="align", product=product, reference=str(reference),
