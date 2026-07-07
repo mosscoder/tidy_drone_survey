@@ -213,6 +213,10 @@ def build(cfg, failed_stage=None, log=print):
             oof = rep.get("pooled_oof", {})
             cover.append((name, f"scene {rep.get('scene_date', '?')} · "
                                 f"mean band R² {oof.get('mean_band_R2', '?')}"))
+        elif kind == "tiles":
+            cover.append((name, f"{rep.get('tiles_written', '?')} web tiles · "
+                                f"z{rep.get('min_zoom', '?')}–z{rep.get('max_zoom', '?')} · "
+                                f"{rep.get('size_mb', '?')} MB"))
         else:
             cover.append((name, ", ".join(f"{k}={v}" for k, v in list(rep.items())[:4]
                                           if not isinstance(v, (dict, list)))))
@@ -272,6 +276,25 @@ def build(cfg, failed_stage=None, log=print):
                           "<table>" + _row(["reliability band", "median", "p90"], "th")
                           + mrows + "</table></section>")
 
+    # ---- web map (pmtiles + leaflet viewer, when the tiles stage ran) ------- #
+    tiles_html = ""
+    trep = next((r for r in stages.values() if r.get("kind") == "tiles"), None)
+    if trep:
+        pm_name = Path(trep.get("out", "")).name
+        map_name = Path(trep["map_html"]).name if trep.get("map_html") else None
+        tiles_html = (
+            f"<p><b>{pm_name}</b> — single-file PMTiles archive: "
+            f"{trep.get('tiles_written', '?')} WEBP tiles, "
+            f"z{trep.get('min_zoom', '?')}–z{trep.get('max_zoom', '?')}, "
+            f"{trep.get('size_mb', '?')} MB. Serve it from any static host or "
+            f"bucket; byte-range requests do the rest — no tile server.</p>")
+        if map_name:
+            tiles_html += (
+                f'<p>Interactive map: <a href="../{map_name}">{map_name}</a> '
+                f"(lives beside the archive in products/ — open over http, e.g. "
+                f"<span class='mono'>python3 -m http.server</span> in products/; "
+                f"file:// cannot do range requests).</p>")
+
     snapshot = json.dumps(manifest.get("config", cfg.snapshot()), indent=2)
     stamp = time.strftime("%Y-%m-%d %H:%M")
 
@@ -287,6 +310,7 @@ def build(cfg, failed_stage=None, log=print):
 {'' if ok else f'<p class="note bad">Run halted at {failed_stage}; sections below cover the stages that ran.</p>'}
 </section>
 <section><h2>Products</h2><div class="cards">{''.join(thumbs) or '<p class="note">no products yet</p>'}</div></section>
+{f'<section><h2>Web map</h2>{tiles_html}</section>' if tiles_html else ''}
 {f'<section><h2>Alignment — visible vs borrowed anchor</h2>{vis_reg_html}</section>' if vis_reg_html else ''}
 {f'<section><h2>Alignment — multispectral vs base map</h2>{reg_html}</section>' if reg_html else ''}
 {''.join(detail)}

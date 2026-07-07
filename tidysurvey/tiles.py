@@ -194,6 +194,71 @@ def build_pmtiles(src, dst, tile_px=512, quality=85, min_zoom=8, max_zoom=None,
                min_zoom=min_zoom, max_zoom=max_zoom, tile_px=tile_px,
                quality=quality, size_mb=round(out_mb, 1),
                seconds=round(time.perf_counter() - t0, 1))
+    rep["map_html"] = write_leaflet_html(
+        Path(dst).with_name(Path(dst).stem + "_map.html"), Path(dst).name,
+        Path(dst).stem, lonlat, min_zoom, max_zoom, log=log)
     log(f"[pmtiles] done ({rep['seconds']:.0f}s) — {written} tiles, "
         f"{out_mb:.0f} MB -> {dst}")
     return rep
+
+
+_VIEWER_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{title}</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/pmtiles@3.2.1/dist/pmtiles.js"></script>
+<style>
+  html, body, #map {{ height: 100%; margin: 0; }}
+  .note {{ position: absolute; z-index: 1000; bottom: 12px; left: 12px; right: 12px;
+           background: #fff; border: 1px solid #c33; color: #922; padding: 8px 12px;
+           font: 13px/1.5 system-ui; border-radius: 8px; display: none; }}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="note" id="note"></div>
+<script>
+  // 512px WEBP tiles rendered on Leaflet's default 256px grid (leafletRasterLayer
+  // maps display z -> archive z directly); maxNativeZoom overzooms the deepest
+  // archive level so display z{overzoom} shows the native-GSD pixels 1:1.
+  const map = L.map("map", {{ minZoom: {min_zoom}, maxZoom: {overzoom} }});
+  map.fitBounds([[{south}, {west}], [{north}, {east}]]);
+  L.control.scale({{ imperial: false }}).addTo(map);
+  L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+    maxNativeZoom: 19, maxZoom: {overzoom}, opacity: 0.5,
+    attribution: "&copy; OpenStreetMap" }}).addTo(map);
+  const p = new pmtiles.PMTiles("{pmtiles_name}");
+  pmtiles.leafletRasterLayer(p, {{ maxNativeZoom: {max_zoom}, maxZoom: {overzoom},
+    attribution: "{title}" }}).addTo(map);
+  p.getHeader().catch(err => {{
+    const n = document.getElementById("note");
+    n.style.display = "block";
+    n.textContent = "Could not read {pmtiles_name}: " + err + " — PMTiles needs HTTP " +
+      "range requests, which file:// cannot serve. Run e.g. `python3 -m http.server` " +
+      "in this folder and open this page via http://localhost:8000/, or host both " +
+      "files on any static server or bucket.";
+  }});
+</script>
+</body>
+</html>
+"""
+
+
+def write_leaflet_html(out_html, pmtiles_name, title, lonlat, min_zoom, max_zoom,
+                       log=print):
+    """The archive's double-clickable face: a self-contained Leaflet page that
+    references the .pmtiles by RELATIVE name, so the pair works from any
+    static host (and from `python3 -m http.server` locally — file:// cannot
+    do range requests, and the page says so instead of showing a blank map)."""
+    west, south, east, north = lonlat
+    html = _VIEWER_HTML.format(title=title, pmtiles_name=pmtiles_name,
+                               west=west, south=south, east=east, north=north,
+                               min_zoom=min_zoom, max_zoom=max_zoom,
+                               overzoom=max_zoom + 2)
+    Path(out_html).write_text(html)
+    log(f"[pmtiles] viewer -> {out_html} (serve over http; file:// can't range-read)")
+    return str(out_html)
