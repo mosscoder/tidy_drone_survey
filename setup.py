@@ -22,6 +22,7 @@ setup(
         'match': ['torch', 'kornia'],
         'sentinel': ['earthengine-api', 'google-auth', 'requests', 'pyproj'],
         'report': ['matplotlib'],
+        'tiles': ['pmtiles', 'Pillow'],
     },
     entry_points={
         'console_scripts': [

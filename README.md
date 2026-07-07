@@ -9,8 +9,16 @@ One TOML per survey drives everything — the command line never decides
 pipeline shape:
 
 ```
-tidysurvey run --config 2024.toml       # scene pick → stitch → align → stitch → calibrate → report
+tidysurvey run --config 2024.toml            # scene pick → stitch → align → stitch → calibrate → report
+tidysurvey run --config 2024.toml --detach   # same, fire-and-forget → tail -f <run_dir>/run.log
 ```
+
+`run` is **rerunnable**: completed stages leave durable outputs and skip
+themselves next time (delete an output to redo its stage), aligned missions
+are kept individually, and a chosen Sentinel-2 scene stays chosen. After any
+interruption the refire command is just the same `run` again. `--detach`
+launches it immune to a closed terminal or session cleanup, logging to
+`<run_dir>/run.log` with a timestamp on every line.
 
 or stage by stage:
 
@@ -21,7 +29,14 @@ tidysurvey align     --config 2024.toml                       # each MS mission 
 tidysurvey stitch    --config 2024.toml --product multispectral
 tidysurvey calibrate --config 2024.toml                       # reflectance + reliability rasters
 tidysurvey report    --config 2024.toml                       # regenerate the quality report
+tidysurvey tiles     --config 2024.toml                       # visible base -> .pmtiles web map
 ```
+
+`tiles` renders the visible COG into a single-file
+[PMTiles](https://docs.protomaps.com/pmtiles/) archive (WebMercator XYZ,
+512 px WEBP tiles, max zoom derived from the GSD) servable as a slippy map
+from any static host or bucket via range requests — no tile server. It is a
+viewing artifact like the COG's overviews; analysis stays on the COG.
 
 Every run leaves the same shape on disk:
 

@@ -130,6 +130,11 @@ class Paths:
         return self.products / f"{self.survey}_ms_calibrated_{gsd_slug(r)}.tif"
 
     @property
+    def visible_pmtiles(self) -> Path:
+        r = self._need(self._vres, "visible")
+        return self.products / f"{self.survey}_visible_{gsd_slug(r)}.pmtiles"
+
+    @property
     def manifest(self) -> Path:
         return self.products / "_run_manifest.json"
 

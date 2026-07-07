@@ -6,7 +6,15 @@
     tidysurvey stitch    --config ... --product multispectral
     tidysurvey calibrate --config ...                       # 4. reflectance + reliability
     tidysurvey report    --config ...                       # regenerate the quality report
+    tidysurvey tiles     --config ...                       # visible base -> .pmtiles web map
     tidysurvey run       --config ...                       # the whole plan, in order
+    tidysurvey run       --config ... --detach               # same, fire-and-forget
+
+`run` is RERUNNABLE: completed stages leave durable outputs and skip
+themselves on the next run (delete an output to redo its stage), so after
+any interruption the refire command is simply the same `run` again.
+--detach launches it immune to terminal close / session cleanup and
+appends everything to <run_dir>/run.log.
 
 The PLAN is derived from the TOML, never from flags: a borrowed `anchor`
 inserts the visible-align pass; a multispectral layer appends align/stitch/
@@ -23,6 +31,7 @@ import signal
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from . import config as _config
 
@@ -62,10 +71,19 @@ def _banner(stage, i, n):
 # --------------------------------------------------------------------------- #
 def _scene(cfg, args):
     from . import sentinel
-    if cfg.calibrate.date not in (None, "auto") and not getattr(args, "rescan", False):
+    rescan = bool(getattr(args, "rescan", False))
+    if cfg.calibrate.date not in (None, "auto") and not rescan:
         say(f"  scene fixed in config: {cfg.calibrate.date} (no search)")
         _config.write_manifest(cfg, {"scene": {"date": cfg.calibrate.date, "source": "config"}})
         return {"date": cfg.calibrate.date}
+    if not rescan and cfg.paths.manifest.exists():
+        try:
+            locked = (json.loads(cfg.paths.manifest.read_text()).get("scene") or {}).get("date")
+        except Exception:
+            locked = None
+        if locked:
+            say(f"  scene already locked: {locked} (manifest; --rescan to search again)")
+            return {"date": locked}
     chosen = sentinel.pick_scene(
         bounds_raster=None if not cfg.ms.missions else cfg.ms.missions[0].path,
         mission_dates=[m.date for m in cfg.ms.missions if m.date] or None,
@@ -213,6 +231,41 @@ def _calibrate(cfg, args):
     return rep
 
 
+def _stage_done(cfg, stage):
+    """A completed stage leaves its product AND its stage report (reports are
+    written last), so a rerun of `run` can skip it. Delete the product to
+    redo a stage. align/* resume per mission; scene honors the manifest."""
+    p = cfg.paths
+    if stage == "stitch/visible" and p.visible_base.exists() \
+            and p.stage_report("stitch_visible").exists():
+        return f"{p.visible_base.name} exists"
+    if stage == "stitch/ms" and p.ms_mosaic.exists() \
+            and p.stage_report("stitch_ms").exists():
+        return f"{p.ms_mosaic.name} exists"
+    if stage == "calibrate" and p.ms_calibrated.exists() \
+            and p.stage_report("calibrate").exists():
+        return f"{p.ms_calibrated.name} exists"
+    return None
+
+
+def _score_if_missing(cfg, product):
+    """Backfill the r map when a stitch is skipped but a prior death landed
+    between the stitch and its scoring."""
+    qa = cfg.paths.visible_reg_qa if product == "visible" else cfg.paths.reg_qa
+    if not qa.exists():
+        _score_after_stitch(cfg, product)
+
+
+def _tiles(cfg, args):
+    from . import tiles
+    paths = cfg.paths.ensure()
+    rep = tiles.build_pmtiles(str(paths.visible_base), str(paths.visible_pmtiles),
+                              min_zoom=args.min_zoom, max_zoom=args.max_zoom,
+                              log=say)
+    paths.stage_report("tiles").write_text(json.dumps(rep, indent=2))
+    return rep
+
+
 def _report(cfg, failed_stage=None):
     from . import report
     return report.build(cfg, failed_stage=failed_stage, log=say)
@@ -227,14 +280,37 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tidysurvey", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["run", "scenes", "stitch", "align",
-                                        "calibrate", "report"])
+                                        "calibrate", "report", "tiles"])
     ap.add_argument("--config", required=True)
     ap.add_argument("--product", choices=["visible", "multispectral", "ms"],
                     default=None, help="for stitch/align")
     ap.add_argument("--date", default=None, help="override calibrate.date")
     ap.add_argument("--non-interactive", action="store_true",
                     help="headless: auto-accept the suggested scene")
+    ap.add_argument("--detach", action="store_true",
+                    help="run detached: survives terminal close/session cleanup; "
+                         "appends to <run_dir>/run.log")
+    ap.add_argument("--rescan", action="store_true",
+                    help="scenes: search again even when a scene is already locked")
+    ap.add_argument("--min-zoom", type=int, default=8, help="tiles: lowest zoom")
+    ap.add_argument("--max-zoom", type=int, default=None,
+                    help="tiles: highest zoom (default: derived from the GSD)")
     args = ap.parse_args(argv)
+
+    if args.detach:
+        import subprocess
+        lite = _config.load(args.config, resolve_auto=False)
+        log_path = Path(lite.run_dir) / "run.log"
+        raw = list(argv) if argv is not None else sys.argv[1:]
+        child = [sys.executable, "-u", "-m", "tidysurvey"] + \
+                [a for a in raw if a != "--detach"]
+        if "--non-interactive" not in child:
+            child.append("--non-interactive")      # a detached run has no keyboard
+        with open(log_path, "a") as lf:
+            proc = subprocess.Popen(child, stdout=lf, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+        say(f"detached: pid {proc.pid} · follow with  tail -f {log_path}")
+        return 0
 
     cfg = _config.load(args.config)
     if args.date:
@@ -261,6 +337,8 @@ def main(argv=None):
         return _calibrate(cfg, args) and 0
     if args.command == "report":
         return _report(cfg) and 0
+    if args.command == "tiles":
+        return _tiles(cfg, args) and 0
 
     # ---- run: the whole plan, report always written ------------------------- #
     plan = cfg.plan()
@@ -269,6 +347,14 @@ def main(argv=None):
     try:
         for i, stage in enumerate(plan, 1):
             _banner(stage, i, len(plan))
+            done = _stage_done(cfg, stage)
+            if done:
+                say(f"  {done} — skipping (delete it to redo this stage)")
+                if stage == "stitch/visible":
+                    _score_if_missing(cfg, "visible")
+                elif stage == "stitch/ms":
+                    _score_if_missing(cfg, "multispectral")
+                continue
             if stage == "scene":
                 _scene(cfg, args)
             elif stage == "align/visible":

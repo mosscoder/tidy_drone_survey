@@ -12,6 +12,7 @@ from . import cog
 from . import validate
 from . import report
 from . import calibrate
+from . import tiles
 
 # stitch (seam-walk blend) + mission-boundary products
 from .merge import (
@@ -30,7 +31,7 @@ from .sentinel import download_sentinel2_bands, pick_scene
 
 __all__ = [
     # modules
-    'config', 'fields', 'cog', 'validate', 'report', 'calibrate',
+    'config', 'fields', 'cog', 'validate', 'report', 'calibrate', 'tiles',
     # stitch + boundaries
     'seam_merge', 'define_hull_tiled', 'find_seamlines',
     'generate_combined_boundaries',
