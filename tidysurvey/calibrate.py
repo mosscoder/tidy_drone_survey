@@ -141,6 +141,19 @@ def save_model(model, path):
 # --------------------------------------------------------------------------- #
 # the apply: bilinear coefficient interpolation at native resolution
 # --------------------------------------------------------------------------- #
+# A DatasetReader holds a C handle (self._hds) that cannot be pickled across the
+# loky process boundary, so each worker opens — and caches — its own handle.
+_WORKER_SRC: dict = {}
+
+
+def _worker_src(path):
+    ds = _WORKER_SRC.get(path)
+    if ds is None:
+        ds = rasterio.open(path)
+        _WORKER_SRC[path] = ds
+    return ds
+
+
 def apply_bilinear(drone_path, model, out, tile=2048, workers=None, log=print):
     """Blend the tile coefficient vectors bilinearly to native resolution,
     apply to native DN, clip to the reference scene range, write a tiled ZSTD
@@ -164,9 +177,10 @@ def apply_bilinear(drone_path, model, out, tile=2048, workers=None, log=print):
                 predictor=2, tiled=True, blockxsize=512, blockysize=512, BIGTIFF="YES")
     for k in ("photometric", "alpha"):
         prof.pop(k, None)
+    src.close()   # metadata only in the parent; workers open their own handles
 
     def process(r0, c0, h, w):
-        arr = src.read(window=Window(c0, r0, w, h))
+        arr = _worker_src(drone_path).read(window=Window(c0, r0, w, h))
         DN = arr[:4].astype(np.float32)
         al = arr[alpha_idx - 1] > 0
         if not al.any():
@@ -213,7 +227,6 @@ def apply_bilinear(drone_path, model, out, tile=2048, workers=None, log=print):
             done += 1
             if done % 200 == 0:
                 log(f"    [{done}/{len(wins)}]")
-    src.close()
     log(f"[calibrate] applied in {time.time() - t0:.0f}s -> {out}")
     return out
 
