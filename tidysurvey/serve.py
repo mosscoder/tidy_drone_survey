@@ -89,10 +89,22 @@ class RangeRequestHandler(SimpleHTTPRequestHandler):
         pass
 
 
-def serve_dir(root, port=8080, log=print):
-    """Serve `root` (blocking) with byte-range support until Ctrl-C."""
+def serve_dir(root, port=8080, open_url=None, log=print):
+    """Serve `root` (blocking) with byte-range support until Ctrl-C.
+    If open_url is set, open it in the default browser once we're listening."""
     handler = partial(RangeRequestHandler, directory=str(root))
     httpd = ThreadingHTTPServer(("", port), handler)
+    if open_url:
+        import threading
+        import webbrowser
+
+        def _open():
+            try:
+                webbrowser.open(open_url)
+            except Exception:
+                pass                     # a missing browser must not kill the server
+        # fire just after serve_forever starts so the first request is handled
+        threading.Timer(0.4, _open).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

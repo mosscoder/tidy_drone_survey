@@ -29,6 +29,7 @@ import argparse
 import faulthandler
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -274,20 +275,178 @@ def _tiles(cfg, args):
 def _serve(cfg, args):
     from .serve import serve_dir
     root = Path(args.dir) if args.dir else cfg.paths.products
+    base = f"http://localhost:{args.port}"
     say(f"serving {root}")
-    for m in sorted(root.glob("*_map.html")):
-        say(f"  map:    http://localhost:{args.port}/{m.name}")
+    maps = sorted(root.glob("*_map.html"))
+    for m in maps:
+        say(f"  map:    {base}/{m.name}")
     rep_html = root / "quality" / "quality_report.html"
     if rep_html.exists():
-        say(f"  report: http://localhost:{args.port}/quality/quality_report.html")
-    say(f"  root:   http://localhost:{args.port}/   (Ctrl-C stops)")
-    serve_dir(root, args.port, log=say)
+        say(f"  report: {base}/quality/quality_report.html")
+    say(f"  root:   {base}/   (Ctrl-C stops)")
+
+    # what to open in the browser on start (default: the map — it's why serve exists)
+    targets = {
+        "map": f"{base}/{maps[0].name}" if maps else None,
+        "report": f"{base}/quality/quality_report.html" if rep_html.exists() else None,
+        "root": f"{base}/",
+    }
+    want = getattr(args, "open_target", "map")
+    open_url = None
+    if want != "none":
+        open_url = targets.get(want) or targets["map"] or targets["report"] or targets["root"]
+        say(f"  opening {open_url} in your browser …")
+    serve_dir(root, args.port, open_url=open_url, log=say)
     return True
 
 
 def _report(cfg, failed_stage=None):
     from . import report
     return report.build(cfg, failed_stage=failed_stage, log=say)
+
+
+# --------------------------------------------------------------------------- #
+# publish — the opt-in terminal step: move the bulky finished data to the NAS,
+# leaving only the quality record local. Idempotent + resumable via the
+# products/_published.json marker; runs only on a fully successful run.
+# --------------------------------------------------------------------------- #
+def _published_status(cfg):
+    """'done' | 'in_progress' | None — read from the run_dir's publish marker."""
+    marker = cfg.paths.products / "_published.json"
+    if not marker.exists():
+        return None
+    try:
+        return json.loads(marker.read_text()).get("status")
+    except Exception:
+        return None
+
+
+def _crash_safe_move(src, dst, log=say):
+    """Move a file so a crash leaves either the source or a COMPLETE
+    destination, never a half-file. Same-share = atomic rename; cross-share
+    (e.g. local SSD -> /Volumes/GIS) = copy to <dst>.partial, verify byte size,
+    atomic os.replace into place, then drop the source. Idempotent: a source
+    already gone with the destination present counts as done."""
+    src, dst = Path(src), Path(dst)
+    if not src.exists():
+        if dst.exists():
+            return "already"
+        raise FileNotFoundError(f"publish: source vanished before move: {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(src, dst)                 # same filesystem: atomic + instant
+        return "renamed"
+    except OSError:
+        pass                                 # cross-device — copy via a .partial
+    tmp = dst.parent / (dst.name + ".partial")
+    shutil.copy2(src, tmp)
+    if tmp.stat().st_size != src.stat().st_size:
+        tmp.unlink(missing_ok=True)
+        raise IOError(f"publish: size mismatch copying {src} -> {dst}")
+    os.replace(tmp, dst)                      # atomic swap into place
+    src.unlink()
+    return "copied"
+
+
+def _move_tree(src, dst, log=say):
+    """Move a whole directory (work/). Same-share = instant rename; cross-share
+    = shutil.move (copytree + rmtree). Refuses to merge into an existing dst."""
+    src, dst = Path(src), Path(dst)
+    if not src.exists():
+        return "already" if dst.exists() else "missing"
+    if dst.exists():
+        raise FileExistsError(f"publish: destination already present, refusing "
+                              f"to merge: {dst} (resolve by hand)")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(src, dst)                  # same filesystem: instant
+        return "renamed"
+    except OSError:
+        shutil.move(str(src), str(dst))      # cross-device: copytree + rmtree
+        return "copied"
+
+
+def _rewrite_report_maplink(cfg, map_name):
+    """The web map moved to the NAS archive; the quality report stays local.
+    Point its map reference at the new home (both substrings are literals
+    emitted by report.build, so this is survey-independent)."""
+    rep = cfg.paths.report_html
+    if not map_name or not rep.exists():
+        return
+    archive = cfg.publish.archive_dir
+    html = rep.read_text()
+    html = html.replace(f'href="../{map_name}"',
+                        f'href="file://{archive}/{map_name}"')
+    html = html.replace(
+        "(lives beside the archive in products/)",
+        f"(published to the NAS archive — view with: "
+        f"tidysurvey serve --dir {archive})")
+    rep.write_text(html)
+
+
+def _publish(cfg):
+    """Terminal, opt-in: move the bulky finished data off the local run_dir to
+    its NAS homes — the visible + calibrated-MS COGs -> basemap_dir under the
+    consumer names visible.tif / multispectral.tif; the .pmtiles web map (+ its
+    _map.html) and work/ -> archive_dir — leaving the quality report,
+    reliability rasters and manifest in the local run_dir. Driven by
+    products/_published.json so it is idempotent and resumable after an
+    interrupted move (on resume it needs no resolved config — the move list is
+    self-contained)."""
+    p = cfg.paths
+    pub = cfg.publish
+    marker_path = p.products / "_published.json"
+    m = json.loads(marker_path.read_text()) if marker_path.exists() else None
+    if m and m.get("status") == "done":
+        say(f"  already published → {pub.basemap_dir} · {pub.archive_dir}")
+        return m
+
+    if m is None:
+        # first publish: build the move list from the resolved product paths
+        basemap, archive = Path(pub.basemap_dir), Path(pub.archive_dir)
+        moves = []
+
+        def add(src, dst, tree=False):
+            moves.append({"src": str(src), "dst": str(dst),
+                          "tree": tree, "done": False})
+
+        add(p.visible_base, basemap / "visible.tif")
+        vaux = Path(str(p.visible_base) + ".aux.xml")
+        if vaux.exists():
+            add(vaux, basemap / "visible.tif.aux.xml")
+        add(p.ms_calibrated, basemap / "multispectral.tif")
+        maux = Path(str(p.ms_calibrated) + ".aux.xml")
+        if maux.exists():
+            add(maux, basemap / "multispectral.tif.aux.xml")
+        add(p.visible_pmtiles, archive / p.visible_pmtiles.name)
+        map_html = p.visible_pmtiles.with_name(p.visible_pmtiles.stem + "_map.html")
+        map_name = map_html.name if map_html.exists() else None
+        if map_name:
+            add(map_html, archive / map_name)
+        add(p.work, archive / "work", tree=True)
+        m = {"status": "in_progress",
+             "published_at": time.strftime("%Y-%m-%d %H:%M"),
+             "basemap_dir": pub.basemap_dir, "archive_dir": pub.archive_dir,
+             "map_html": map_name, "moves": moves}
+        marker_path.write_text(json.dumps(m, indent=2))
+
+    for mv in m["moves"]:
+        if mv.get("done"):
+            continue
+        res = (_move_tree(mv["src"], mv["dst"]) if mv.get("tree")
+               else _crash_safe_move(mv["src"], mv["dst"]))
+        say(f"  {Path(mv['src']).name} → {mv['dst']}  [{res}]")
+        mv["done"] = True
+        marker_path.write_text(json.dumps(m, indent=2))
+
+    _rewrite_report_maplink(cfg, m.get("map_html"))
+    mani = json.loads(p.manifest.read_text()) if p.manifest.exists() else {}
+    mani["published"] = {"at": m["published_at"], "basemap_dir": pub.basemap_dir,
+                         "archive_dir": pub.archive_dir}
+    p.manifest.write_text(json.dumps(mani, indent=2))
+    m["status"] = "done"
+    marker_path.write_text(json.dumps(m, indent=2))
+    return m
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +475,10 @@ def main(argv=None):
                     help="tiles: highest zoom (default: derived from the GSD)")
     ap.add_argument("--port", type=int, default=8080, help="serve: port")
     ap.add_argument("--dir", default=None, help="serve: directory (default products/)")
+    ap.add_argument("--open", dest="open_target",
+                    choices=["map", "report", "root", "none"], default="map",
+                    help="serve: open this in the browser on start (default map; "
+                         "none = don't open)")
     args = ap.parse_args(argv)
 
     if args.detach:
@@ -332,6 +495,24 @@ def main(argv=None):
                                     stdin=subprocess.DEVNULL, start_new_session=True)
         say(f"detached: pid {proc.pid} · follow with  tail -f {log_path}")
         return 0
+
+    # a published run is TERMINAL: check the seal before the (remote) resolve so
+    # re-running a shipped survey never depends on its inputs still existing
+    if args.command == "run":
+        lite = _config.load(args.config, resolve_auto=False)
+        if lite.publish.enabled:
+            sealed = _published_status(lite)
+            if sealed == "done":
+                say(f"tidysurvey · {lite.survey} · already published")
+                say(f"  basemap {lite.publish.basemap_dir}")
+                say(f"  archive {lite.publish.archive_dir}")
+                say(f"  nothing to do — clear "
+                    f"{lite.paths.products / '_published.json'} to rebuild")
+                return 0
+            if sealed == "in_progress":
+                say(f"tidysurvey · {lite.survey} · resuming interrupted publish")
+                _publish(lite)
+                return 0
 
     # serve only needs run_dir/products — skip the remote-header resolve
     cfg = _config.load(args.config, resolve_auto=(args.command != "serve"))
@@ -370,6 +551,8 @@ def main(argv=None):
     failed = None
     try:
         for i, stage in enumerate(plan, 1):
+            if stage == "publish":
+                continue                    # terminal move — run at the seam, below
             _banner(stage, i, len(plan))
             done = _stage_done(cfg, stage)
             if done:
@@ -409,13 +592,22 @@ def main(argv=None):
         say(f"✗ {failed}")
         raise
     finally:
-        _banner("report", len(plan), len(plan))
+        _banner("report", plan.index("report") + 1, len(plan))
         _report(cfg, failed_stage=failed)
         _config.write_manifest(cfg, {"finished": time.strftime("%Y-%m-%d %H:%M"),
                                      "seconds": round(time.time() - t0, 1),
                                      "failed_stage": failed})
-    say(f"✓ run complete — {time.time() - t0:.0f}s · to ship this survey, "
-        f"copy one folder: {cfg.paths.products}")
+    # success only (a failed stage re-raised above): the opt-in move to the NAS
+    if cfg.publish.enabled:
+        _banner("publish", len(plan), len(plan))
+        _publish(cfg)
+        say(f"✓ run complete — {time.time() - t0:.0f}s · published →")
+        say(f"    basemap  {cfg.publish.basemap_dir}")
+        say(f"    archive  {cfg.publish.archive_dir}")
+        say(f"    local record kept: {cfg.paths.products}")
+    else:
+        say(f"✓ run complete — {time.time() - t0:.0f}s · to ship this survey, "
+            f"copy one folder: {cfg.paths.products}")
     return 0
 
 

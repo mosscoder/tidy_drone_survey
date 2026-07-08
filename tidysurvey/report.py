@@ -179,9 +179,14 @@ def build(cfg, failed_stage=None, log=print):
     stages = {}
     for p in sorted(Path(paths.reports).glob("*.json")):
         try:
-            stages[p.stem] = json.loads(p.read_text())
+            rep = json.loads(p.read_text())
         except Exception:
-            pass
+            continue
+        # per-mission align checkpoints (align_batch_*) are resume state, not
+        # report sections; the combined align report carries the missions table
+        if rep.get("kind") == "align" and "missions" not in rep:
+            continue
+        stages[p.stem] = rep
 
     manifest = {}
     if paths.manifest.exists():
@@ -204,8 +209,13 @@ def build(cfg, failed_stage=None, log=print):
                           f"{rep.get('n_seams', 0)} seams"
                           + (f" · worst residual {max(res):.1f} cm" if res else "")))
         elif kind == "align":
-            cover.append((name, f"{rep.get('mission', '')} · median shift "
-                                f"{rep.get('d_med_cm', '?')} cm"))
+            shifts = sorted(m["d_med_cm"] for m in rep.get("missions", [])
+                            if m.get("d_med_cm") is not None)
+            n = len(shifts)
+            med = (shifts[n // 2] if n % 2 else (shifts[n // 2 - 1] + shifts[n // 2]) / 2) \
+                if shifts else None
+            cover.append((name, f"{len(rep.get('missions', []))} missions"
+                          + (f" · median shift {med:.1f} cm" if med is not None else "")))
         elif kind == "registration_r_cells":
             cover.append((name, f"median cell r {rep.get('median_r')} "
                                 f"({rep.get('cells')} cells)"))
@@ -260,11 +270,13 @@ def build(cfg, failed_stage=None, log=print):
                           + _row(["seam", "measured shift (cm)", "post-solve residual (cm)"], "th")
                           + rows + "</table></section>")
         if rep.get("kind") == "align":
+            rows = "".join(_row([m.get("name") or m.get("mission"), m.get("tiles"),
+                                 m.get("matches"), m.get("cells"), m.get("d_med_cm")])
+                           for m in rep.get("missions", []))
             detail.append(
                 f"<section><h2>{name}</h2><table>"
                 + _row(["mission", "tiles", "matches", "cells", "median shift (cm)"], "th")
-                + _row([rep.get("mission"), rep.get("tiles"), rep.get("matches"),
-                        rep.get("cells"), rep.get("d_med_cm")]) + "</table></section>")
+                + rows + "</table></section>")
         if rep.get("kind") == "calibrate":
             oof = rep.get("pooled_oof", {})
             mae = rep.get("qa_summary", {})
@@ -289,12 +301,14 @@ def build(cfg, failed_stage=None, log=print):
             f"{trep.get('size_mb', '?')} MB. Serve it from any static host or "
             f"bucket; byte-range requests do the rest — no tile server.</p>")
         if map_name:
+            serve_cmd = (f"tidysurvey serve --config {cfg.source}"
+                         if cfg.source else "tidysurvey serve --config <survey>.toml")
             tiles_html += (
                 f'<p>Interactive map: <a href="../{map_name}">{map_name}</a> '
-                f"(lives beside the archive in products/ — view locally with "
-                f"<span class='mono'>tidysurvey serve --config &lt;survey&gt;.toml</span>; "
-                f"needs byte-range HTTP, which file:// and python's stock "
-                f"http.server don't provide).</p>")
+                f"(lives beside the archive in products/). View locally — needs "
+                f"byte-range HTTP, which file:// and python's stock http.server "
+                f"don't provide:</p>"
+                f'<pre class="mono">{serve_cmd}</pre>')
 
     snapshot = json.dumps(manifest.get("config", cfg.snapshot()), indent=2)
     stamp = time.strftime("%Y-%m-%d %H:%M")

@@ -30,7 +30,7 @@ tidysurvey stitch    --config 2024.toml --product multispectral
 tidysurvey calibrate --config 2024.toml                       # reflectance + reliability rasters
 tidysurvey report    --config 2024.toml                       # regenerate the quality report
 tidysurvey tiles     --config 2024.toml                       # visible base -> .pmtiles web map
-tidysurvey serve     --config 2024.toml                       # view products/ locally
+tidysurvey serve     --config 2024.toml                       # view products/ locally (opens the web map)
 ```
 
 `tiles` runs inside every plan by default (`web_map = true` under
@@ -39,9 +39,10 @@ tidysurvey serve     --config 2024.toml                       # view products/ l
 512 px WEBP tiles, max zoom derived from the GSD) plus a Leaflet viewer
 (`*_map.html`) beside it — a slippy map servable from any static host or
 bucket that supports byte-range requests, no tile server. View locally with
-`tidysurvey serve` (python's stock `http.server` ignores Range headers and
-cannot serve PMTiles). It is a viewing artifact like the COG's overviews;
-analysis stays on the COG.
+`tidysurvey serve`, which opens the web map in your browser (`--open report`
+for the quality report, `--open none` to suppress) and byte-serves it —
+python's stock `http.server` ignores Range headers and cannot serve PMTiles.
+It is a viewing artifact like the COG's overviews; analysis stays on the COG.
 
 Every run leaves the same shape on disk:
 
@@ -50,6 +51,39 @@ Every run leaves the same shape on disk:
 <run_dir>/products/quality/    reliability rasters + quality_report.html
 <run_dir>/work/                intermediates, deletable once the run is accepted
 ```
+
+## Publish (optional): run on fast local disk, ship to durable storage
+
+By default everything lands under `run_dir` and stays there. A survey may
+instead run on a local SSD and, **only after a fully successful run**, move its
+bulky finished data off to durable NAS homes — leaving the lightweight quality
+record behind. Opt in with a `[publish]` section:
+
+```toml
+[publish]
+# the two COGs, renamed to the consumer basemap names:
+#   <survey>_visible_<gsd>.tif        -> basemap_dir/visible.tif
+#   <survey>_ms_calibrated_<gsd>.tif  -> basemap_dir/multispectral.tif
+basemap_dir = "/Volumes/GIS/MPG_basemap/Raster/imagery/drone/2024/summer"
+# the .pmtiles web map (+ its _map.html) and the whole work/ tree:
+archive_dir = "/Volumes/home/nas_data/tidy_survey/2024_front_country_summer"
+```
+
+Omit the section entirely and nothing moves (the historical behaviour). What
+**never** moves is the survey's durable record, kept in the local `run_dir`:
+`products/quality/` (report + reliability rasters + calibration model) and
+`products/_run_manifest.json`.
+
+The move is idempotent and crash-safe — each file copies to a `.partial`, is
+size-verified, then atomically swapped into place, so an interrupted publish
+resumes rather than corrupts. On completion a `products/_published.json` marker
+**seals** the run: `tidysurvey run` on a published survey is a no-op that prints
+where the data went (and no longer depends on the remote inputs still existing).
+Clear the marker to rebuild.
+
+After publish the web map lives on the NAS — view it with `tidysurvey serve
+--dir <archive_dir>`; `tidysurvey serve` from the run_dir still serves the local
+quality report.
 
 Geometric truth is declared in the config, exactly one of `georeferencing =
 "gcp"` (summer: the orthos carry ground control; their stitched product

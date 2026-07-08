@@ -89,6 +89,29 @@ class CalibrateCfg:
     clip: str = "scene"              # clamp output to the reference scene's range
 
 
+@dataclass
+class PublishCfg:
+    """The one sanctioned output-destination knob: an OPT-IN terminal step
+    that, after a successful run, moves the bulky finished data off the local
+    run_dir to durable NAS homes. Omit the [publish] section entirely and the
+    pipeline behaves exactly as before — everything stays in run_dir.
+
+    Two destinations, because finished data splits by consumer:
+      basemap_dir  the visible + calibrated-MS COGs, renamed to the consumer
+                   basemap names (visible.tif / multispectral.tif)
+      archive_dir  the bulk that is not a basemap consumable: the .pmtiles web
+                   map (+ its _map.html) and the whole work/ tree
+    The quality report, reliability rasters, calibration model and manifest are
+    NEVER moved — they stay in the local run_dir as the survey's durable record.
+    """
+    basemap_dir: Optional[str] = None
+    archive_dir: Optional[str] = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.basemap_dir and self.archive_dir)
+
+
 def gsd_slug(res_m: float) -> str:
     """0.032 -> '3p2cm', 0.059 -> '5p9cm', 0.10 -> '10cm'."""
     cm = res_m * 100.0
@@ -201,6 +224,7 @@ class Config:
     ms: MultispectralCfg = dc_field(default_factory=MultispectralCfg)
     stitch: StitchCfg = dc_field(default_factory=StitchCfg)
     calibrate: CalibrateCfg = dc_field(default_factory=CalibrateCfg)
+    publish: PublishCfg = dc_field(default_factory=PublishCfg)
     paths: Paths = None
     source: Optional[str] = None            # the TOML this came from
     dotenv_loaded: int = 0                  # vars applied from a .env beside the TOML
@@ -222,6 +246,8 @@ class Config:
         if self.visible.orthos and self.visible.web_map:
             stages.append("tiles")              # the web map, from the finished base
         stages.append("report")
+        if self.publish.enabled:
+            stages.append("publish")            # opt-in: move finished data to the NAS
         return stages
 
     def credentials_path(self) -> Optional[str]:
@@ -240,6 +266,7 @@ class Config:
             "multispectral": {"resolution_m": self.ms.resolution_m, "bands": self.ms.bands,
                               "missions": [vars(m) for m in self.ms.missions]},
             "stitch": vars(self.stitch), "calibrate": dict(vars(self.calibrate)),
+            "publish": vars(self.publish),
             "plan": self.plan(), "source": self.source,
         }
 
@@ -392,6 +419,9 @@ def load(path: str, resolve_auto: bool = True) -> Config:
         blend=c.get("blend", "bilinear"),
         clip=c.get("clip", "scene"),
     )
+    pb = raw.get("publish", {})
+    cfg.publish = PublishCfg(basemap_dir=pb.get("basemap_dir"),
+                             archive_dir=pb.get("archive_dir"))
 
     vres = cfg.visible.resolution_m
     mres = cfg.ms.resolution_m
