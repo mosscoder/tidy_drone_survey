@@ -50,7 +50,8 @@ def _install_death_rattle():
     """A killed run should confess in its own log. SIGTERM/SIGHUP get logged
     with a timestamp before dying (SIGKILL can't be caught — but then the
     log's last timestamp still dates the kill); faulthandler dumps a
-    traceback on hard crashes."""
+    traceback on hard crashes, and SIGUSR1 dumps live thread stacks so a
+    HUNG run can be located without killing it."""
     faulthandler.enable()
 
     def _die(signum, frame):
@@ -67,6 +68,15 @@ def _install_death_rattle():
             signal.signal(s, _die)
         except (ValueError, OSError):    # non-main thread / unsupported
             pass
+
+    def _dump(signum, frame):           # `kill -USR1 <pid>` on a run gone quiet
+        say(f"-- SIGUSR1 (pid {os.getpid()}): thread stacks follow "
+            "(process still alive) --")
+        faulthandler.dump_traceback()   # -> stderr -> run.log; locates a hang
+    try:
+        signal.signal(signal.SIGUSR1, _dump)
+    except (ValueError, OSError):
+        pass
 
 
 def _banner(stage, i, n):
@@ -535,10 +545,11 @@ def main(argv=None):
     say(f"  plan    {' → '.join(cfg.plan())}")
     say(f"  run_dir {cfg.run_dir}  (products/ = deliverables · work/ = intermediates)")
 
-    # memory telemetry: a breadcrumb every ~30s so a silent SIGKILL (jetsam on a
-    # memory-starved box) can be told apart from an external kill by the last
-    # line before the log goes dark. Daemon thread; harmless to every command.
-    sampler = _mem.Sampler(say).start()
+    # resource telemetry: a breadcrumb every ~30s (memory RSS/peak/system-free +
+    # run_dir disk-free) so a silent SIGKILL (jetsam) or an ENOSPC can be told
+    # apart from an external kill by the last line before the log goes dark.
+    # Daemon thread; harmless to every command.
+    sampler = _mem.Sampler(say, run_dir=cfg.run_dir).start()
     sampler.sample_now("·start")
 
     if args.command == "scenes":

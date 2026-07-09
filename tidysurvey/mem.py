@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import resource
+import shutil
 import threading
 
 try:
@@ -36,24 +37,39 @@ _MAXRSS_TO_GB = (1 / 1024**3) if os.uname().sysname == "Darwin" else (1 / 1024**
 # pressure territory where jetsam starts looking for something to kill.
 _LOW_FREE_GB = 6.0
 
+# Free space on the run_dir volume below this (GB) is flagged — a stitch writes
+# tens of GB per stage, and an ENOSPC mid-write is a silent-death candidate.
+_LOW_DISK_GB = 25.0
+
 
 def peak_gb() -> float:
     """High-water mark of this process's resident set, in GB (monotonic)."""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _MAXRSS_TO_GB
 
 
-def line() -> str:
-    """One-line snapshot: process RSS, process peak, and system used%/free —
-    the system figure is the one that predicts a jetsam kill."""
+def line(run_dir=None) -> str:
+    """One-line snapshot: process RSS/peak, system used%/free, and — when a path
+    is given — free space on that volume. System-free predicts a memory (jetsam)
+    kill; disk-free predicts an ENOSPC write failure. Those are the two
+    silent-death candidates a stalled log needs to tell apart."""
     peak = peak_gb()
     if psutil is None:
-        return f"peak {peak:.1f}G (psutil absent)"
-    rss = _PROC.memory_info().rss / 1024**3
-    vm = psutil.virtual_memory()
-    free_gb = vm.available / 1024**3
-    flag = "  ⚠ LOW" if free_gb < _LOW_FREE_GB else ""
-    return (f"rss {rss:.1f}G · peak {peak:.1f}G · "
-            f"sys {vm.percent:.0f}% used, {free_gb:.1f}G free{flag}")
+        out = f"peak {peak:.1f}G (psutil absent)"
+    else:
+        rss = _PROC.memory_info().rss / 1024**3
+        vm = psutil.virtual_memory()
+        free_gb = vm.available / 1024**3
+        flag = "  ⚠ MEM LOW" if free_gb < _LOW_FREE_GB else ""
+        out = (f"rss {rss:.1f}G · peak {peak:.1f}G · "
+               f"sys {vm.percent:.0f}% used, {free_gb:.1f}G free{flag}")
+    if run_dir is not None:
+        try:
+            dfree = shutil.disk_usage(run_dir).free / 1024**3
+            out += f" · disk {dfree:.0f}G free" + (
+                "  ⚠ DISK LOW" if dfree < _LOW_DISK_GB else "")
+        except Exception:
+            pass
+    return out
 
 
 class Sampler:
@@ -61,8 +77,9 @@ class Sampler:
     stage the pipeline is in. Set the interval with $TIDYSURVEY_MEM_EVERY.
     Never raises into the pipeline; on any error it simply stops sampling."""
 
-    def __init__(self, say, every: float = 30.0):
+    def __init__(self, say, run_dir=None, every: float = 30.0):
         self._say = say
+        self._run_dir = run_dir
         try:
             every = float(os.environ.get("TIDYSURVEY_MEM_EVERY", every))
         except (TypeError, ValueError):
@@ -85,7 +102,7 @@ class Sampler:
 
     def sample_now(self, note: str = "") -> None:
         try:
-            self._say(f"  · mem [{self._stage}{note}] {line()}")
+            self._say(f"  · res [{self._stage}{note}] {line(self._run_dir)}")
         except Exception:
             pass
 
