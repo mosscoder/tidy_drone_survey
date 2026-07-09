@@ -37,6 +37,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import config as _config
+from . import mem as _mem
 
 
 def say(msg=""):
@@ -55,6 +56,10 @@ def _install_death_rattle():
     def _die(signum, frame):
         name = signal.Signals(signum).name
         say(f"!! received {name} (pid {os.getpid()}) — terminating")
+        try:
+            say(f"   mem at signal: {_mem.line()}")
+        except Exception:
+            pass
         sys.exit(128 + signum)
 
     for s in (signal.SIGTERM, signal.SIGHUP):
@@ -530,6 +535,12 @@ def main(argv=None):
     say(f"  plan    {' → '.join(cfg.plan())}")
     say(f"  run_dir {cfg.run_dir}  (products/ = deliverables · work/ = intermediates)")
 
+    # memory telemetry: a breadcrumb every ~30s so a silent SIGKILL (jetsam on a
+    # memory-starved box) can be told apart from an external kill by the last
+    # line before the log goes dark. Daemon thread; harmless to every command.
+    sampler = _mem.Sampler(say).start()
+    sampler.sample_now("·start")
+
     if args.command == "scenes":
         return _scene(cfg, args) and 0
     if args.command == "stitch":
@@ -554,6 +565,8 @@ def main(argv=None):
             if stage == "publish":
                 continue                    # terminal move — run at the seam, below
             _banner(stage, i, len(plan))
+            sampler.set_stage(stage)
+            sampler.sample_now()
             done = _stage_done(cfg, stage)
             if done:
                 say(f"  {done} — skipping (delete it to redo this stage)")
@@ -590,9 +603,11 @@ def main(argv=None):
     except Exception as e:
         failed = f"{stage}: {e}"
         say(f"✗ {failed}")
+        sampler.sample_now("·FAILED")
         raise
     finally:
         _banner("report", plan.index("report") + 1, len(plan))
+        sampler.set_stage("report")
         _report(cfg, failed_stage=failed)
         _config.write_manifest(cfg, {"finished": time.strftime("%Y-%m-%d %H:%M"),
                                      "seconds": round(time.time() - t0, 1),
@@ -600,6 +615,8 @@ def main(argv=None):
     # success only (a failed stage re-raised above): the opt-in move to the NAS
     if cfg.publish.enabled:
         _banner("publish", len(plan), len(plan))
+        sampler.set_stage("publish")
+        sampler.sample_now()
         _publish(cfg)
         say(f"✓ run complete — {time.time() - t0:.0f}s · published →")
         say(f"    basemap  {cfg.publish.basemap_dir}")
@@ -608,6 +625,7 @@ def main(argv=None):
     else:
         say(f"✓ run complete — {time.time() - t0:.0f}s · to ship this survey, "
             f"copy one folder: {cfg.paths.products}")
+    sampler.stop()
     return 0
 
 
