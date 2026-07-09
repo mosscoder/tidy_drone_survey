@@ -122,7 +122,90 @@ pk = peak_gb()
 print(f"       {nn} nodes, {nv} unknowns; peak added by the SOLVE = {pk - b4:.2f} G "
       f"(old dense path would add ~{3*2*Hc*Wc*4/1024**3:.0f} G of fields)")
 
+# =====================================================================
+# TEST E — coarse-pass reuse ;  TEST F — composite block-resume
+# both new resume paths must reproduce the clean Test A output byte-for-byte
+# =====================================================================
+import json, shutil as _sh
+F.build_matcher, F.match_tile, F.release_matcher_cache = fake_build, fake_match, (lambda d: None)
+
+
+def _clear(out):
+    base = out.rsplit(".", 1)[0]
+    _sh.rmtree(base + "_coarse", ignore_errors=True)
+    _sh.rmtree(base + "_seam_ckpt", ignore_errors=True)
+    for f in (out, base + "_render_ckpt.json"):
+        if os.path.exists(f):
+            os.remove(f)
+
+
+print("\nTEST E — coarse-pass reuse (crash after coarse -> resume reuses memmaps)")
+outE = f"{TMP}/masterE.tif"; baseE = outE.rsplit(".", 1)[0]; _clear(outE)
+_orig_bld = F.build_matcher
+
+
+def _boom(device=None):
+    raise RuntimeError("injected: crash right after the coarse pass")
+
+
+F.build_matcher = _boom                      # the walk builds the matcher first -> dies post-coarse
+crashedE = False
+try:
+    M.seam_merge(paths, outE, res=res, log=lambda m: None)
+except RuntimeError as e:
+    crashedE = "injected" in str(e)
+_arts = ["ds.dat", "valid.dat", "D.dat", "owner.npy", "cov2.npy", "_coarse_done.json"]
+have_coarse = all(os.path.exists(f"{baseE}_coarse/{a}") for a in _arts)
+F.build_matcher = _orig_bld
+logsE = []
+M.seam_merge(paths, outE, res=res, log=lambda m: logsE.append(m))
+reusedE = any("reusing complete geometry" in m for m in logsE)
+with rasterio.open(outE) as d:
+    aE = d.read()
+identicalE = np.array_equal(aE, a1)
+coarse_gone_E = not os.path.exists(f"{baseE}_coarse")
+print(f"       crashed after coarse={crashedE}  artifacts persisted={have_coarse}")
+print(f"       resume logged reuse={reusedE}  output==clean={identicalE}  "
+      f"coarse cleaned on success={coarse_gone_E}")
+
+print("\nTEST F — composite block-resume (crash mid-render -> resume completes)")
+outF = f"{TMP}/masterF.tif"; baseF = outF.rsplit(".", 1)[0]; _clear(outF)
+_orig_wja = M._write_json_atomic
+_rck = {"n": 0}
+
+
+def _crashing_wja(path, obj):
+    if "render_ckpt" in str(path):
+        _rck["n"] += 1
+        if _rck["n"] == 2:                    # let chunk 0 checkpoint, die on chunk 1
+            raise RuntimeError("injected: crash mid-render after one checkpoint")
+    return _orig_wja(path, obj)
+
+
+M._write_json_atomic = _crashing_wja
+crashedF = False
+try:                                         # render_chunk=1 -> one block per checkpoint
+    M.seam_merge(paths, outF, res=res, render_chunk=1, log=lambda m: None)
+except RuntimeError as e:
+    crashedF = "injected" in str(e)
+M._write_json_atomic = _orig_wja
+rckF = f"{baseF}_render_ckpt.json"
+partial_done = json.load(open(rckF))["done"] if os.path.exists(rckF) else None
+logsF = []
+M.seam_merge(paths, outF, res=res, render_chunk=1, log=lambda m: logsF.append(m))
+resumedF = any("composite: resuming" in m for m in logsF)
+with rasterio.open(outF) as d:
+    aF = d.read()
+identicalF = np.array_equal(aF, a1)
+rck_gone = not os.path.exists(rckF)
+print(f"       crashed mid-render={crashedF}  partial ckpt done={partial_done}")
+print(f"       resume logged resume={resumedF}  output==clean={identicalF}  "
+      f"render ckpt cleaned={rck_gone}")
+
 print("=" * 74)
-ok = same and r1['n_seams'] == 3 and r3['n_seams'] == 3 and (pk - b4) < 4.0
+ok = (same and r1['n_seams'] == 3 and r3['n_seams'] == 3 and (pk - b4) < 4.0
+      and crashedE and have_coarse and reusedE and identicalE and coarse_gone_E
+      and crashedF and partial_done == [0] and resumedF and identicalF and rck_gone)
 print("VERDICT:", "PASS" if ok else "FAIL",
-      f"(e2e resume reproduces output; solve adds {pk-b4:.1f}G not ~28G)")
+      f"(walk-resume + coarse-reuse + render-resume all byte-identical to clean; "
+      f"solve adds {pk-b4:.1f}G)")

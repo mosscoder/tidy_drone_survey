@@ -466,6 +466,16 @@ _GEOM_DS = 8                         # coarse geometry decimation
 _HALO = 64                           # block halo so band shifts never sample off-block
 
 
+def _write_json_atomic(path, obj):
+    """Durable sentinel/checkpoint write: a SIGKILL can never leave a torn file
+    (write to .tmp, then atomic os.replace). Used for the coarse-reuse sentinel
+    and the composite render checkpoint."""
+    path = _Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(_json.dumps(obj))
+    os.replace(tmp, path)
+
+
 def _alpha_index(path):
     with rasterio.open(path) as s:
         if s.colorinterp:
@@ -489,7 +499,7 @@ def _union_grid(paths, out_crs, res):
 
 def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=None,
                workers=None, block=2048, ownership_out=None, report_json=None,
-               nspec=None, log=print):
+               nspec=None, render_chunk=None, log=print):
     """Merge N overlapping orthomosaics with the 1 m seam-walk blend.
 
     inputs   : list of (name, path) pairs — every input is named; names carry
@@ -529,6 +539,10 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     log(f"[seam_merge] {N} inputs -> {OUT_W}x{OUT_H} @ {res} m {out_crs} "
         f"(gauge={gauge}, band={band_width_m} m)")
 
+    # the grid manifest — shared by the coarse-reuse sentinel and the walk/render
+    # checkpoints, so any plan change invalidates all three together.
+    manifest = dict(W=OUT_W, H=OUT_H, res=round(float(res), 6), n=N, names=list(names))
+
     # ---- coarse geometry: validity, EDT owner, faultlines (STREAMED to disk) --- #
     # ds_c (per-source EDTs, ~57 GB at N=21) and valid_c (~14 GB) are only used
     # later -- ds_c/D_c per-block in the composite, valid_c at the solve -- so
@@ -536,61 +550,93 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     # are streamed one at a time with owner/coverage accumulated incrementally,
     # so even the coarse pass peaks at ~one EDT (not the 114 GB np.stack the old
     # path built). owner_c/cov2_c/D_c are byte-identical to the in-RAM version.
+    # RESUMABLE: on a clean finish a `_coarse_done.json` sentinel (matching this
+    # grid + the exact memmap byte sizes) is written LAST; a restart that finds
+    # it reopens the memmaps instead of recomputing ~20 min of EDTs. A crash mid-
+    # pass leaves no sentinel, so a partial dir is never trusted -> recomputed.
     Wc, Hc = -(-OUT_W // _GEOM_DS), -(-OUT_H // _GEOM_DS)
     tr_c = Affine.translation(OUT_TR.c, OUT_TR.f) * Affine.scale(res * _GEOM_DS, -res * _GEOM_DS)
     cres = res * _GEOM_DS
     mmdir = _Path(str(out).rsplit(".", 1)[0] + "_coarse")
     mmdir.mkdir(parents=True, exist_ok=True)
+    coarse_done = mmdir / "_coarse_done.json"
 
-    log(f"    coarse pass: validity masks for {N} inputs @ {cres:.2f} m "
-        f"({Wc}x{Hc} px each) ...")
+    def _coarse_reusable():
+        if not coarse_done.exists():
+            return False
+        try:
+            if _json.loads(coarse_done.read_text()) != manifest:
+                return False
+        except Exception:
+            return False
+        want = {"ds.dat": N * Hc * Wc * 4, "valid.dat": N * Hc * Wc, "D.dat": Hc * Wc * 4}
+        for fn, nbytes in want.items():
+            p = mmdir / fn
+            if not p.exists() or p.stat().st_size != nbytes:
+                return False
+        return (mmdir / "owner.npy").exists() and (mmdir / "cov2.npy").exists()
 
-    def read_alpha_c(i):
-        with rasterio.open(paths[i]) as s:
-            with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
-                            resampling=Resampling.nearest) as v:
-                m = v.read(aidx[i]) > 127
-        log(f"      {names[i]}: {m.mean() * 100:.1f}% of the union grid")
-        return m
+    if _coarse_reusable():
+        log("    coarse pass: reusing complete geometry from disk "
+            "(sentinel matches this grid — skipped the ~20 min EDT recompute)")
+        ds_c = np.memmap(mmdir / "ds.dat", dtype=np.float32, mode="r", shape=(N, Hc, Wc))
+        valid_c = np.memmap(mmdir / "valid.dat", dtype=np.bool_, mode="r", shape=(N, Hc, Wc))
+        D_c = np.memmap(mmdir / "D.dat", dtype=np.float32, mode="r", shape=(Hc, Wc))
+        owner_c = np.load(mmdir / "owner.npy")
+        cov2_c = np.load(mmdir / "cov2.npy")
+    else:
+        log(f"    coarse pass: validity masks for {N} inputs @ {cres:.2f} m "
+            f"({Wc}x{Hc} px each) ...")
 
-    with _TPE(max_workers=min(N, 8)) as ex:
-        valid_list = list(ex.map(read_alpha_c, range(N)))
-    log("    coarse pass: EDT ownership + faultlines (streaming to disk) ...")
-    ds_c = np.memmap(mmdir / "ds.dat", dtype=np.float32, mode="w+", shape=(N, Hc, Wc))
-    valid_c = np.memmap(mmdir / "valid.dat", dtype=np.bool_, mode="w+", shape=(N, Hc, Wc))
-    owner_c = np.full((Hc, Wc), -1, np.int16)
-    best = np.full((Hc, Wc), -1.0, np.float32)         # running max of ds (argmax)
-    ncov = np.zeros((Hc, Wc), np.uint8)                # count of covering sources
-    for i in range(N):
-        v = valid_list[i]; valid_list[i] = None
-        valid_c[i] = v
-        d = _edt(v).astype(np.float32) * cres          # only ~one EDT in RAM at a time
-        ds_c[i] = d
-        better = d > best                              # strict > => argmax's first-max
-        owner_c[better] = i; best[better] = d[better]
-        ncov += v
-        del v, d, better
-    ds_c.flush(); valid_c.flush()
-    del best, valid_list
-    cov2_c = ncov >= 2
-    owner_c[ncov < 1] = np.int16(-1)                   # -1 where no source covers
-    del ncov
-    gc.collect()
-    fault_c = np.zeros((Hc, Wc), bool)
-    chg = (owner_c[:, :-1] != owner_c[:, 1:]) & cov2_c[:, :-1] & cov2_c[:, 1:]
-    fault_c[:, :-1] |= chg; fault_c[:, 1:] |= chg
-    chg = (owner_c[:-1, :] != owner_c[1:, :]) & cov2_c[:-1, :] & cov2_c[1:, :]
-    fault_c[:-1, :] |= chg; fault_c[1:, :] |= chg
-    if not fault_c.any():
-        raise RuntimeError("seam_merge: no flight<->flight faultline — nothing to merge")
-    D_c = np.memmap(mmdir / "D.dat", dtype=np.float32, mode="w+", shape=(Hc, Wc))
-    D_c[:] = _edt(~fault_c).astype(np.float32) * cres
-    D_c.flush()
-    log(f"    coarse pass done: {int(fault_c.sum())} faultline cells "
-        f"(~{int(fault_c.sum()) * cres / 2000:.1f} km of seam; both sides marked); "
-        f"ds_c/valid_c/D_c streamed to disk (held RAM-free through the walk)")
-    del fault_c
-    gc.collect()
+        def read_alpha_c(i):
+            with rasterio.open(paths[i]) as s:
+                with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
+                                resampling=Resampling.nearest) as v:
+                    m = v.read(aidx[i]) > 127
+            log(f"      {names[i]}: {m.mean() * 100:.1f}% of the union grid")
+            return m
+
+        with _TPE(max_workers=min(N, 8)) as ex:
+            valid_list = list(ex.map(read_alpha_c, range(N)))
+        log("    coarse pass: EDT ownership + faultlines (streaming to disk) ...")
+        ds_c = np.memmap(mmdir / "ds.dat", dtype=np.float32, mode="w+", shape=(N, Hc, Wc))
+        valid_c = np.memmap(mmdir / "valid.dat", dtype=np.bool_, mode="w+", shape=(N, Hc, Wc))
+        owner_c = np.full((Hc, Wc), -1, np.int16)
+        best = np.full((Hc, Wc), -1.0, np.float32)         # running max of ds (argmax)
+        ncov = np.zeros((Hc, Wc), np.uint8)                # count of covering sources
+        for i in range(N):
+            v = valid_list[i]; valid_list[i] = None
+            valid_c[i] = v
+            d = _edt(v).astype(np.float32) * cres          # only ~one EDT in RAM at a time
+            ds_c[i] = d
+            better = d > best                              # strict > => argmax's first-max
+            owner_c[better] = i; best[better] = d[better]
+            ncov += v
+            del v, d, better
+        ds_c.flush(); valid_c.flush()
+        del best, valid_list
+        cov2_c = ncov >= 2
+        owner_c[ncov < 1] = np.int16(-1)                   # -1 where no source covers
+        del ncov
+        gc.collect()
+        fault_c = np.zeros((Hc, Wc), bool)
+        chg = (owner_c[:, :-1] != owner_c[:, 1:]) & cov2_c[:, :-1] & cov2_c[:, 1:]
+        fault_c[:, :-1] |= chg; fault_c[:, 1:] |= chg
+        chg = (owner_c[:-1, :] != owner_c[1:, :]) & cov2_c[:-1, :] & cov2_c[1:, :]
+        fault_c[:-1, :] |= chg; fault_c[1:, :] |= chg
+        if not fault_c.any():
+            raise RuntimeError("seam_merge: no flight<->flight faultline — nothing to merge")
+        D_c = np.memmap(mmdir / "D.dat", dtype=np.float32, mode="w+", shape=(Hc, Wc))
+        D_c[:] = _edt(~fault_c).astype(np.float32) * cres
+        D_c.flush()
+        log(f"    coarse pass done: {int(fault_c.sum())} faultline cells "
+            f"(~{int(fault_c.sum()) * cres / 2000:.1f} km of seam; both sides marked); "
+            f"ds_c/valid_c/D_c streamed to disk (held RAM-free through the walk)")
+        del fault_c
+        gc.collect()
+        np.save(mmdir / "owner.npy", owner_c)              # persist the two RAM-only derived
+        np.save(mmdir / "cov2.npy", cov2_c)                # arrays the walk/solve/composite need
+        _write_json_atomic(coarse_done, manifest)          # sentinel LAST -> dir now trustworthy
 
     if ownership_out:
         cat = np.zeros((Hc, Wc), np.uint8)
@@ -611,7 +657,6 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     # kept SPARSE in RAM (a few MB) -- never densified -- for the low-memory solve.
     ckpt = _Path(str(out).rsplit(".", 1)[0] + "_seam_ckpt")
     ckpt.mkdir(parents=True, exist_ok=True)
-    manifest = dict(W=OUT_W, H=OUT_H, res=round(float(res), 6), n=N, names=list(names))
     mpath = ckpt / "_grid.json"
     if mpath.exists() and _json.loads(mpath.read_text()) != manifest:
         for f in ckpt.glob("*.npz"):
@@ -728,12 +773,12 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     prof = dict(driver="GTiff", height=OUT_H, width=OUT_W, count=nspec + 1, dtype="uint8",
                 crs=out_crs, transform=OUT_TR, tiled=True, blockxsize=512, blockysize=512,
                 compress="zstd", predictor=2, ZSTD_LEVEL=3, BIGTIFF="YES",
-                num_threads=str(workers))
+                num_threads=str(workers), SPARSE_OK="TRUE")
+    # SPARSE_OK: unwritten tiles stay absent instead of being zero-filled on the
+    # first close(), so the block-resume below only ever FIRST-writes a tile
+    # (never rewrites a compressed one) and uncovered blocks cost no disk.
     _Path(out).parent.mkdir(parents=True, exist_ok=True)
-    dst = rasterio.open(out, "w", **prof)
-    if nspec == 3:
-        dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue,
-                           ColorInterp.alpha]
+    dst = None                                    # opened in the render section (w fresh / r+ resume)
     wlock = _threading.Lock()
     tls = _threading.local()
     counts = _dd(int)
@@ -803,28 +848,64 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         return kind
 
     blocks = [(r0, c0) for r0 in range(0, OUT_H, block) for c0 in range(0, OUT_W, block)]
-    log(f"    composite: {len(blocks)} blocks of {block}x{block} px, {workers} workers "
-        f"(copy = one owner, byte-identical; own/seam = overlap blocks)")
+    # ---- render checkpoint: block-resume so a crash mid-composite never -------
+    # restarts the ~183k x 237k render from block 0. Completed block indices are
+    # recorded only AFTER a close() flush boundary, so a resume trusts only what
+    # GDAL durably wrote; each block writes a disjoint, tile-aligned window
+    # (block % blocksize == 0) and SPARSE_OK keeps the rest absent, so a resumed
+    # write is always a FIRST-write -- no compressed tile is ever rewritten.
+    rckpt = _Path(str(out).rsplit(".", 1)[0] + "_render_ckpt.json")
+    rmanifest = dict(manifest, block=int(block), nspec=int(nspec))
+    done = set()
+    if os.path.exists(out) and rckpt.exists():
+        try:
+            rc = _json.loads(rckpt.read_text())
+            if rc.get("manifest") == rmanifest:
+                done = set(rc.get("done", []))
+        except Exception:
+            done = set()
+    if done:
+        dst = rasterio.open(out, "r+")
+        log(f"    composite: resuming — {len(done)}/{len(blocks)} blocks already on "
+            f"disk (crash-safe render checkpoint)")
+    else:
+        dst = rasterio.open(out, "w", **prof)
+        if nspec == 3:
+            dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue,
+                               ColorInterp.alpha]
+    todo = [bi for bi in range(len(blocks)) if bi not in done]
+    log(f"    composite: {len(blocks)} blocks of {block}x{block} px, {workers} workers, "
+        f"{len(todo)} to render (copy = one owner, byte-identical; own/seam = overlap)")
+    chunk_n = render_chunk or max(64, min(512, len(blocks) // 40 or 64))   # flush/checkpoint granularity
+    n_done = base = len(done)
     t_comp = _time.perf_counter()
     t_last = t_comp
     with _TPE(max_workers=workers) as ex:
-        futs = {ex.submit(process_block, r0, c0): (r0, c0) for r0, c0 in blocks}
-        n_done = 0
-        for fut in _as_completed(futs):
-            counts[fut.result()] += 1; n_done += 1
-            now = _time.perf_counter()
-            if n_done == len(blocks) or n_done % 100 == 0 or now - t_last >= 120:
-                t_last = now
-                gb = os.path.getsize(out) / 1e9 if os.path.exists(out) else 0.0
-                rate = n_done / max(now - t_comp, 1e-9)
-                eta_m = (len(blocks) - n_done) / rate / 60
-                log(f"    [{n_done}/{len(blocks)}] {100 * n_done / len(blocks):4.1f}%  "
-                    f"copy={counts['copy']} own={counts['own']} seam={counts['seam']} "
-                    f"skip={counts['skip']}  {gb:.1f} GB on disk  ETA ~{eta_m:.0f} min")
-    dst.close()   # vmain was closed after the walk; the composite uses tls VRTs
+        for ci in range(0, len(todo), chunk_n):
+            chunk = todo[ci:ci + chunk_n]
+            futs = {ex.submit(process_block, *blocks[bi]): bi for bi in chunk}
+            for fut in _as_completed(futs):
+                counts[fut.result()] += 1; n_done += 1
+                now = _time.perf_counter()
+                if n_done == len(blocks) or n_done % 100 == 0 or now - t_last >= 120:
+                    t_last = now
+                    gb = os.path.getsize(out) / 1e9 if os.path.exists(out) else 0.0
+                    rate = (n_done - base) / max(now - t_comp, 1e-9)
+                    eta_m = (len(blocks) - n_done) / rate / 60 if rate > 0 else 0.0
+                    log(f"    [{n_done}/{len(blocks)}] {100 * n_done / len(blocks):4.1f}%  "
+                        f"copy={counts['copy']} own={counts['own']} seam={counts['seam']} "
+                        f"skip={counts['skip']}  {gb:.1f} GB on disk  ETA ~{eta_m:.0f} min")
+            dst.close()                            # flush this chunk durably before marking done
+            done.update(chunk)
+            _write_json_atomic(rckpt, dict(manifest=rmanifest, done=sorted(done)))
+            if len(done) < len(blocks):
+                dst = rasterio.open(out, "r+")     # reopen; update mode won't zero-fill the sparse rest
+    if dst is not None and not dst.closed:
+        dst.close()   # vmain was closed after the walk; the composite uses tls VRTs
     ds_c = D_c = None                             # release the coarse memmaps
     gc.collect()
     shutil.rmtree(mmdir, ignore_errors=True)      # ~74 GB of coarse scratch, done
+    rckpt.unlink(missing_ok=True)                 # render finished -> drop the checkpoint
 
     report = dict(kind="stitch", inputs=names, n_seams=len(seams), seams=seams,
                   gauge=gauge, band_width_m=band_width_m, res_m=res, crs=out_crs,
