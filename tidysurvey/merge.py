@@ -1,4 +1,6 @@
+import gc
 import os
+import shutil
 import tempfile
 
 import numpy as np
@@ -527,10 +529,18 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     log(f"[seam_merge] {N} inputs -> {OUT_W}x{OUT_H} @ {res} m {out_crs} "
         f"(gauge={gauge}, band={band_width_m} m)")
 
-    # ---- coarse geometry: validity, EDT owner, faultlines ------------------ #
+    # ---- coarse geometry: validity, EDT owner, faultlines (STREAMED to disk) --- #
+    # ds_c (per-source EDTs, ~57 GB at N=21) and valid_c (~14 GB) are only used
+    # later -- ds_c/D_c per-block in the composite, valid_c at the solve -- so
+    # they go to disk-backed memmaps and are NEVER held whole in RAM. The EDTs
+    # are streamed one at a time with owner/coverage accumulated incrementally,
+    # so even the coarse pass peaks at ~one EDT (not the 114 GB np.stack the old
+    # path built). owner_c/cov2_c/D_c are byte-identical to the in-RAM version.
     Wc, Hc = -(-OUT_W // _GEOM_DS), -(-OUT_H // _GEOM_DS)
     tr_c = Affine.translation(OUT_TR.c, OUT_TR.f) * Affine.scale(res * _GEOM_DS, -res * _GEOM_DS)
     cres = res * _GEOM_DS
+    mmdir = _Path(str(out).rsplit(".", 1)[0] + "_coarse")
+    mmdir.mkdir(parents=True, exist_ok=True)
 
     log(f"    coarse pass: validity masks for {N} inputs @ {cres:.2f} m "
         f"({Wc}x{Hc} px each) ...")
@@ -544,24 +554,43 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         return m
 
     with _TPE(max_workers=min(N, 8)) as ex:
-        valid_c = list(ex.map(read_alpha_c, range(N)))
-    log("    coarse pass: EDT ownership + faultlines ...")
-    ds_c = [_edt(v).astype(np.float32) * cres for v in valid_c]
-    vstack = np.stack(valid_c)
-    cov2_c = vstack.sum(0) >= 2
-    owner_c = np.where(vstack.any(0), np.argmax(np.stack(ds_c), 0).astype(np.int16),
-                       np.int16(-1))
+        valid_list = list(ex.map(read_alpha_c, range(N)))
+    log("    coarse pass: EDT ownership + faultlines (streaming to disk) ...")
+    ds_c = np.memmap(mmdir / "ds.dat", dtype=np.float32, mode="w+", shape=(N, Hc, Wc))
+    valid_c = np.memmap(mmdir / "valid.dat", dtype=np.bool_, mode="w+", shape=(N, Hc, Wc))
+    owner_c = np.full((Hc, Wc), -1, np.int16)
+    best = np.full((Hc, Wc), -1.0, np.float32)         # running max of ds (argmax)
+    ncov = np.zeros((Hc, Wc), np.uint8)                # count of covering sources
+    for i in range(N):
+        v = valid_list[i]; valid_list[i] = None
+        valid_c[i] = v
+        d = _edt(v).astype(np.float32) * cres          # only ~one EDT in RAM at a time
+        ds_c[i] = d
+        better = d > best                              # strict > => argmax's first-max
+        owner_c[better] = i; best[better] = d[better]
+        ncov += v
+        del v, d, better
+    ds_c.flush(); valid_c.flush()
+    del best, valid_list
+    cov2_c = ncov >= 2
+    owner_c[ncov < 1] = np.int16(-1)                   # -1 where no source covers
+    del ncov
+    gc.collect()
     fault_c = np.zeros((Hc, Wc), bool)
     chg = (owner_c[:, :-1] != owner_c[:, 1:]) & cov2_c[:, :-1] & cov2_c[:, 1:]
     fault_c[:, :-1] |= chg; fault_c[:, 1:] |= chg
     chg = (owner_c[:-1, :] != owner_c[1:, :]) & cov2_c[:-1, :] & cov2_c[1:, :]
     fault_c[:-1, :] |= chg; fault_c[1:, :] |= chg
-    D_c = (_edt(~fault_c).astype(np.float32) * cres if fault_c.any()
-           else np.full((Hc, Wc), 1e9, np.float32))
     if not fault_c.any():
         raise RuntimeError("seam_merge: no flight<->flight faultline — nothing to merge")
+    D_c = np.memmap(mmdir / "D.dat", dtype=np.float32, mode="w+", shape=(Hc, Wc))
+    D_c[:] = _edt(~fault_c).astype(np.float32) * cres
+    D_c.flush()
     log(f"    coarse pass done: {int(fault_c.sum())} faultline cells "
-        f"(~{int(fault_c.sum()) * cres / 2000:.1f} km of seam; both sides marked)")
+        f"(~{int(fault_c.sum()) * cres / 2000:.1f} km of seam; both sides marked); "
+        f"ds_c/valid_c/D_c streamed to disk (held RAM-free through the walk)")
+    del fault_c
+    gc.collect()
 
     if ownership_out:
         cat = np.zeros((Hc, Wc), np.uint8)
@@ -669,6 +698,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         seams.append(rec)
         log(f"    seam {names[ia]}-{names[ib]}: {n_tiles} tiles -> {len(an)} matches "
             f"-> {len(pts)} nodes (|e|={med_cm:.1f} cm)")
+        del ans, dss, an, d; gc.collect()        # aggressive: free match buffers each pair
     if matcher is not None:
         del matcher
         _F.release_matcher_cache(dev)   # GPU work is done; composite runs for hours
@@ -792,6 +822,9 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                     f"copy={counts['copy']} own={counts['own']} seam={counts['seam']} "
                     f"skip={counts['skip']}  {gb:.1f} GB on disk  ETA ~{eta_m:.0f} min")
     dst.close()   # vmain was closed after the walk; the composite uses tls VRTs
+    ds_c = D_c = None                             # release the coarse memmaps
+    gc.collect()
+    shutil.rmtree(mmdir, ignore_errors=True)      # ~74 GB of coarse scratch, done
 
     report = dict(kind="stitch", inputs=names, n_seams=len(seams), seams=seams,
                   gauge=gauge, band_width_m=band_width_m, res_m=res, crs=out_crs,
