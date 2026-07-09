@@ -576,18 +576,44 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             d.write(cat, 1)
             d.update_tags(names=",".join(names), seam_band_value=str(N + 1))
 
-    # ---- per-pair seam walk (LoFTR) ---------------------------------------- #
-    matcher, dev = _F.build_matcher()
-    vmain = {i: _WarpedVRT(rasterio.open(paths[i]), crs=out_crs, transform=OUT_TR,
-                           width=OUT_W, height=OUT_H, resampling=Resampling.bilinear)
-             for i in range(N)}
-    efield_c, seams = {}, []
-    for ia, ib in _combinations(range(N), 2):
+    # ---- per-pair seam walk (LoFTR), CHECKPOINTED -------------------------- #
+    # each pair's sparse result is persisted the moment it finishes, so a crash
+    # (or a jetsam kill at the solve) never re-walks a completed seam. efield is
+    # kept SPARSE in RAM (a few MB) -- never densified -- for the low-memory solve.
+    ckpt = _Path(str(out).rsplit(".", 1)[0] + "_seam_ckpt")
+    ckpt.mkdir(parents=True, exist_ok=True)
+    manifest = dict(W=OUT_W, H=OUT_H, res=round(float(res), 6), n=N, names=list(names))
+    mpath = ckpt / "_grid.json"
+    if mpath.exists() and _json.loads(mpath.read_text()) != manifest:
+        for f in ckpt.glob("*.npz"):
+            f.unlink()
+        log("    seam checkpoint: plan changed -> stale cache cleared")
+    mpath.write_text(_json.dumps(manifest))
+
+    def _adjacency(ia, ib):
         A = owner_c == ia; B = owner_c == ib
-        f_ij = np.zeros((Hc, Wc), bool)
-        adj = (A[:, :-1] & B[:, 1:]) | (B[:, :-1] & A[:, 1:]); f_ij[:, :-1] |= adj; f_ij[:, 1:] |= adj
-        adj = (A[:-1, :] & B[1:, :]) | (B[:-1, :] & A[1:, :]); f_ij[:-1, :] |= adj; f_ij[1:, :] |= adj
+        f = np.zeros((Hc, Wc), bool)
+        adj = (A[:, :-1] & B[:, 1:]) | (B[:, :-1] & A[:, 1:]); f[:, :-1] |= adj; f[:, 1:] |= adj
+        adj = (A[:-1, :] & B[1:, :]) | (B[:-1, :] & A[1:, :]); f[:-1, :] |= adj; f[1:, :] |= adj
+        return f
+
+    matcher = dev = vmain = None
+    efield_sp, seams = {}, []
+    all_pairs = list(_combinations(range(N), 2))
+    n_cached = sum((ckpt / f"seam_{ia}_{ib}.npz").exists() for ia, ib in all_pairs)
+    if n_cached:
+        log(f"    seam checkpoint: resuming — {n_cached}/{len(all_pairs)} pairs already on disk")
+    for ia, ib in all_pairs:
+        cf = ckpt / f"seam_{ia}_{ib}.npz"
+        if cf.exists():
+            z = np.load(cf, allow_pickle=True)
+            if bool(z["ok"]):
+                efield_sp[(ia, ib)] = (z["pts"], z["vx"], z["vy"])
+                seams.append(dict(z["rec"].item()))
+            continue
+        f_ij = _adjacency(ia, ib)
         if not f_ij.any():
+            np.savez(cf, ok=False)
             continue
         ys, xs = np.where(f_ij)
         seen, seeds = set(), []
@@ -595,6 +621,11 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             key = (y // _TILE_H, x // _TILE_W)
             if key not in seen:
                 seen.add(key); seeds.append((int(y), int(x)))
+        if matcher is None:                      # build the GPU matcher + read VRTs lazily
+            matcher, dev = _F.build_matcher()
+            vmain = {i: _WarpedVRT(rasterio.open(paths[i]), crs=out_crs, transform=OUT_TR,
+                                   width=OUT_W, height=OUT_H, resampling=Resampling.bilinear)
+                     for i in range(N)}
         log(f"    seam {names[ia]}-{names[ib]}: walking {len(seeds)} corridor tiles "
             f"(LoFTR on {dev.type}) ...")
         ans, dss, n_tiles = [], [], 0
@@ -620,49 +651,48 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             an, d = m
             ans.append(an + [c0, r0]); dss.append(d); n_tiles += 1
         if not ans:
+            np.savez(cf, ok=False)
             log(f"    seam {names[ia]}-{names[ib]}: no usable matches (skipped)")
             continue
         an = np.concatenate(ans); d = np.concatenate(dss)
         pts, vx, vy = _F.pool_to_cells(an, d, _FS, _MIN_CELL)
         if len(pts) == 0:
+            np.savez(cf, ok=False)
             continue
-        efield_c[(ia, ib)] = (_F.fill_field(np.stack([pts[:, 0] / _GEOM_DS,
-                                                      pts[:, 1] / _GEOM_DS], 1), vx, Wc, Hc),
-                              _F.fill_field(np.stack([pts[:, 0] / _GEOM_DS,
-                                                      pts[:, 1] / _GEOM_DS], 1), vy, Wc, Hc))
+        pts_c = np.stack([pts[:, 0] / _GEOM_DS, pts[:, 1] / _GEOM_DS], 1)   # coarse px
+        vx = np.asarray(vx); vy = np.asarray(vy)
         med_cm = float(np.median(np.hypot(vx, vy)) * res * 100)
-        seams.append(dict(pair=f"{names[ia]}-{names[ib]}", tiles=n_tiles,
-                          matches=int(len(an)), nodes=int(len(pts)),
-                          med_shift_cm=round(med_cm, 1)))
+        rec = dict(pair=f"{names[ia]}-{names[ib]}", ij=[ia, ib], tiles=n_tiles,
+                   matches=int(len(an)), nodes=int(len(pts)), med_shift_cm=round(med_cm, 1))
+        np.savez(cf, ok=True, pts=pts_c, vx=vx, vy=vy, rec=rec)   # <- crash-safe checkpoint
+        efield_sp[(ia, ib)] = (pts_c, vx, vy)
+        seams.append(rec)
         log(f"    seam {names[ia]}-{names[ib]}: {n_tiles} tiles -> {len(an)} matches "
             f"-> {len(pts)} nodes (|e|={med_cm:.1f} cm)")
-    del matcher
-    _F.release_matcher_cache(dev)   # GPU work is done; composite runs for hours
-    if not efield_c:
+    if matcher is not None:
+        del matcher
+        _F.release_matcher_cache(dev)   # GPU work is done; composite runs for hours
+    if vmain is not None:
+        for v in vmain.values():
+            v.close()
+    if not efield_sp:
         raise RuntimeError("seam_merge: no seams matched")
 
-    # ---- joint solve -------------------------------------------------------- #
+    # ---- joint solve (SPARSE in, LATTICE out; memory-frugal) --------------- #
     corridor_c = (D_c <= _SOLVE_CORR_M) & cov2_c
     anchored = 0 if gauge == "anchored" else None
-    fields_c, n_nodes, n_var = _F.solve_free_gauge(
-        valid_c, efield_c, corridor_c, max(1, round(_SOLVE_S / _GEOM_DS)),
+    lat_c, sol_c, resid, n_nodes, n_var = _F.solve_free_gauge(
+        valid_c, efield_sp, corridor_c, max(1, round(_SOLVE_S / _GEOM_DS)),
         N, _W_GAUGE, anchored_index=anchored)
     log(f"    solve: {n_nodes} corridor nodes, {n_var} unknowns "
         f"({'anchored to ' + names[0] if anchored is not None else 'free gauge'})")
+    for s in seams:                              # post-solve residual (px -> cm)
+        rp = resid.get(tuple(s["ij"]))
+        s["residual_cm"] = round(rp * res * 100, 1) if rp is not None else None
 
-    # post-solve residual per seam: |(x_j - x_i) - f_meas| at fault nodes
-    for s, ((ia, ib), (fx, fy)) in zip(seams, efield_c.items()):
-        A = owner_c == ia; B = owner_c == ib
-        f_ij = np.zeros((Hc, Wc), bool)
-        adj = (A[:, :-1] & B[:, 1:]) | (B[:, :-1] & A[:, 1:]); f_ij[:, :-1] |= adj; f_ij[:, 1:] |= adj
-        adj = (A[:-1, :] & B[1:, :]) | (B[:-1, :] & A[1:, :]); f_ij[:-1, :] |= adj; f_ij[1:, :] |= adj
-        m = f_ij & np.isfinite(fx) & np.isfinite(fy)
-        if not m.any():
-            s["residual_cm"] = None
-            continue
-        rx = (fields_c[ib][0] - fields_c[ia][0])[m] - fx[m]
-        ry = (fields_c[ib][1] - fields_c[ia][1])[m] - fy[m]
-        s["residual_cm"] = round(float(np.median(np.hypot(rx, ry)) * res * 100), 1)
+    # the composite needs only ds_c/D_c/lat_c per block -> free the ~16 GB of
+    # validity masks + ownership before the (never-before-reached) long render
+    valid_c = owner_c = cov2_c = None
 
     # ---- streamed N-way composite ------------------------------------------ #
     prof = dict(driver="GTiff", height=OUT_H, width=OUT_W, count=nspec + 1, dtype="uint8",
@@ -688,6 +718,16 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     def covers(i, bx0, by0, bx1, by1):
         l, b, r, t = bounds[i]
         return not (bx1 <= l or bx0 >= r or by1 <= b or by0 >= t)
+
+    _FIELD_UP = _GEOM_DS * 8                      # solved lattice (8 coarse-px) -> native px
+    def _lat_block(lat_i, r0, c0, bh, bw):
+        """A block of a source's solved field, upsampled from its lattice (or
+        zero where the source had no solved nodes). Bit-identical to upsampling
+        the full coarse field the old path built (validated)."""
+        if lat_i is None:
+            return (np.zeros((bh, bw), np.float32), np.zeros((bh, bw), np.float32))
+        return (_F.upsample_block(lat_i[0], _FIELD_UP, r0, c0, bh, bw),
+                _F.upsample_block(lat_i[1], _FIELD_UP, r0, c0, bh, bw))
 
     def process_block(r0, c0):
         bh = min(block, OUT_H - r0); bw = min(block, OUT_W - c0)
@@ -716,9 +756,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             geom = _seam_geom_block(hr0, hc0, hh, hw, present, valids, ds_c, D_c,
                                     res, band_width_m)
             if geom["in_band"][iy:iy + bh, ix:ix + bw].any():
-                flds = [( _F.upsample_block(fields_c[i][0], _GEOM_DS, hr0, hc0, hh, hw),
-                          _F.upsample_block(fields_c[i][1], _GEOM_DS, hr0, hc0, hh, hw))
-                        for i in present]
+                flds = [_lat_block(lat_c[i], hr0, hc0, hh, hw) for i in present]
                 sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
                                                   fields=flds, geom=geom)
                 kind = "seam"
@@ -753,9 +791,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                 log(f"    [{n_done}/{len(blocks)}] {100 * n_done / len(blocks):4.1f}%  "
                     f"copy={counts['copy']} own={counts['own']} seam={counts['seam']} "
                     f"skip={counts['skip']}  {gb:.1f} GB on disk  ETA ~{eta_m:.0f} min")
-    dst.close()
-    for v in vmain.values():
-        v.close()
+    dst.close()   # vmain was closed after the walk; the composite uses tls VRTs
 
     report = dict(kind="stitch", inputs=names, n_seams=len(seams), seams=seams,
                   gauge=gauge, band_width_m=band_width_m, res_m=res, crs=out_crs,

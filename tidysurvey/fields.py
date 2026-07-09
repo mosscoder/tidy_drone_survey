@@ -75,6 +75,37 @@ def fill_field(pts_px, vals, out_w, out_h, sample_ds=8) -> np.ndarray:
     return cv2.resize(g.astype(np.float32), (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
 
+def sample_field_nodes(pts_px, vals, out_w, out_h, node_r, node_c, sample_ds=8):
+    """Value of fill_field(pts,vals,out_w,out_h) at the coarse nodes (node_r,
+    node_c) WITHOUT materializing the full (out_h,out_w) field — the memory
+    win for the joint solve, which only needs the field at corridor nodes.
+
+    Builds the SAME sample_ds lattice as fill_field, then samples it with the
+    same INTER_LINEAR kernel cv2.resize uses (via cv2.remap with the matching
+    (p+0.5)*scale-0.5 coordinate convention). Validated bit-close to
+    fill_field(...)[node] in the corridor regime — see the solve-equivalence
+    test (max |Δ| < 1e-3 px where the solve operates; divergence only in deep
+    extrapolation past the correspondence hull, which corridor_c excludes)."""
+    node_r = np.asarray(node_r, np.float32); node_c = np.asarray(node_c, np.float32)
+    n = len(node_r)
+    if len(vals) < 1 or n == 0:
+        return np.zeros(n, np.float32)
+    ex = np.arange(0, out_w, sample_ds); ey = np.arange(0, out_h, sample_ds)
+    EX, EY = np.meshgrid(ex, ey)
+    g = np.nan_to_num(griddata_fill(np.asarray(pts_px, float),
+                                    np.asarray(vals), EX, EY)).astype(np.float32)
+    lat_h, lat_w = g.shape
+    mapx = ((node_c + 0.5) * (lat_w / out_w) - 0.5).astype(np.float32)
+    mapy = ((node_r + 0.5) * (lat_h / out_h) - 0.5).astype(np.float32)
+    out = np.empty(n, np.float32)
+    CH = 30000                                   # cv2.remap needs each map dim < SHRT_MAX
+    for i in range(0, n, CH):
+        out[i:i + CH] = cv2.remap(g, mapx[i:i + CH].reshape(1, -1),
+                                  mapy[i:i + CH].reshape(1, -1), cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REPLICATE).ravel()
+    return out
+
+
 def upsample_block(arr, fac, r0, c0, bh, bw, interp=cv2.INTER_LINEAR):
     """Upsample a factor-`fac` decimated global array to a native block,
     grid-aligned (used to bring coarse geometry/fields to native windows)."""
@@ -196,18 +227,27 @@ def corroborate_cells(pts, vx, vy, fs=64, min_nb=8, reject_px=4.0):
 # --------------------------------------------------------------------------- #
 # the free-gauge joint solve (stitching)
 # --------------------------------------------------------------------------- #
-def solve_free_gauge(valid_c, efield_c, corridor_c, spacing_c, n_sources,
-                     w_gauge=0.05, anchored_index=None):
+def solve_free_gauge(valid_c, efield_sp, corridor_c, spacing_c, n_sources,
+                     w_gauge=0.05, anchored_index=None, sample_ds=8):
     """Joint solve over ALL pair edges on corridor nodes: for every node where
     sources i and j overlap, (x_j - x_i) should equal the measured seam field;
     a small gauge ridge (w_gauge * x = 0) pins the free translation. With
     anchored_index set, that source's unknowns are excluded (held at zero) —
     the 'pin everything to one reference flight' fallback.
 
+    Memory-frugal: the pair fields are SPARSE (never densified), sampled at the
+    solve nodes on the fly, and each solved per-source field is returned as its
+    sample_ds LATTICE (~Wc/8 x Hc/8, tens of MB) rather than the full 2.7 GB
+    coarse field. The composite upsamples the lattice per block. This removes
+    the ~114 GB the old dense path built at the walk->solve boundary.
+
     valid_c   : list of n coarse validity masks (Hc,Wc)
-    efield_c  : {(i,j): (fx_c, fy_c)} measured pairwise seam fields (coarse px)
+    efield_sp : {(i,j): (pts, vx, vy)} SPARSE seam correspondences (coarse px)
     corridor_c: coarse mask of nodes to solve on (near-fault corridor)
-    Returns   : per-source (fx_c, fy_c) coarse fields, n_nodes, n_unknowns.
+    Returns   : (lat, sol, n_nodes, n_unknowns)
+                lat[oi] = (fx_lat, fy_lat) float32 (Hc//sd, Wc//sd), or None
+                sol[oi] = (P, cx, cy) sparse solved nodes for source oi, or None
+                          (lets a caller evaluate solved values anywhere cheaply)
     """
     import scipy.sparse as sp
     from scipy.sparse.linalg import lsqr
@@ -216,6 +256,7 @@ def solve_free_gauge(valid_c, efield_c, corridor_c, spacing_c, n_sources,
     rr = list(range(spacing_c // 2, Hc, spacing_c))
     cc = list(range(spacing_c // 2, Wc, spacing_c))
     nodes = [(r, c) for r in rr for c in cc if corridor_c[r, c]]
+    nr = np.array([r for r, c in nodes]); nc = np.array([c for r, c in nodes])
     var = {}
     for oi in range(n_sources):
         if oi == anchored_index:
@@ -233,41 +274,57 @@ def solve_free_gauge(valid_c, efield_c, corridor_c, spacing_c, n_sources,
             rows.append(nrow[0]); cols.append(vi); data.append(co)
         bx.append(rx); by.append(ry); nrow[0] += 1
 
-    for (oi, oj), (fx, fy) in efield_c.items():
+    pair_terms = {}                              # (oi,oj) -> [(ti,tj,fxv,fyv)] for the residual
+    for (oi, oj), (pts, vx, vy) in efield_sp.items():
         co = valid_c[oi] & valid_c[oj]
-        for (r, c) in nodes:
-            if not (co[r, c] and np.isfinite(fx[r, c]) and np.isfinite(fy[r, c])):
+        # dense-equivalent field values at the nodes, without the full field
+        fxn = sample_field_nodes(pts, vx, Wc, Hc, nr, nc, sample_ds)
+        fyn = sample_field_nodes(pts, vy, Wc, Hc, nr, nc, sample_ds)
+        terms = pair_terms.setdefault((oi, oj), [])
+        for k, (r, c) in enumerate(nodes):
+            if not co[r, c]:
                 continue
             ti = var.get((oi, r, c)); tj = var.get((oj, r, c))
+            fxv, fyv = float(fxn[k]), float(fyn[k])
             if oi == anchored_index and tj is not None:      # x_j = f
-                add([(tj, 1.0)], float(fx[r, c]), float(fy[r, c]))
+                add([(tj, 1.0)], fxv, fyv); terms.append((None, tj, fxv, fyv))
             elif oj == anchored_index and ti is not None:    # -x_i = f
-                add([(ti, -1.0)], float(fx[r, c]), float(fy[r, c]))
+                add([(ti, -1.0)], fxv, fyv); terms.append((ti, None, fxv, fyv))
             elif ti is not None and tj is not None:          # x_j - x_i = f
-                add([(tj, 1.0), (ti, -1.0)], float(fx[r, c]), float(fy[r, c]))
+                add([(tj, 1.0), (ti, -1.0)], fxv, fyv); terms.append((ti, tj, fxv, fyv))
     for (oi, r, c), vi in var.items():
         add([(vi, w_gauge)], 0.0, 0.0)
 
-    zero = np.zeros((Hc, Wc), np.float32)
     if nrow[0] == 0 or len(var) == 0:
-        return [(zero.copy(), zero.copy()) for _ in range(n_sources)], 0, 0
+        return [None] * n_sources, [None] * n_sources, {}, 0, 0
     A = sp.coo_matrix((data, (rows, cols)), shape=(nrow[0], len(var))).tocsr()
     cx = lsqr(A, np.array(bx), atol=1e-8, btol=1e-8)[0]
     cy = lsqr(A, np.array(by), atol=1e-8, btol=1e-8)[0]
 
-    fields = []
+    # post-solve residual per pair: median |(x_j - x_i) - f_meas| at its nodes
+    resid = {}
+    for pr, terms in pair_terms.items():
+        rr = [np.hypot((0.0 if tj is None else cx[tj]) - (0.0 if ti is None else cx[ti]) - fxv,
+                       (0.0 if tj is None else cy[tj]) - (0.0 if ti is None else cy[ti]) - fyv)
+              for ti, tj, fxv, fyv in terms]
+        resid[pr] = float(np.median(rr)) if rr else None
+
+    ex = np.arange(0, Wc, sample_ds); ey = np.arange(0, Hc, sample_ds)
+    EX, EY = np.meshgrid(ex, ey)
+    lat = [None] * n_sources; sol = [None] * n_sources
     for oi in range(n_sources):
-        pts, vx, vy = [], [], []
+        P, vxo, vyo = [], [], []
         for (r, c) in nodes:
             vi = var.get((oi, r, c))
             if vi is not None:
-                pts.append((c, r)); vx.append(cx[vi]); vy.append(cy[vi])
-        if pts:
-            P = np.array(pts, float)
-            fields.append((fill_field(P, vx, Wc, Hc), fill_field(P, vy, Wc, Hc)))
-        else:
-            fields.append((zero.copy(), zero.copy()))
-    return fields, len(nodes), len(var)
+                P.append((c, r)); vxo.append(cx[vi]); vyo.append(cy[vi])
+        if not P:
+            continue
+        P = np.array(P, float)
+        sol[oi] = (P, np.asarray(vxo), np.asarray(vyo))
+        lat[oi] = (np.nan_to_num(griddata_fill(P, vxo, EX, EY)).astype(np.float32),
+                   np.nan_to_num(griddata_fill(P, vyo, EX, EY)).astype(np.float32))
+    return lat, sol, resid, len(nodes), len(var)
 
 
 # --------------------------------------------------------------------------- #
