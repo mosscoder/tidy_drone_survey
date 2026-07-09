@@ -598,12 +598,14 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
 
         with _TPE(max_workers=min(N, 8)) as ex:
             valid_list = list(ex.map(read_alpha_c, range(N)))
-        log("    coarse pass: EDT ownership + faultlines (streaming to disk) ...")
+        log(f"    coarse pass: streaming {N} per-source EDTs to disk "
+            f"(one at a time; owner/coverage accumulated incrementally) ...")
         ds_c = np.memmap(mmdir / "ds.dat", dtype=np.float32, mode="w+", shape=(N, Hc, Wc))
         valid_c = np.memmap(mmdir / "valid.dat", dtype=np.bool_, mode="w+", shape=(N, Hc, Wc))
         owner_c = np.full((Hc, Wc), -1, np.int16)
         best = np.full((Hc, Wc), -1.0, np.float32)         # running max of ds (argmax)
         ncov = np.zeros((Hc, Wc), np.uint8)                # count of covering sources
+        t_edt = _time.perf_counter()
         for i in range(N):
             v = valid_list[i]; valid_list[i] = None
             valid_c[i] = v
@@ -613,12 +615,18 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             owner_c[better] = i; best[better] = d[better]
             ncov += v
             del v, d, better
+            el = _time.perf_counter() - t_edt
+            eta = el / (i + 1) * (N - i - 1)
+            log(f"      EDT {i + 1}/{N}: {names[i]} streamed  "
+                f"({el:.0f}s elapsed, ~{eta:.0f}s left)")
         ds_c.flush(); valid_c.flush()
         del best, valid_list
         cov2_c = ncov >= 2
         owner_c[ncov < 1] = np.int16(-1)                   # -1 where no source covers
         del ncov
         gc.collect()
+        log("      all EDTs streamed; computing faultlines + coarse distance field "
+            "(one final EDT) ...")
         fault_c = np.zeros((Hc, Wc), bool)
         chg = (owner_c[:, :-1] != owner_c[:, 1:]) & cov2_c[:, :-1] & cov2_c[:, 1:]
         fault_c[:, :-1] |= chg; fault_c[:, 1:] |= chg
