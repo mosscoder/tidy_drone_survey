@@ -19,6 +19,9 @@ import math as _math
 import os
 import threading as _threading
 import time as _time
+import subprocess as _subprocess
+import shutil as _shutil
+import sys as _sys
 from pathlib import Path as _Path
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor as _TPE
@@ -39,6 +42,81 @@ _FS = 64                     # pooling cell (px)
 _MIN_NB = 8                  # corroboration: neighbours required in the 5x5 ring
 _REJECT_PX, _MIN_TILE, _MIN_CELL = 4.0, 8, 2
 _GEOM_DS, _FIELD_DS, _BLOCK = 8, 8, 2048
+
+# --------------------------------------------------------------------------- #
+# dense match pass — run as fresh subprocess CHUNKS (audit 02_registration §7).
+# LoFTR on MPS decays with varied-shape calls in a long-lived process
+# (496 -> 1829 ms/tile; in-loop empty_cache accelerates it). A fresh process
+# per chunk resets the allocator -> flat throughput. ONLY these workers touch
+# the GPU; register_survey_dense (the parent) stays on the CPU.
+_CHUNK_TILES = int(os.environ.get("TIDYSURVEY_REG_CHUNK", "250"))
+
+
+class _FakeMatcher:                                     # test hook only
+    """TIDYSURVEY_REG_FAKE=1: a fixed grid of correspondences with a constant
+    sub-pixel shift, to exercise chunk orchestration without loading LoFTR."""
+    def __call__(self, d):
+        import torch
+        h, w = d["image0"].shape[-2:]
+        ys, xs = np.mgrid[30:h - 30:40, 30:w - 30:40]
+        kp = np.column_stack([xs.ravel(), ys.ravel()]).astype(np.float32)
+        return {"keypoints0": torch.from_numpy(kp),
+                "keypoints1": torch.from_numpy(kp + np.float32([0.6, -0.4]))}
+
+
+def _worker_matcher():
+    if os.environ.get("TIDYSURVEY_REG_FAKE"):
+        import torch
+        return _FakeMatcher(), torch.device("cpu")
+    return _F.build_matcher()
+
+
+def _run_reg_chunk(work_dir, chunk_idx):
+    """Match ONE chunk of the tile list in this (fresh) process, write
+    part_<idx>.npz, exit. Invoked via `python -m tidysurvey._regchunk`. The
+    process exit is the point — it frees the MPS allocator. No in-loop
+    empty_cache; preallocated, reused device buffers."""
+    import torch
+    work = _Path(work_dir); ci = int(chunk_idx)
+    st = _json.loads((work / "state.json").read_text())
+    tiles = np.load(work / "tiles.npy")
+    sub = tiles[ci * _CHUNK_TILES:(ci + 1) * _CHUNK_TILES]
+    TR = _Affine(*st["tr"]); W, H, nspec = st["W"], st["H"], st["nspec"]
+    th, tw, a_alpha = st["tile_h"], st["tile_w"], st["a_alpha"]
+    reject, mintile = st["reject_px"], st["min_tile"]
+    matcher, dev = _worker_matcher()
+    ta = torch.empty((1, 1, th, tw), device=dev)        # preallocated, reused
+    tb = torch.empty((1, 1, th, tw), device=dev)
+    vm = _WarpedVRT(rasterio.open(st["mission"]), crs=st["out_crs"], transform=TR,
+                    width=W, height=H, resampling=_Resampling.bilinear)
+    va = _WarpedVRT(rasterio.open(st["anchor"]), crs=st["out_crs"], transform=TR,
+                    width=W, height=H, resampling=_Resampling.average)
+    ans, dss, n_used = [], [], 0
+    for (r0, c0) in sub:
+        r0, c0 = int(r0), int(c0)
+        win = _Window(c0, r0, tw, th)
+        spec = vm.read(list(range(1, min(3, nspec) + 1)), window=win)
+        if not (spec != 0).any():
+            continue
+        aal = va.read(a_alpha, window=win)
+        if not (aal > 127).any():
+            continue
+        argb = va.read([1, 2, 3], window=win)
+        m = _F.match_tile_pre(matcher, dev, ta, tb,
+                              _F.gray_stretch(spec.astype(np.float32)),
+                              _F.gray_stretch(argb.astype(np.float32)),
+                              reject, mintile)
+        if m is None:
+            continue
+        k0, dd = m
+        ans.append(k0 + [c0, r0]); dss.append(dd); n_used += 1
+    vm.close(); va.close()
+    part = work / f"part_{ci}.npz"
+    if ans:
+        np.savez(part, an=np.concatenate(ans), d=np.concatenate(dss),
+                 n_used=np.int64(n_used))
+    else:
+        np.savez(part, an=np.zeros((0, 2)), d=np.zeros((0, 2)), n_used=np.int64(0))
 
 
 # --------------------------------------------------------------------------- #
@@ -167,37 +245,38 @@ def register_survey_dense(
                 tiles.append((r0, c0))
     log(f"    {len(tiles)} data tiles (bbox {r1b - r0b}x{c1b - c0b} px)")
 
-    # ---- dense match pass --------------------------------------------------- #
-    matcher, dev = _F.build_matcher(device)
-    vrt_m = _WarpedVRT(rasterio.open(mission), crs=out_crs, transform=TR,
-                       width=W, height=H, resampling=_Resampling.bilinear)
-    vrt_a = _WarpedVRT(rasterio.open(anchor), crs=out_crs, transform=TR,
-                       width=W, height=H, resampling=_Resampling.average)
+    # ---- dense match pass: fresh subprocess per CHUNK ----------------------- #
+    # GPU work runs ONLY in short-lived chunk workers so the MPS per-process
+    # inference decay (audit 02_registration §7: 496->1829 ms/tile; in-loop
+    # empty_cache accelerates it) can't accumulate across a mission. This parent
+    # never builds a matcher — geometry, field fit and warp are all CPU. Results
+    # are identical to a single pass (same tiles, same deterministic matcher).
+    work = _Path(str(output_registered_survey_path) + ".regwork")
+    _shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    np.save(work / "tiles.npy", np.asarray(tiles, dtype=np.int64))
+    (work / "state.json").write_text(_json.dumps(dict(
+        mission=mission, anchor=anchor, out_crs=out_crs,
+        tr=[TR.a, TR.b, TR.c, TR.d, TR.e, TR.f], W=int(W), H=int(H),
+        nspec=int(nspec), a_alpha=int(a_alpha), reject_px=_REJECT_PX,
+        min_tile=_MIN_TILE, tile_h=_TILE_H, tile_w=_TILE_W)))
+    n_chunks = -(-len(tiles) // _CHUNK_TILES)
+    log(f"    matching {len(tiles)} tiles in {n_chunks} x {_CHUNK_TILES}-tile "
+        f"subprocess chunks (a fresh GPU process each — resets the MPS decay)")
+    for ci in range(n_chunks):
+        rc = _subprocess.run(
+            [_sys.executable, "-m", "tidysurvey._regchunk", str(work), str(ci)])
+        if rc.returncode != 0:
+            _shutil.rmtree(work, ignore_errors=True)
+            raise RuntimeError(f"register_survey_dense: match chunk "
+                               f"{ci + 1}/{n_chunks} failed (rc={rc.returncode})")
+        log(f"    [chunk {ci + 1}/{n_chunks}] done")
     buf_an, buf_d, n_used = [], [], 0
-    for n_run, (r0, c0) in enumerate(tiles, 1):
-        win = _Window(c0, r0, _TILE_W, _TILE_H)
-        spec = vrt_m.read(list(range(1, min(3, nspec) + 1)), window=win)
-        if not (spec != 0).any():
-            continue
-        aal = vrt_a.read(a_alpha, window=win)
-        if not (aal > 127).any():
-            continue
-        argb = vrt_a.read([1, 2, 3], window=win)
-        m = _F.match_tile(matcher, dev,
-                          _F.gray_stretch(spec.astype(np.float32)),
-                          _F.gray_stretch(argb.astype(np.float32)),
-                          _REJECT_PX, _MIN_TILE)
-        if m is None:
-            continue
-        k0, d = m
-        buf_an.append(k0 + [c0, r0]); buf_d.append(d); n_used += 1
-        if n_run % 100 == 0:
-            _F.release_matcher_cache(dev)   # cap MPS allocator growth
-        if n_run % 250 == 0:
-            log(f"    [{n_run}/{len(tiles)}] tiles, {n_used} with matches")
-    vrt_m.close(); vrt_a.close()
-    del matcher
-    _F.release_matcher_cache(dev)   # match pass done; solve + warp run on CPU
+    for ci in range(n_chunks):
+        z = np.load(work / f"part_{ci}.npz")
+        if len(z["an"]):
+            buf_an.append(z["an"]); buf_d.append(z["d"]); n_used += int(z["n_used"])
+    _shutil.rmtree(work, ignore_errors=True)
     if not buf_an:
         raise RuntimeError("register_survey_dense: no matches")
     an = np.concatenate(buf_an); d = np.concatenate(buf_d)

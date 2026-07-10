@@ -177,6 +177,28 @@ def match_tile(matcher, device, ga, gb, reject_px=4.0, min_tile=8):
     return k0[keep], d[keep]
 
 
+def match_tile_pre(matcher, device, ta_buf, tb_buf, ga, gb, reject_px=4.0, min_tile=8):
+    """match_tile with PREALLOCATED device buffers reused across a chunk
+    (copy_ in place, no fresh per-call tensor) — the audit's low-churn config
+    that keeps MPS inference flat within a registration subprocess chunk. Same
+    result as match_tile for the same inputs."""
+    import torch
+    ta_buf.copy_(torch.from_numpy(ga)[None, None])
+    tb_buf.copy_(torch.from_numpy(gb)[None, None])
+    with torch.inference_mode():
+        out = matcher({"image0": ta_buf, "image1": tb_buf})
+    k0 = out["keypoints0"].cpu().numpy()
+    k1 = out["keypoints1"].cpu().numpy()
+    if len(k0) < 4:
+        return None
+    d = k1 - k0
+    med = np.median(d, axis=0)
+    keep = np.hypot(*(d - med).T) < reject_px
+    if keep.sum() < min_tile:
+        return None
+    return k0[keep], d[keep]
+
+
 def pool_to_cells(an, d, fs=64, min_cell=2):
     """Pool raw matches into fs-px cells -> per-cell (mean anchor, median
     displacement). Sparse-but-robust nodes for the smooth field."""
