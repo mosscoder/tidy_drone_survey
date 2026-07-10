@@ -336,6 +336,24 @@ def _published_status(cfg):
         return None
 
 
+_COPY_BUFSIZE = 16 * 1024 * 1024  # 16 MiB — saturate the NAS link; shutil's 64 KiB
+                                   # default is latency-bound over smbfs (~6 MB/s vs ~60)
+
+
+def _fast_copy(src, dst, *_ignore, **_kw):
+    """Copy one file with a large buffer. shutil.copy2 moves bytes 64 KiB at a
+    time, which pipelines poorly over smbfs — every small write waits a network
+    round-trip (~6 MB/s on a link that does ~60). 16 MiB reads/writes let it run.
+    Tolerates the extra args shutil.copytree(copy_function=...) passes, so the
+    same helper serves the work/ tree move."""
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        shutil.copyfileobj(fsrc, fdst, _COPY_BUFSIZE)
+    try:
+        shutil.copystat(src, dst)
+    except OSError:
+        pass
+
+
 def _crash_safe_move(src, dst, log=say):
     """Move a file so a crash leaves either the source or a COMPLETE
     destination, never a half-file. Same-share = atomic rename; cross-share
@@ -354,7 +372,7 @@ def _crash_safe_move(src, dst, log=say):
     except OSError:
         pass                                 # cross-device — copy via a .partial
     tmp = dst.parent / (dst.name + ".partial")
-    shutil.copy2(src, tmp)
+    _fast_copy(src, tmp)
     if tmp.stat().st_size != src.stat().st_size:
         tmp.unlink(missing_ok=True)
         raise IOError(f"publish: size mismatch copying {src} -> {dst}")
@@ -377,7 +395,8 @@ def _move_tree(src, dst, log=say):
         os.rename(src, dst)                  # same filesystem: instant
         return "renamed"
     except OSError:
-        shutil.move(str(src), str(dst))      # cross-device: copytree + rmtree
+        shutil.copytree(str(src), str(dst), copy_function=_fast_copy)
+        shutil.rmtree(str(src))              # cross-device: copytree + rmtree, big buffers
         return "copied"
 
 
