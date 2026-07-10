@@ -169,6 +169,9 @@ def _align(cfg, product):
         prefix = "visible_"
         rep_path = paths.stage_report("align_visible")
         scored = paths.visible_base          # scored after stitch; per-mission here
+        res = cfg.visible.resolution_m       # register at the TARGET GSD, not the mission's
+                                             # oversampled native (~2.6 cm is empty detail
+                                             # above the ~3.3 cm true ortho GSD)
     else:
         items = cfg.ms.missions
         reference = str(cfg.paths.visible_base)
@@ -176,6 +179,7 @@ def _align(cfg, product):
         prefix = ""
         rep_path = paths.stage_report("align_ms")
         scored = paths.ms_mosaic
+        res = cfg.ms.resolution_m            # MS native ≈ target; passed for parity
     summaries = []
     for it in items:
         out = paths.registered / f"{prefix}{it.name}.tif"
@@ -189,7 +193,8 @@ def _align(cfg, product):
             s = json.loads(qa.read_text())
         else:
             s = registration.register_survey_dense(
-                it.path, reference, str(out), qa_json=str(qa), log=say)
+                it.path, reference, str(out), qa_json=str(qa),
+                resolution_m=res if isinstance(res, float) else None, log=say)
         s["name"] = it.name
         summaries.append(s)
     rep = dict(kind="align", product=product, reference=str(reference),
