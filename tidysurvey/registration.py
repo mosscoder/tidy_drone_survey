@@ -134,6 +134,38 @@ def prewarp_union_anchor(anchor, out_crs, missions, res, out_path, log=print):
     return out_path
 
 
+def stage_local(src, dst, log=print):
+    """Byte-copy a remote mission COG (https / gs:// / /vsicurl) to a LOCAL file
+    so its per-tile reads are local, not over the network — the dominant chunk
+    cost once the anchor is local. The WarpedVRT read still applies the single
+    native->grid warp; this only relocates the bytes. Temporary; removed after
+    the mission registers. Retries transient network failures."""
+    import urllib.request as _ur, urllib.error as _ue
+    import shutil as _sh
+    s = str(src)
+    if s.startswith("gs://"):
+        s = "https://storage.googleapis.com/" + s[5:]
+    elif s.startswith("/vsicurl/"):
+        s = s[len("/vsicurl/"):]
+    _Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    t0, last = _time.time(), None
+    for _ in range(3):
+        try:
+            with _ur.urlopen(s, timeout=120) as r, open(dst, "wb") as f:
+                _sh.copyfileobj(r, f, 16 * 1024 * 1024)
+            last = None
+            break
+        except (_ue.URLError, OSError, TimeoutError) as e:
+            last = e
+            _Path(dst).unlink(missing_ok=True)
+            _time.sleep(3)
+    if last is not None:
+        raise RuntimeError(f"stage_local: failed to fetch {src}: {last}")
+    log(f"    staged mission local ({_time.time() - t0:.0f}s · "
+        f"{_Path(dst).stat().st_size / 1e9:.1f} GB)")
+    return dst
+
+
 def _run_reg_chunk(work_dir, chunk_idx):
     """Match ONE chunk of the tile list in this (fresh) process, write
     part_<idx>.npz, exit. Invoked via `python -m tidysurvey._regchunk`. The

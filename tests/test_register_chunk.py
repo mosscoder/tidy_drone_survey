@@ -82,3 +82,11 @@ u_ok = (os.path.exists(uanchor) and ubands == 4 and abs(uw - W) <= 1
         and abs(uh - H) <= 1 and ualpha > 0)
 print(f"union anchor: {uw}x{uh} bands={ubands} alpha_mean={ualpha:.0f} (grid≈mission {W}x{H})")
 print("UNION-ANCHOR:", "PASS" if u_ok else "FAIL")
+
+# --- stage_local: byte-copy a (file://) source to local ----------------------
+srcf = f"{TMP}/tostage.bin"
+open(srcf, "wb").write(b"hello-stage-" * 100000)          # ~1.2 MB
+dstf = f"{TMP}/staged.bin"
+R.stage_local("file://" + srcf, dstf, log=lambda m: None)
+s_ok = (os.path.exists(dstf) and open(dstf, "rb").read() == open(srcf, "rb").read())
+print("STAGE-LOCAL:", "PASS" if s_ok else "FAIL")

@@ -203,9 +203,20 @@ def _align(cfg, product):
                 f"(delete {out.name} to redo)")
             s = json.loads(qa.read_text())
         else:
+            # byte-copy a remote mission COG local so its per-tile reads are
+            # local (the dominant chunk cost once the anchor is local). The
+            # WarpedVRT still does the single native->grid warp. Temporary —
+            # dropped after the mission registers.
+            src, staged = it.path, None
+            if str(it.path).startswith(("http", "gs:", "/vsi")):
+                staged = str(paths.work / f"_mstage_{it.name}.tif")
+                registration.stage_local(it.path, staged, log=say)
+                src = staged
             s = registration.register_survey_dense(
-                it.path, reg_ref, str(out), qa_json=str(qa),
+                src, reg_ref, str(out), qa_json=str(qa),
                 resolution_m=res if isinstance(res, float) else None, log=say)
+            if staged:
+                Path(staged).unlink(missing_ok=True)
         s["name"] = it.name
         summaries.append(s)
     if union_anchor:                         # align pass complete — drop the shared pre-warp
