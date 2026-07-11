@@ -159,6 +159,7 @@ def _stitch(cfg, product):
 def _align(cfg, product):
     from . import registration, validate
     paths = cfg.paths.ensure()
+    union_anchor = None
     if product == "visible":
         if not cfg.anchor:
             raise SystemExit("align --product visible needs a borrowed anchor in the "
@@ -172,6 +173,15 @@ def _align(cfg, product):
         res = cfg.visible.resolution_m       # register at the TARGET GSD, not the mission's
                                              # oversampled native (~2.6 cm is empty detail
                                              # above the ~3.3 cm true ortho GSD)
+        # union-anchor (audit stage 0): pre-warp the NAS anchor ONCE to a local
+        # COG shared by all missions (not re-fetched per tile per mission).
+        # Cached across resume; removed when the pass completes. `reference`
+        # stays the logical anchor (for the report + post-stitch scorer).
+        union_anchor = str(paths.work / "_anchor_union.tif")
+        if not Path(union_anchor).exists():
+            registration.prewarp_union_anchor(
+                cfg.anchor, cfg.crs, [o.path for o in cfg.visible.orthos],
+                res, union_anchor, log=say)
     else:
         items = cfg.ms.missions
         reference = str(cfg.paths.visible_base)
@@ -180,6 +190,7 @@ def _align(cfg, product):
         rep_path = paths.stage_report("align_ms")
         scored = paths.ms_mosaic
         res = cfg.ms.resolution_m            # MS native ≈ target; passed for parity
+    reg_ref = union_anchor or reference      # visible: local union pre-warp; ms: visible_base
     summaries = []
     for it in items:
         out = paths.registered / f"{prefix}{it.name}.tif"
@@ -193,10 +204,12 @@ def _align(cfg, product):
             s = json.loads(qa.read_text())
         else:
             s = registration.register_survey_dense(
-                it.path, reference, str(out), qa_json=str(qa),
+                it.path, reg_ref, str(out), qa_json=str(qa),
                 resolution_m=res if isinstance(res, float) else None, log=say)
         s["name"] = it.name
         summaries.append(s)
+    if union_anchor:                         # align pass complete — drop the shared pre-warp
+        Path(union_anchor).unlink(missing_ok=True)
     rep = dict(kind="align", product=product, reference=str(reference),
                missions=summaries)
     rep_path.write_text(json.dumps(rep, indent=2))

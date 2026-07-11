@@ -71,3 +71,14 @@ ok = (have_out and len(chunk_done) > 1 and bands == 4 and ow == W and oh == H
       and qa_j["matches"] > 0 and qa_j["cells"] > 0 and cleaned)
 print("VERDICT:", "PASS" if ok else "FAIL",
       f"(chunked subprocess register reproduces a valid warp; {len(chunk_done)} chunks)")
+
+# --- union-anchor: pre-warp the anchor onto the union grid of the mission(s) ---
+uanchor = f"{TMP}/union_anchor.tif"
+R.prewarp_union_anchor(anchor, crs, [mission], res, uanchor, log=lambda m: None)
+with rasterio.open(uanchor) as d:
+    uw, uh, ubands = d.width, d.height, d.count
+    ualpha = d.read(ubands).mean()
+u_ok = (os.path.exists(uanchor) and ubands == 4 and abs(uw - W) <= 1
+        and abs(uh - H) <= 1 and ualpha > 0)
+print(f"union anchor: {uw}x{uh} bands={ubands} alpha_mean={ualpha:.0f} (grid≈mission {W}x{H})")
+print("UNION-ANCHOR:", "PASS" if u_ok else "FAIL")

@@ -99,6 +99,32 @@ def _prewarp_to_grid(src, out_crs, TR, W, H, bands, resampling, out_path, worker
     dst.close()
 
 
+def prewarp_union_anchor(anchor, out_crs, missions, res, out_path, log=print):
+    """Pre-warp the borrowed anchor ONCE onto the UNION grid of all missions
+    (audit stage 0: 'pre-warp the anchor once'), as a LOCAL GTiff, so every
+    mission's registration reads the anchor locally instead of re-fetching the
+    NAS anchor per tile per mission (21x redundant). Shared across the align
+    pass; cli._align removes it afterwards."""
+    from rasterio.warp import transform_bounds as _tbounds
+    x0 = y0 = float("inf"); x1 = y1 = float("-inf")
+    for m in missions:
+        with rasterio.open(m) as s:
+            b = _tbounds(s.crs, out_crs, *s.bounds)
+        x0, y0, x1, y1 = min(x0, b[0]), min(y0, b[1]), max(x1, b[2]), max(y1, b[3])
+    W = int(_math.ceil((x1 - x0) / res)); H = int(_math.ceil((y1 - y0) / res))
+    TR = _Affine.translation(x0, y1) * _Affine.scale(res, -res)
+    with rasterio.open(anchor) as a:
+        nb = a.count
+    workers = max(1, (os.cpu_count() or 4) - 1)
+    log(f"    pre-warping anchor ONCE onto the union {W}x{H} grid "
+        f"({len(missions)} missions) ...")
+    _ts = _time.time()
+    _prewarp_to_grid(anchor, out_crs, TR, W, H, list(range(1, nb + 1)),
+                     _Resampling.average, out_path, workers)
+    log(f"    anchor union pre-warp done ({_time.time() - _ts:.0f}s) -> local")
+    return out_path
+
+
 def _run_reg_chunk(work_dir, chunk_idx):
     """Match ONE chunk of the tile list in this (fresh) process, write
     part_<idx>.npz, exit. Invoked via `python -m tidysurvey._regchunk`. The
@@ -115,22 +141,28 @@ def _run_reg_chunk(work_dir, chunk_idx):
     matcher, dev = _worker_matcher()
     ta = torch.empty((1, 1, th, tw), device=dev)        # preallocated, reused
     tb = torch.empty((1, 1, th, tw), device=dev)
-    vm = rasterio.open(st["mission"])        # staged onto the grid -> plain local read
-    va = rasterio.open(st["anchor"])
-    ans, dss, n_used, rd, inf = [], [], 0, 0.0, 0.0
+    # mission read from its source (GCS) per tile; anchor read from the shared
+    # union pre-warp (local) so it is NOT re-fetched from the NAS per mission.
+    vm = _WarpedVRT(rasterio.open(st["mission"]), crs=st["out_crs"], transform=TR,
+                    width=W, height=H, resampling=_Resampling.bilinear)
+    va = _WarpedVRT(rasterio.open(st["anchor"]), crs=st["out_crs"], transform=TR,
+                    width=W, height=H, resampling=_Resampling.average)
+    ans, dss, n_used, rdm, rda, inf = [], [], 0, 0.0, 0.0, 0.0
     for (r0, c0) in sub:
         r0, c0 = int(r0), int(c0)
         win = _Window(c0, r0, tw, th)
         t = _time.time()
         spec = vm.read(list(range(1, min(3, nspec) + 1)), window=win)
-        skip = not (spec != 0).any()
-        if not skip:
-            aal = va.read(a_alpha, window=win)
-            skip = not (aal > 127).any()
-        if not skip:
+        rdm += _time.time() - t
+        if not (spec != 0).any():
+            continue
+        t = _time.time()
+        aal = va.read(a_alpha, window=win)
+        ok = (aal > 127).any()
+        if ok:
             argb = va.read([1, 2, 3], window=win)
-        rd += _time.time() - t
-        if skip:
+        rda += _time.time() - t
+        if not ok:
             continue
         t = _time.time()
         m = _F.match_tile_pre(matcher, dev, ta, tb,
@@ -143,8 +175,8 @@ def _run_reg_chunk(work_dir, chunk_idx):
         k0, dd = m
         ans.append(k0 + [c0, r0]); dss.append(dd); n_used += 1
     vm.close(); va.close()
-    print(f"    chunk {ci}: {n_used}/{len(sub)} tiles matched · "
-          f"read {rd:.0f}s · infer {inf:.0f}s", flush=True)
+    print(f"    chunk {ci}: {n_used}/{len(sub)} · mission-read {rdm:.0f}s · "
+          f"anchor-read {rda:.0f}s · infer {inf:.0f}s", flush=True)
     part = work / f"part_{ci}.npz"
     if ans:
         np.savez(part, an=np.concatenate(ans), d=np.concatenate(dss),
@@ -288,20 +320,13 @@ def register_survey_dense(
     work = _Path(str(output_registered_survey_path) + ".regwork")
     _shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
-    # audit stage 0: stage mission RGB + anchor RGBA onto the local grid ONCE, so
-    # the chunk workers read local files instead of re-fetching the GCS mission /
-    # NAS anchor per tile. Temporary — dropped with .regwork below.
-    mloc, aloc = str(work / "mission_grid.tif"), str(work / "anchor_grid.tif")
-    _ts = _time.time()
-    log(f"    staging mission + anchor onto the local {W}x{H} grid ...")
-    _prewarp_to_grid(mission, out_crs, TR, W, H, list(range(1, min(3, nspec) + 1)),
-                     _Resampling.bilinear, mloc, workers)
-    _prewarp_to_grid(anchor, out_crs, TR, W, H, list(range(1, a_alpha + 1)),
-                     _Resampling.average, aloc, workers)
-    log(f"    staged local grid ({_time.time() - _ts:.0f}s)")
+    # NOTE: `anchor` is expected to be the shared UNION pre-warp (local COG) built
+    # once by cli._align for borrowed-anchor seasons — the workers read it locally
+    # instead of re-fetching the NAS anchor per tile per mission. The mission is
+    # read from its own source (GCS) per tile, NOT downloaded.
     np.save(work / "tiles.npy", np.asarray(tiles, dtype=np.int64))
     (work / "state.json").write_text(_json.dumps(dict(
-        mission=mloc, anchor=aloc, out_crs=out_crs,
+        mission=mission, anchor=anchor, out_crs=out_crs,
         tr=[TR.a, TR.b, TR.c, TR.d, TR.e, TR.f], W=int(W), H=int(H),
         nspec=int(nspec), a_alpha=int(a_alpha), reject_px=_REJECT_PX,
         min_tile=_MIN_TILE, tile_h=_TILE_H, tile_w=_TILE_W)))
