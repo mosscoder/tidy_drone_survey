@@ -100,28 +100,37 @@ def _prewarp_to_grid(src, out_crs, TR, W, H, bands, resampling, out_path, worker
 
 
 def prewarp_union_anchor(anchor, out_crs, missions, res, out_path, log=print):
-    """Pre-warp the borrowed anchor ONCE onto the UNION grid of all missions
-    (audit stage 0: 'pre-warp the anchor once'), as a LOCAL GTiff, so every
-    mission's registration reads the anchor locally instead of re-fetching the
-    NAS anchor per tile per mission (21x redundant). Shared across the align
-    pass; cli._align removes it afterwards."""
+    """Stage the borrowed anchor ONCE onto the UNION extent of all missions as a
+    LOCAL COG, so it is not re-fetched from the NAS per tile per mission (21x
+    redundant). The union grid is SNAPPED to the anchor's own pixel lattice, so
+    when the anchor's CRS matches this stage is a pixel-exact CROP (no resample):
+    the anchor is then resampled EXACTLY ONCE — at the per-mission VRT read onto
+    the mission grid — the same single warp the seam walk applies to every
+    source. Shared across the align pass; cli._align removes it afterwards."""
     from rasterio.warp import transform_bounds as _tbounds
     x0 = y0 = float("inf"); x1 = y1 = float("-inf")
     for m in missions:
         with rasterio.open(m) as s:
             b = _tbounds(s.crs, out_crs, *s.bounds)
         x0, y0, x1, y1 = min(x0, b[0]), min(y0, b[1]), max(x1, b[2]), max(y1, b[3])
-    W = int(_math.ceil((x1 - x0) / res)); H = int(_math.ceil((y1 - y0) / res))
-    TR = _Affine.translation(x0, y1) * _Affine.scale(res, -res)
     with rasterio.open(anchor) as a:
-        nb = a.count
+        nb, at = a.count, a.transform
+        same_crs = str(a.crs) == str(out_crs)
+    if same_crs:                         # snap to the anchor lattice -> exact crop
+        ares, ax, ay = abs(at.a), at.c, at.f
+        x0 = ax + _math.floor((x0 - ax) / ares) * ares
+        y1 = ay - _math.floor((ay - y1) / ares) * ares
+        gres, rs, how = ares, _Resampling.nearest, "exact crop"
+    else:                                # cross-CRS reproject -> one resample here
+        gres, rs, how = res, _Resampling.average, "reproject"
+    W = int(_math.ceil((x1 - x0) / gres)); H = int(_math.ceil((y1 - y0) / gres))
+    TR = _Affine.translation(x0, y1) * _Affine.scale(gres, -gres)
     workers = max(1, (os.cpu_count() or 4) - 1)
-    log(f"    pre-warping anchor ONCE onto the union {W}x{H} grid "
-        f"({len(missions)} missions) ...")
+    log(f"    staging anchor ONCE onto the union {W}x{H} grid "
+        f"({how}; {len(missions)} missions) ...")
     _ts = _time.time()
-    _prewarp_to_grid(anchor, out_crs, TR, W, H, list(range(1, nb + 1)),
-                     _Resampling.average, out_path, workers)
-    log(f"    anchor union pre-warp done ({_time.time() - _ts:.0f}s) -> local")
+    _prewarp_to_grid(anchor, out_crs, TR, W, H, list(range(1, nb + 1)), rs, out_path, workers)
+    log(f"    anchor union stage done ({_time.time() - _ts:.0f}s) -> local")
     return out_path
 
 
