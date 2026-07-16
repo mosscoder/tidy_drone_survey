@@ -347,11 +347,17 @@ def pooled_oof_r2(model, log=print):
     for b, nm in enumerate(model["band_names"]):
         yy, pp = Y[m, b].astype(float), P[m, b]
         out[nm] = round(1 - np.sum((yy - pp) ** 2) / np.sum((yy - yy.mean()) ** 2), 3)
+    out["mean_band_R2"] = round(float(np.mean([out[n] for n in model["band_names"]])), 3)
+    # VI R2 is variance-suppressed at block scale (a near-constant index has
+    # almost no variance, so R2 = 1 - err/var collapses to ~0 or negative even
+    # when absolute error is tiny). Nested under `vi_r2` so it never reads as a
+    # band headline; VI reliability ships as MAE (perblock_qa / the raster).
     vP, vT = _vi(P[m]), _vi(Y[m].astype(float))
+    vi = {}
     for j, nm in enumerate(("NDVI", "NDRE", "CIre")):
         mm = np.isfinite(vP[j]) & np.isfinite(vT[j])
         yy, pp = vT[j][mm], vP[j][mm]
-        out[nm] = round(1 - np.sum((yy - pp) ** 2) / np.sum((yy - yy.mean()) ** 2), 3)
-    out["mean_band_R2"] = round(float(np.mean([out[n] for n in model["band_names"]])), 3)
+        vi[nm] = round(1 - np.sum((yy - pp) ** 2) / np.sum((yy - yy.mean()) ** 2), 3)
+    out["vi_r2"] = vi
     log(f"[calibrate] pooled OOF: {out}")
     return out

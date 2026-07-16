@@ -157,7 +157,7 @@ def _stitch(cfg, product):
 
 
 def _align(cfg, product):
-    from . import registration, validate
+    from . import registration
     paths = cfg.paths.ensure()
     union_anchor = None
     if product == "visible":
@@ -174,11 +174,16 @@ def _align(cfg, product):
                                              # oversampled native (~2.6 cm is empty detail
                                              # above the ~3.3 cm true ortho GSD)
         # union-anchor (audit stage 0): pre-warp the NAS anchor ONCE to a local
-        # COG shared by all missions (not re-fetched per tile per mission).
-        # Cached across resume; removed when the pass completes. `reference`
-        # stays the logical anchor (for the report + post-stitch scorer).
+        # COG shared by all missions (not re-fetched per tile per mission), then
+        # REUSED by the post-stitch scorer (mount-independent, ~byte-identical to
+        # the NAS anchor for a same-CRS borrowed anchor) and dropped once scored.
+        # Skip building it only when nothing left needs it: every mission already
+        # registered AND the visible r-map already scored.
         union_anchor = str(paths.work / "_anchor_union.tif")
-        if not Path(union_anchor).exists():
+        _all_reg = all((paths.registered / f"visible_{o.name}.tif").exists()
+                       and (paths.reports / f"align_visible_{o.name}.json").exists()
+                       for o in cfg.visible.orthos)
+        if not Path(union_anchor).exists() and not (_all_reg and paths.visible_reg_qa.exists()):
             registration.prewarp_union_anchor(
                 cfg.anchor, cfg.crs, [o.path for o in cfg.visible.orthos],
                 res, union_anchor, log=say)
@@ -219,34 +224,53 @@ def _align(cfg, product):
                 Path(staged).unlink(missing_ok=True)
         s["name"] = it.name
         summaries.append(s)
-    if union_anchor:                         # align pass complete — drop the shared pre-warp
-        Path(union_anchor).unlink(missing_ok=True)
+    # NOTE: the union prewarp is NOT dropped here — it is reused by the scorer
+    # (below / post-stitch) and removed by _score_after_stitch once scored.
     rep = dict(kind="align", product=product, reference=str(reference),
                missions=summaries)
     rep_path.write_text(json.dumps(rep, indent=2))
     # the promoted evidence map: per-cell r of the stitched product vs the
-    # reference — written after the matching stitch exists; score now if it does
-    if scored.exists():
-        sc = validate.registration_r_cells(str(scored), str(reference), str(qa_out), log=say)
-        (paths.reports / f"reg_r_cells_{product}.json").write_text(json.dumps(sc, indent=2))
-    else:
+    # reference. Written after the matching stitch exists (scored right after its
+    # stitch); on a resume where the stitch already ran but scoring didn't, do it
+    # now — through the guarded, local-anchor scorer.
+    if scored.exists() and not qa_out.exists():
+        _score_after_stitch(cfg, product)
+    elif not scored.exists():
         say(f"  (r map deferred: {scored.name} not built yet — "
               "it is scored right after its stitch)")
     return rep
 
 
 def _score_after_stitch(cfg, product):
-    """The per-cell agreement map for the freshly stitched product."""
+    """Per-cell reliability r-map for a freshly stitched product. Evidence, not a
+    gate: any failure is logged and the run CONTINUES (a missing evidence map must
+    never kill a multi-hour run). Visible scores against the LOCAL union-anchor
+    prewarp when present — mount-independent, ~byte-identical to the NAS anchor for
+    a same-CRS borrowed anchor, and far faster — then drops that ~80 GB prewarp;
+    MS scores against the local visible base."""
     from . import validate
     paths = cfg.paths
-    if product == "visible" and cfg.anchor:
-        sc = validate.registration_r_cells(str(paths.visible_base), cfg.anchor,
-                                           str(paths.visible_reg_qa), log=say)
-        (paths.reports / "reg_r_cells_visible.json").write_text(json.dumps(sc, indent=2))
+    union = paths.work / "_anchor_union.tif"
+    if product == "visible":
+        if not cfg.anchor:
+            return                              # gcp-mode: no borrowed anchor to score against
+        ref = str(union) if union.exists() else cfg.anchor
+        try:
+            sc = validate.registration_r_cells(str(paths.visible_base), ref,
+                                               str(paths.visible_reg_qa), log=say)
+            (paths.reports / "reg_r_cells_visible.json").write_text(json.dumps(sc, indent=2))
+        except Exception as e:
+            say(f"  ⚠ visible r-map skipped ({type(e).__name__}: {e}) — evidence map, not a "
+                f"gate; backfill by deleting {paths.visible_reg_qa.name} and re-running")
+        finally:
+            union.unlink(missing_ok=True)       # drop the prewarp once scoring is attempted
     if product == "multispectral":
-        sc = validate.registration_r_cells(str(paths.ms_mosaic), str(paths.visible_base),
-                                           str(paths.reg_qa), log=say)
-        (paths.reports / "reg_r_cells_ms.json").write_text(json.dumps(sc, indent=2))
+        try:
+            sc = validate.registration_r_cells(str(paths.ms_mosaic), str(paths.visible_base),
+                                               str(paths.reg_qa), log=say)
+            (paths.reports / "reg_r_cells_ms.json").write_text(json.dumps(sc, indent=2))
+        except Exception as e:
+            say(f"  ⚠ multispectral r-map skipped ({type(e).__name__}: {e}) — evidence map, not a gate")
 
 
 def _calibrate(cfg, args):

@@ -280,12 +280,21 @@ def build(cfg, failed_stage=None, log=print):
         if rep.get("kind") == "calibrate":
             oof = rep.get("pooled_oof", {})
             mae = rep.get("qa_summary", {})
-            head = _row(list(oof.keys()), "th") + _row(list(oof.values())) if oof else ""
+            # R2 headline = raw bands + mean only. VI R2 (top-level in older runs,
+            # nested under `vi_r2` now) is variance-suppressed and omitted here —
+            # VI reliability is the MAE table below.
+            r2 = {k: v for k, v in oof.items()
+                  if k not in ("NDVI", "NDRE", "CIre", "vi_r2")}
+            head = _row(list(r2.keys()), "th") + _row(list(r2.values())) if r2 else ""
             mrows = "".join(_row([k, v.get("median"), v.get("p90")])
                             for k, v in mae.items() if isinstance(v, dict))
             detail.append(f"<section><h2>calibrate — held-out agreement</h2>"
+                          '<p class="note">Pooled 5-fold within-tile OOF R² (raw bands + mean). '
+                          "Vegetation-index R² is omitted: a near-constant index has almost no "
+                          "variance, so R² (= 1 − error/variance) collapses to ~0 or negative even "
+                          "when absolute error is tiny — VI reliability is read as MAE below.</p>"
                           f"<table>{head}</table>"
-                          "<table>" + _row(["reliability band", "median", "p90"], "th")
+                          "<table>" + _row(["reliability band (MAE)", "median", "p90"], "th")
                           + mrows + "</table></section>")
 
     # ---- web map (pmtiles + leaflet viewer, when the tiles stage ran) ------- #
