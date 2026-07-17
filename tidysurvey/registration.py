@@ -310,10 +310,23 @@ def register_survey_dense(
         res = resolution_m or round(abs(s.res[0]), 3)
         n_bands = s.count
         mb = s.bounds
+        mt = s.transform                            # native transform (same CRS as out_crs)
+        mW, mH = s.width, s.height
     nspec = max(1, n_bands - 1) if n_bands in (4, 5) else n_bands   # last band = alpha if RGBA/5-band
-    W = int(np.ceil((mb.right - mb.left) / res))
-    H = int(np.ceil((mb.top - mb.bottom) / res))
-    TR = _Affine.translation(mb.left, mb.top) * _Affine.scale(res, -res)
+    # snap the output origin to a global `res` lattice so every same-GSD mission
+    # (and the stitch union grid, likewise snapped) shares one pixel lattice — the
+    # merge then crops interiors pixel-exactly instead of re-resampling them.
+    ox = _math.floor(mb.left / res) * res
+    oy = _math.ceil(mb.top / res) * res
+    W = int(np.ceil((mb.right - ox) / res))
+    H = int(np.ceil((oy - mb.bottom) / res))
+    TR = _Affine.translation(ox, oy) * _Affine.scale(res, -res)
+    # grid-pixel -> native-pixel affine (axis-aligned, same CRS): n = s*g + a. Lets
+    # the output warp read the mission at NATIVE res and fold the native->grid warp
+    # AND the correction field into ONE cubic remap (no intermediate grid resample).
+    sx = TR.a / mt.a; sy = TR.e / mt.e
+    ax = 0.5 * sx + (TR.c - mt.c) / mt.a - 0.5
+    ay = 0.5 * sy + (TR.f - mt.f) / mt.e - 0.5
     log(f"[register_dense] {os.path.basename(mission)} -> grid {W}x{H} @ {res} m")
 
     # ---- coarse validity (mission) + reference coverage -------------------- #
@@ -404,11 +417,41 @@ def register_survey_dense(
     ccx = np.clip((pts[:, 0] // _FS).astype(int), 0, Wcc - 1)
     keep &= ok[ccy, ccx]
     n_rej = int((~keep).sum())
+    _cpts, _ckeep, _cok = pts, keep, ok            # cell-coverage inputs (pre-subset)
     pts, vx, vy = pts[keep], vx[keep], vy[keep]
     if len(pts) == 0:
         raise RuntimeError("register_survey_dense: all cells rejected by the gates")
     d_med = float(np.median(np.hypot(vx, vy)) * res * 100)
     log(f"    {len(pts)} cells after gates ({n_rej} rejected)  |d| med={d_med:.1f} cm")
+    # --- durable per-region diagnostics on the _FS-cell lattice --------------------
+    #  coverage (1=matched / 0=expected-but-failed / 255=not-expected) is the
+    #  failed-match map; disp (|d|_cm, dx, dy) are the RAW pooled displacements (not
+    #  the smooth field) — the honest per-region error signal the deferred
+    #  through-time analysis stacks across seasons. On the mission's snapped lattice
+    #  so they are cross-season stackable.
+    _celltr = _Affine.translation(TR.c, TR.f) * _Affine.scale(_FS * res, -_FS * res)
+    cov = np.where(_cok, 0, 255).astype(np.uint8)
+    cov[np.clip((_cpts[_ckeep, 1] // _FS).astype(int), 0, Hcc - 1),
+        np.clip((_cpts[_ckeep, 0] // _FS).astype(int), 0, Wcc - 1)] = 1
+    disp = np.full((3, Hcc, Wcc), np.nan, np.float32)
+    _dy = np.clip((pts[:, 1] // _FS).astype(int), 0, Hcc - 1)
+    _dx = np.clip((pts[:, 0] // _FS).astype(int), 0, Wcc - 1)
+    disp[0, _dy, _dx] = np.hypot(vx, vy) * res * 100
+    disp[1, _dy, _dx] = vx * res * 100; disp[2, _dy, _dx] = vy * res * 100
+    cov_out = str(_Path(output_registered_survey_path).with_suffix(".coverage.tif"))
+    disp_out = str(_Path(output_registered_survey_path).with_suffix(".disp.tif"))
+    with rasterio.open(cov_out, "w", driver="GTiff", width=Wcc, height=Hcc, count=1,
+                       dtype="uint8", crs=out_crs, transform=_celltr, nodata=255,
+                       tiled=True, compress="zstd") as _dc:
+        _dc.write(cov, 1)
+        _dc.set_band_description(1, "match coverage: 1=matched 0=failed-but-expected 255=not-expected")
+    with rasterio.open(disp_out, "w", driver="GTiff", width=Wcc, height=Hcc, count=3,
+                       dtype="float32", crs=out_crs, transform=_celltr, nodata=float("nan"),
+                       tiled=True, compress="zstd") as _dd:
+        _dd.write(disp)
+        for _i, _n in enumerate(("|d|_cm", "dx_cm", "dy_cm"), 1):
+            _dd.set_band_description(_i, _n)
+    failed_cells = int((cov == 0).sum())
 
     # ---- one smooth field (bbox-local, FIELD_DS lattice) --------------------- #
     bh, bw = r1b - r0b, c1b - c0b
@@ -437,27 +480,37 @@ def register_survey_dense(
 
     def wone(bc):
         r0, c0 = bc
-        if not hasattr(tls, "v"):
-            tls.v = _WarpedVRT(rasterio.open(mission), crs=out_crs, transform=TR,
-                               width=W, height=H, resampling=_Resampling.bilinear)
+        if not hasattr(tls, "m"):
+            tls.m = rasterio.open(mission)                  # native read, per worker
         bh2, bw2 = min(_BLOCK, r1b - r0), min(_BLOCK, c1b - c0)
         hr0, hc0 = max(r0b, r0 - halo), max(c0b, c0 - halo)
         hr1, hc1 = min(r1b, r0 + bh2 + halo), min(c1b, c0 + bw2 + halo)
         hh, hw = hr1 - hr0, hc1 - hc0
         iy, ix = r0 - hr0, c0 - hc0
-        spec = tls.v.read(list(range(1, nspec + 1)),
-                          window=_Window(hc0, hr0, hw, hh)).astype(np.float32)
-        val = vfull[hr0 - r0b:hr1 - r0b, hc0 - c0b:hc1 - c0b]
+        # native read window covering this (haloed) grid block, padded for the cubic kernel
+        PAD = 3
+        nc0 = max(0, int(_math.floor(sx * hc0 + ax)) - PAD)
+        nr0 = max(0, int(_math.floor(sy * hr0 + ay)) - PAD)
+        nc1 = min(mW, int(_math.ceil(sx * hc1 + ax)) + PAD)
+        nr1 = min(mH, int(_math.ceil(sy * hr1 + ay)) + PAD)
         fxs = upf(Fx, hr0, hc0, hh, hw); fys = upf(Fy, hr0, hc0, hh, hw)
         gx, gy = np.meshgrid(np.arange(hw, dtype=np.float32),
                              np.arange(hh, dtype=np.float32))
-        mapx, mapy = gx - fxs, gy - fys                     # inverse map: pull from source
         outb = np.zeros((nspec + 1, hh, hw), np.uint8)
-        for b in range(nspec):
-            outb[b] = cv2.remap(spec[b], mapx, mapy, cv2.INTER_LINEAR,
-                                borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.uint8)
-        outb[nspec] = (cv2.remap(val, mapx, mapy, cv2.INTER_NEAREST,
-                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0
+        if nc1 > nc0 and nr1 > nr0:
+            native = tls.m.read(list(range(1, nspec + 1)),
+                                window=_Window(nc0, nr0, nc1 - nc0, nr1 - nr0)).astype(np.float32)
+            # ONE resample: corrected source GRID coord -> NATIVE pixel (local to the read)
+            mapx = (sx * (hc0 + gx - fxs) + ax - nc0).astype(np.float32)
+            mapy = (sy * (hr0 + gy - fys) + ay - nr0).astype(np.float32)
+            for b in range(nspec):
+                rem = cv2.remap(native[b], mapx, mapy, cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                outb[b] = np.clip(rem, 0, 255).astype(np.uint8)     # cubic can overshoot [0,255]
+        # alpha stays grid-space + nearest (no blur), via the grid correction map
+        val = vfull[hr0 - r0b:hr1 - r0b, hc0 - c0b:hc1 - c0b]
+        outb[nspec] = (cv2.remap(val, (gx - fxs).astype(np.float32), (gy - fys).astype(np.float32),
+                                 cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0
                        ).astype(np.uint8) * 255
         with wlock:
             dst.write(outb[:, iy:iy + bh2, ix:ix + bw2],
@@ -471,10 +524,12 @@ def register_survey_dense(
     summary = dict(kind="align", mission=os.path.basename(mission),
                    reference=os.path.basename(anchor), tiles=len(tiles),
                    matches=int(len(an)), cells=int(len(pts)), rejected=n_rej,
+                   failed_cells=failed_cells,
                    d_med_cm=round(d_med, 1),
                    d_p99_cm=round(float(np.percentile(np.hypot(vx, vy), 99)) * res * 100, 1),
                    maxF_cm=round(maxF * res * 100, 1),
                    out=str(output_registered_survey_path),
+                   coverage=cov_out, disp=disp_out,
                    seconds=round(_time.time() - t0, 1))
     if qa_json:
         _Path(qa_json).parent.mkdir(parents=True, exist_ok=True)

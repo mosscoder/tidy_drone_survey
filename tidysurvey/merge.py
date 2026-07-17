@@ -492,8 +492,14 @@ def _union_grid(paths, out_crs, res):
             bs.append(_transform_bounds(s.crs, out_crs, *s.bounds, densify_pts=21))
     minx = min(b[0] for b in bs); miny = min(b[1] for b in bs)
     maxx = max(b[2] for b in bs); maxy = max(b[3] for b in bs)
-    W = int(np.ceil((maxx - minx) / res)); H = int(np.ceil((maxy - miny) / res))
-    tr = Affine.translation(minx, maxy) * Affine.scale(res, -res)
+    # snap the union origin to the SAME global `res` lattice the registered sources
+    # use (registration.py's TR snap), so a lattice-aligned single-owner source reads
+    # onto this grid as a pixel-exact CROP (no interior resample), not a sub-pixel
+    # average — the last resample the raw->mosaic path was carrying.
+    ox = float(np.floor(minx / res) * res)
+    oy = float(np.ceil(maxy / res) * res)
+    W = int(np.ceil((maxx - ox) / res)); H = int(np.ceil((oy - miny) / res))
+    tr = Affine.translation(ox, oy) * Affine.scale(res, -res)
     return tr, W, H, dict(zip(range(len(paths)), bs))
 
 
