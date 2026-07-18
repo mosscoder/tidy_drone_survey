@@ -436,13 +436,20 @@ def _crash_safe_move(src, dst, log=say):
 
 def _move_tree(src, dst, log=say):
     """Move a whole directory (work/). Same-share = instant rename; cross-share
-    = shutil.move (copytree + rmtree). Refuses to merge into an existing dst."""
+    = copytree + rmtree. A stale dst from a prior run is moved aside (keeping
+    ONE backup) rather than merged or crashed on — a re-publish replaces it."""
     src, dst = Path(src), Path(dst)
     if not src.exists():
         return "already" if dst.exists() else "missing"
     if dst.exists():
-        raise FileExistsError(f"publish: destination already present, refusing "
-                              f"to merge: {dst} (resolve by hand)")
+        # Prior run's archive sits here. A re-publish of the same survey
+        # replaces it; keep ONE backup instead of refusing outright (a hard
+        # refusal stalled the 2024 summer publish on its old work/ archive).
+        aside = dst.parent / (dst.name + ".superseded")
+        if aside.exists():
+            shutil.rmtree(str(aside))
+        os.rename(str(dst), str(aside))
+        log(f"    stale archive moved aside: {dst.name} -> {aside.name}")
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.rename(src, dst)                  # same filesystem: instant
