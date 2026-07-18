@@ -436,20 +436,18 @@ def _crash_safe_move(src, dst, log=say):
 
 def _move_tree(src, dst, log=say):
     """Move a whole directory (work/). Same-share = instant rename; cross-share
-    = copytree + rmtree. A stale dst from a prior run is moved aside (keeping
-    ONE backup) rather than merged or crashed on — a re-publish replaces it."""
+    = copytree + rmtree. A stale dst from a prior run is DELETED and replaced —
+    work/ is regenerable, so keeping a backup would only pile stale waste on
+    the NAS. One current archive per survey, never a superseded one."""
     src, dst = Path(src), Path(dst)
     if not src.exists():
         return "already" if dst.exists() else "missing"
     if dst.exists():
-        # Prior run's archive sits here. A re-publish of the same survey
-        # replaces it; keep ONE backup instead of refusing outright (a hard
-        # refusal stalled the 2024 summer publish on its old work/ archive).
-        aside = dst.parent / (dst.name + ".superseded")
-        if aside.exists():
-            shutil.rmtree(str(aside))
-        os.rename(str(dst), str(aside))
-        log(f"    stale archive moved aside: {dst.name} -> {aside.name}")
+        # Prior run's archive sits here. A re-publish replaces it: delete the
+        # old one outright (a backup accumulates stale regenerable intermediates
+        # on the NAS). A hard refusal here stalled the 2024 summer publish.
+        log(f"    replacing stale archive: deleting old {dst.name}")
+        shutil.rmtree(str(dst))
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.rename(src, dst)                  # same filesystem: instant
