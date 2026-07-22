@@ -14,6 +14,30 @@ from google.oauth2 import service_account
 from pyproj import CRS, Transformer
 
 
+def _aoi_cloud_pct(img, ee_region) -> float:
+    """AOI cloud fraction (%) — QA60 cloud+cirrus bits meaned over the survey
+    footprint at 60 m. The SINGLE definition of 'cloud over the AOI': the scene
+    picker and the downloader both call it, so they can never again disagree
+    about the same granule the way they once did (0.0% vs 46.5% — identical
+    scene, but measured over one mission's clear corner vs the full survey)."""
+    qa = img.select("QA60")
+    cloud = qa.bitwiseAnd(1 << 10).Or(qa.bitwiseAnd(1 << 11))
+    st = cloud.reduceRegion(reducer=ee.Reducer.mean(), geometry=ee_region,
+                            scale=60, maxPixels=1e9).get("QA60").getInfo()
+    return (st or 0.0) * 100
+
+
+def _choose_scene(cands: list, max_cloud_pct: float) -> dict:
+    """Pick the calibration scene from candidate dicts (each carrying
+    aoi_cloud_pct + days_from_target): the NEAREST-to-target among those AT OR
+    UNDER the cloud limit; if none qualify, the single least-cloudy scene (the
+    caller warns). Pure + deterministic — the offline-testable core shared by
+    both selectors, so 'which scene is clean' lives in exactly one place."""
+    clean = [c for c in cands if c["aoi_cloud_pct"] <= max_cloud_pct]
+    pool = clean or [min(cands, key=lambda c: c["aoi_cloud_pct"])]
+    return min(pool, key=lambda c: (abs(c["days_from_target"]), c["aoi_cloud_pct"]))
+
+
 def download_sentinel2_bands(
     bounds_raster: str,
     target_date: str,
@@ -23,6 +47,8 @@ def download_sentinel2_bands(
     band_names: list[str] = None,
     buffer_days: int = 7,
     output_resolution: int = 10,
+    scene_id: str = None,
+    max_scene_cloud_pct: float = 20.0,
     collection: str = 'COPERNICUS/S2_SR_HARMONIZED',
 ) -> str:
     """
@@ -101,80 +127,61 @@ def download_sentinel2_bands(
     ]
     ee_region = ee.Geometry.Polygon([region])
 
-    # Search for images (no scene-level cloud filter)
     target_dt = datetime.strptime(target_date, '%Y-%m-%d')
-    start_date = (target_dt - timedelta(days=buffer_days)).strftime('%Y-%m-%d')
-    end_date = (target_dt + timedelta(days=buffer_days)).strftime('%Y-%m-%d')
 
-    print(f"Searching for Sentinel-2 images from {start_date} to {end_date}")
+    if scene_id:
+        # Exact granule chosen by pick_scene and locked in the manifest — download
+        # THIS scene, never a date re-search. (The re-search below once re-picked a
+        # 46%-cloud scene over the clean one pick_scene intended, because it ranked
+        # purely by date proximity and ignored cloud entirely.)
+        print(f"Using locked scene: {scene_id}")
+        image = ee.Image(scene_id)
+    else:
+        # No locked id (manual/legacy call): search the window and choose the
+        # NEAREST scene AT OR UNDER the AOI cloud limit — cloud first, then date.
+        start_date = (target_dt - timedelta(days=buffer_days)).strftime('%Y-%m-%d')
+        end_date = (target_dt + timedelta(days=buffer_days)).strftime('%Y-%m-%d')
+        print(f"Searching for Sentinel-2 images from {start_date} to {end_date}")
+        coll = ee.ImageCollection(collection) \
+            .filterDate(start_date, end_date).filterBounds(ee_region)
+        feats = coll.getInfo().get('features', [])
+        if not feats:
+            raise ValueError(
+                f"No Sentinel-2 images found between {start_date} and {end_date}. "
+                "Try increasing buffer_days.")
+        by_day = {}
+        for f in feats:
+            d = datetime.fromtimestamp(f['properties']['system:time_start'] / 1000)
+            by_day.setdefault(d.strftime('%Y-%m-%d'), f)
+        cands = []
+        for day, f in sorted(by_day.items()):
+            aoi = _aoi_cloud_pct(ee.Image(f['id']), ee_region)
+            delta = (datetime.strptime(day, '%Y-%m-%d').date() - target_dt.date()).days
+            cands.append(dict(date=day, days_from_target=delta,
+                              aoi_cloud_pct=round(aoi, 1), id=f['id']))
+            print(f"  - {day} (AOI cloud: {aoi:.1f}%)")
+        pick = _choose_scene(cands, max_scene_cloud_pct)
+        print(f"  -> {pick['date']} (AOI cloud {pick['aoi_cloud_pct']:.1f}%)")
+        image = ee.Image(pick['id'])
 
-    image_collection = ee.ImageCollection(collection) \
-        .filterDate(start_date, end_date) \
-        .filterBounds(ee_region)
-
-    collection_size = image_collection.size().getInfo()
-    print(f"  Found {collection_size} images")
-
-    if collection_size == 0:
-        raise ValueError(
-            f"No Sentinel-2 images found between {start_date} and {end_date}. "
-            "Try increasing buffer_days."
-        )
-
-    # List available images
-    image_list = image_collection.getInfo()['features']
-    print("Available images:")
-    for img in image_list:
-        img_date = datetime.fromtimestamp(
-            img['properties']['system:time_start'] / 1000
-        ).strftime('%Y-%m-%d')
-        scene_cloud = img['properties'].get('CLOUDY_PIXEL_PERCENTAGE', 'N/A')
-        if isinstance(scene_cloud, (int, float)):
-            print(f"  - {img_date} (scene cloud: {scene_cloud:.1f}%)")
-        else:
-            print(f"  - {img_date}")
-
-    # Find nearest image to target date
-    ee_target_date = ee.Date(target_date)
-
-    def add_days_diff(img):
-        diff = ee.Number(img.date().difference(ee_target_date, 'day')).abs()
-        return img.set('days_diff', diff)
-
-    image_collection = image_collection.map(add_days_diff)
-    image = image_collection.sort('days_diff').first()
-
-    # Get selected image info
+    # Selected image info (same for both paths)
     image_info = image.getInfo()
     selected_date = datetime.fromtimestamp(
-        image_info['properties']['system:time_start'] / 1000
-    )
+        image_info['properties']['system:time_start'] / 1000)
     selected_date_str = selected_date.strftime('%Y-%m-%d')
     date_yymmdd = selected_date.strftime('%y%m%d')
     days_from_target = abs((selected_date.date() - target_dt.date()).days)
-
     print(f"Selected image: {selected_date_str} ({days_from_target} days from target)")
 
-    # Calculate AOI cloud percentage using QA60
-    qa = image.select('QA60')
-    clouds = qa.bitwiseAnd(1 << 10)  # Cloud bit
-    cirrus = qa.bitwiseAnd(1 << 11)  # Cirrus bit
-    cloud_mask = clouds.Or(cirrus)
-
-    # Calculate cloud percentage within AOI
-    cloud_stats = cloud_mask.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=ee_region,
-        scale=60,
-        maxPixels=1e9
-    )
-    aoi_cloud_pct = cloud_stats.get('QA60').getInfo()
-    if aoi_cloud_pct is not None:
-        aoi_cloud_pct = aoi_cloud_pct * 100
-    else:
-        aoi_cloud_pct = 0.0
-
+    # AOI cloud cover for the sidecar + a loud guard: over the limit means the
+    # calibration targets are cloud-masked/hazy over that fraction of the survey.
+    aoi_cloud_pct = _aoi_cloud_pct(image, ee_region)
     print(f"  AOI cloud cover: {aoi_cloud_pct:.1f}%")
+    if aoi_cloud_pct > max_scene_cloud_pct:
+        print(f"  ⚠ WARNING: AOI cloud {aoi_cloud_pct:.1f}% exceeds the "
+              f"{max_scene_cloud_pct:.0f}% limit — ~{aoi_cloud_pct:.0f}% of the "
+              f"survey will calibrate against cloud-masked/hazy targets. "
+              f"Re-pick with `tidysurvey scenes --rescan` before trusting this.")
 
     # Build output path with date
     final_output_path = output_path.replace('{date}', date_yymmdd)
@@ -190,7 +197,9 @@ def download_sentinel2_bands(
     # Rename bands
     result = result.rename(band_names)
 
-    # Apply cloud mask (cloudy pixels become nodata)
+    # Apply pixel-level cloud mask (QA60 cloud+cirrus → nodata)
+    qa = image.select('QA60')
+    cloud_mask = qa.bitwiseAnd(1 << 10).Or(qa.bitwiseAnd(1 << 11))
     result = result.updateMask(cloud_mask.Not())
 
     # Reproject to target CRS
@@ -344,21 +353,14 @@ def pick_scene(
         by_day.setdefault(d.strftime("%Y-%m-%d"), f)
     cands = []
     for day, f in sorted(by_day.items()):
-        img = ee.Image(f["id"])
-        qa = img.select("QA60")
-        cloud = qa.bitwiseAnd(1 << 10).Or(qa.bitwiseAnd(1 << 11))
-        st = cloud.reduceRegion(reducer=ee.Reducer.mean(), geometry=ee_region,
-                                scale=60, maxPixels=1e9).get("QA60").getInfo()
-        aoi = (st or 0.0) * 100
+        aoi = _aoi_cloud_pct(ee.Image(f["id"]), ee_region)
         scn = f["properties"].get("CLOUDY_PIXEL_PERCENTAGE")
         delta = (datetime.strptime(day, "%Y-%m-%d").date() - tgt.date()).days
         cands.append(dict(date=day, days_from_target=delta, aoi_cloud_pct=round(aoi, 1),
                           scene_cloud_pct=(round(scn, 1) if scn is not None else None),
                           id=f["id"], over_limit=aoi > max_scene_cloud_pct))
     cands.sort(key=lambda c: (abs(c["days_from_target"]), c["aoi_cloud_pct"]))
-
-    clean = [c for c in cands if not c["over_limit"]]
-    suggested = clean[0] if clean else cands[0]
+    suggested = _choose_scene(cands, max_scene_cloud_pct)
 
     log("\n    #   date          Δ target    cloud over survey    scene cloud")
     for i, c in enumerate(cands, 1):

@@ -102,8 +102,21 @@ def _scene(cfg, args):
         if locked:
             say(f"  scene already locked: {locked} (manifest; --rescan to search again)")
             return {"date": locked}
+    # AOI for the cloud estimate = the WHOLE survey footprint (union of every MS
+    # mission), not missions[0]: a single mission can sit in a clear gap of an
+    # otherwise-cloudy scene and lock a 46%-cloud reference reported as "0.0%".
+    aoi_kw = {}
+    if cfg.ms.missions:
+        try:
+            epsg = int(cfg.crs.split(":")[-1])
+            aoi_kw = dict(bounds=_config.survey_bounds(cfg.ms.missions, epsg),
+                          bounds_crs_epsg=epsg)
+        except Exception as e:
+            say(f"  ⚠ full-AOI bounds unavailable ({type(e).__name__}: {e}); "
+                f"cloud estimate falls back to the mission_00 footprint")
+            aoi_kw = dict(bounds_raster=cfg.ms.missions[0].path)
     chosen = sentinel.pick_scene(
-        bounds_raster=None if not cfg.ms.missions else cfg.ms.missions[0].path,
+        **aoi_kw,
         mission_dates=[m.date for m in cfg.ms.missions if m.date] or None,
         target_date=None if cfg.calibrate.date == "auto" else cfg.calibrate.date,
         search_days=cfg.calibrate.search_days,
@@ -277,7 +290,8 @@ def _calibrate(cfg, args):
     from . import calibrate, sentinel, validate, cog
     paths = cfg.paths.ensure()
     manifest = json.loads(paths.manifest.read_text()) if paths.manifest.exists() else {}
-    scene_date = (manifest.get("scene") or {}).get("date") or cfg.calibrate.date
+    scene = manifest.get("scene") or {}
+    scene_date = scene.get("date") or cfg.calibrate.date
     if scene_date in (None, "auto"):
         raise SystemExit("no scene locked — run `tidysurvey scenes` (or `run`) first, "
                          "or set an explicit calibrate.date")
@@ -285,6 +299,7 @@ def _calibrate(cfg, args):
         bounds_raster=str(paths.ms_mosaic), target_date=scene_date,
         output_path=str(paths.sentinel_scene()), bands=list(cfg.calibrate.band_map.keys()),
         band_names=list(cfg.calibrate.band_map.values()),
+        scene_id=scene.get("id"), max_scene_cloud_pct=cfg.calibrate.max_scene_cloud_pct,
         gee_credentials_path=cfg.credentials_path())
     model = calibrate.fit_block_ridge(str(paths.ms_mosaic), s2, log=say,
                                       block_m=cfg.calibrate.block_m,

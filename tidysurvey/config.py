@@ -359,6 +359,29 @@ def _scan_missions(missions: List[NamedInput], need_gsd: bool) -> Optional[float
     return round(statistics.median(res), 3) if res else None
 
 
+def survey_bounds(inputs: List[NamedInput], out_epsg: int) -> tuple:
+    """Union footprint of a set of rasters as (minx, miny, maxx, maxy) in
+    EPSG:out_epsg. The scene picker needs the WHOLE survey AOI for its cloud
+    estimate: fed a single mission (as it once was), it can read 0.0% cloud from
+    that mission's clear corner of a scene that is 46% clouded over the full
+    survey, and lock that scene as the calibration reference. One header-open
+    per input (bounds only), each reprojected to the survey CRS and unioned."""
+    import rasterio
+    from rasterio.warp import transform_bounds
+    box = None
+    for it in inputs:
+        with rasterio.open(it.path) as s:
+            b, src_epsg = s.bounds, s.crs.to_epsg()
+        l, bm, r, t = ((b.left, b.bottom, b.right, b.top) if src_epsg == out_epsg
+                       else transform_bounds(f"EPSG:{src_epsg}", f"EPSG:{out_epsg}",
+                                             b.left, b.bottom, b.right, b.top))
+        box = (l, bm, r, t) if box is None else (
+            min(box[0], l), min(box[1], bm), max(box[2], r), max(box[3], t))
+    if box is None:
+        raise ValueError("survey_bounds: no readable inputs")
+    return box
+
+
 def load(path: str, resolve_auto: bool = True) -> Config:
     """Parse + validate a survey TOML. A `.env` beside it is applied first
     (variables already in the environment win). With resolve_auto (default),
