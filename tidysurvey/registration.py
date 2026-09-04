@@ -5,7 +5,7 @@ The first-generation per-chip machinery (Chip loaders, per-chip LoFTR + GDAL
 polynomial warps, chip merging) was retired by the refactor — the audit found
 the camera-geometry model ill-posed for flat maps, independent per-chip warps
 disagreeing at their edges, and dropped chips leaving holes (production_
-refactor.md §3.2). It lives on branch `main` / git history. The public entry
+refactor.md §3.2). It lives at tag `v0.1.0-legacy` in git history. The public entry
 point `register_survey_by_chips` keeps its exact signature and now runs the
 dense internals (agreement with the anchor 0.685 -> 0.863 on the 2024 survey,
 98.6% of cells improved).
@@ -270,7 +270,7 @@ def register_survey_by_chips(
         raise NotImplementedError(
             "the per-chip engine was retired by the refactor (ill-posed camera "
             "model, per-chip edge disagreements, dropped-chip holes — audit "
-            "§3.2). It is preserved on branch `main` / git history.")
+            "§3.2). It is preserved at tag `v0.1.0-legacy` in git history.")
     return register_survey_dense(
         unreg_survey_path, reg_reference_path, output_registered_survey_path,
         device=None if device_for_loftr in (None, "cpu") else device_for_loftr,

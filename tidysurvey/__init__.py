@@ -1,8 +1,8 @@
-# tidysurvey — the config-driven survey pipeline (refactor, branch dev).
+# tidysurvey — the config-driven survey pipeline (branch main; first-gen code at tag v0.1.0-legacy).
 #
 # Lean surface: one module per stage + the shared engine. Retired first-gen
 # machinery (per-chip registration internals, hard-cut mosaic + meta_mosaic,
-# clip-and-fill, geo neighbour helpers) lives on branch `main` / git history.
+# clip-and-fill, geo neighbour helpers) lives at tag `v0.1.0-legacy` in git history.
 # One compatibility promise is kept: register_survey_by_chips retains its
 # exact signature, running the audited dense internals.
 
