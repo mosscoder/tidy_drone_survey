@@ -455,6 +455,7 @@ from rasterio.warp import transform_bounds as _transform_bounds
 from scipy.ndimage import distance_transform_edt as _edt
 
 from . import fields as _F
+from . import bands as _B
 
 _TILE_H, _TILE_W = 480, 640          # LoFTR tile
 _FS = 120                            # seam pooling cell (px)
@@ -474,15 +475,6 @@ def _write_json_atomic(path, obj):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(_json.dumps(obj))
     os.replace(tmp, path)
-
-
-def _alpha_index(path):
-    with rasterio.open(path) as s:
-        if s.colorinterp:
-            for i, ci in enumerate(s.colorinterp):
-                if ci == ColorInterp.alpha:
-                    return i + 1
-        return s.count      # convention: last band is validity when no alpha tag
 
 
 def _union_grid(paths, out_crs, res):
@@ -505,7 +497,7 @@ def _union_grid(paths, out_crs, res):
 
 def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=None,
                workers=None, block=2048, ownership_out=None, report_json=None,
-               nspec=None, render_chunk=None, log=print):
+               nspec=None, render_chunk=None, band_names=None, log=print):
     """Merge N overlapping orthomosaics with the 1 m seam-walk blend.
 
     inputs   : list of (name, path) pairs — every input is named; names carry
@@ -514,8 +506,11 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     gauge    : "free" (no input is the reference; corrections split evenly) or
                "anchored" (pin the FIRST input; others move fully — fallback).
     res      : output pixel size; None = median of the inputs' native GSDs.
-    nspec    : spectral band count to carry (None = all non-alpha bands of the
-               first input). Alpha/validity = tagged alpha band, else the last.
+    nspec    : spectral band count to carry (None = all spectral bands of the
+               first input under the band law).
+    band_names : the config's spectral band names — the first N non-alpha bands
+               of every input are these, in order (bands.band_law). None = every
+               non-alpha band. Validity = tagged alpha, else derived from zeros.
 
     Geometry only — raw band values are never altered outside the seam band,
     and inside it only cross-faded between the meeting owners. Writes a stage
@@ -535,10 +530,19 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             with rasterio.open(p) as s:
                 rs.append(abs(s.res[0]))
         res = round(float(np.median(rs)), 3)
-    aidx = {i: _alpha_index(p) for i, p in enumerate(paths)}
+    laws = [_B.band_law(p, band_names) for p in paths]
     if nspec is None:
-        with rasterio.open(paths[0]) as s:
-            nspec = min(aidx[0] - 1, s.count - 1) if s.count > 1 else 1
+        nspec = laws[0].nspec
+    short = [n for n, l in zip(names, laws) if l.nspec < nspec]
+    if short:
+        raise ValueError(f"seam_merge: inputs with fewer than {nspec} spectral bands: {short}")
+    aidx = {i: laws[i].alpha for i in range(N)}                    # None = validity from zeros
+    spec_idx = {i: [b - 1 for b in laws[i].spectral[:nspec]] for i in range(N)}
+
+    def _valid(i, arr):
+        """validity of a windowed read of input i under its band law"""
+        return arr[aidx[i] - 1] > 127 if aidx[i] else (arr[spec_idx[i]] != 0).any(0)
+    log(f"    band law: {laws[0].describe()}" + (f" (first of {N} inputs)" if N > 1 else ""))
     workers = workers or max(1, (os.cpu_count() or 4) - 1)
 
     OUT_TR, OUT_W, OUT_H, bounds = _union_grid(paths, out_crs, res)
@@ -598,7 +602,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             with rasterio.open(paths[i]) as s:
                 with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
                                 resampling=Resampling.nearest) as v:
-                    m = v.read(aidx[i]) > 127
+                    m = _B.read_valid(v, laws[i])
             log(f"      {names[i]}: {m.mean() * 100:.1f}% of the union grid")
             return m
 
@@ -727,12 +731,12 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             c0 = min(max(x - _TILE_W // 2, 0), OUT_W - _TILE_W)
             a = vmain[ia].read(window=Window(c0, r0, _TILE_W, _TILE_H))
             b = vmain[ib].read(window=Window(c0, r0, _TILE_W, _TILE_H))
-            va, vb = a[aidx[ia] - 1] > 127, b[aidx[ib] - 1] > 127
+            va, vb = _valid(ia, a), _valid(ib, b)
             if va.mean() < 0.4 or vb.mean() < 0.4:
                 continue
             m = _F.match_tile(matcher, dev,
-                              _F.gray_stretch(a[:min(3, nspec)].astype(np.float32)),
-                              _F.gray_stretch(b[:min(3, nspec)].astype(np.float32)),
+                              _F.gray_stretch(a[spec_idx[ia][:3]].astype(np.float32)),
+                              _F.gray_stretch(b[spec_idx[ib][:3]].astype(np.float32)),
                               _REJECT_PX, _MIN_TILE)
             if m is None:
                 continue
@@ -830,18 +834,18 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             return "skip"
         V = src_vrts()
         rg = {i: V[i].read(window=Window(hc0, hr0, hw, hh)) for i in present}
-        val = {i: rg[i][aidx[i] - 1] > 127 for i in present}
+        val = {i: _valid(i, rg[i]) for i in present}
         present = [i for i in present if val[i].any()]
         if not present:
             return "skip"
         if len(present) == 1:
             i = present[0]
-            outh = np.concatenate([rg[i][:nspec],
+            outh = np.concatenate([rg[i][spec_idx[i]],
                                    np.where(val[i], 255, 0)[None].astype(np.uint8)], 0)
             kind = "copy"
         else:
             valids = [val[i] for i in present]
-            specs = [rg[i][:nspec].astype(np.float32) for i in present]
+            specs = [rg[i][spec_idx[i]].astype(np.float32) for i in present]
             geom = _seam_geom_block(hr0, hc0, hh, hw, present, valids, ds_c, D_c,
                                     res, band_width_m)
             if geom["in_band"][iy:iy + bh, ix:ix + bw].any():
@@ -884,9 +888,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             f"disk (crash-safe render checkpoint)")
     else:
         dst = rasterio.open(out, "w", **prof)
-        if nspec == 3:
-            dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue,
-                               ColorInterp.alpha]
+        _B.tag_output(dst, (list(band_names) if band_names else list(laws[0].names))[:nspec])
     todo = [bi for bi in range(len(blocks)) if bi not in done]
     log(f"    composite: {len(blocks)} blocks of {block}x{block} px, {workers} workers, "
         f"{len(todo)} to render (copy = one owner, byte-identical; own/seam = overlap)")

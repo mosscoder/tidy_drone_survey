@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='tidysurvey',
-    version='0.2.0.dev0',
+    version='0.3.0.dev0',
     description='Config-driven drone-survey pipeline: stitch, align, calibrate, report',
     packages=find_packages(),
     python_requires='>=3.10',

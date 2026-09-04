@@ -94,6 +94,26 @@ Hard gates exist only where a threshold is physical (seams ≤ 20 cm, interiors
 byte-identical). Registration agreement and calibration MAE ship as evidence
 rasters beside the products — read per survey, no fixed thresholds.
 
+## Bands and validity (the band law)
+
+`tidysurvey/bands.py` is the one place that decides which bands are data and
+which is validity. DroneDeploy's exports, as verified on the bucket:
+
+| export | bands | validity |
+|---|---|---|
+| visible | RGBA | band 4, tagged alpha |
+| multispectral 2024 | R, G, NIR, RE, NIR again | none (no alpha, nodata unset) |
+| multispectral 2025+ | R, G, NIR, RE, NIR again, alpha | band 6, tagged alpha |
+
+The colour tags on the multispectral files are wrong (band 3 is tagged "blue"
+and is NIR), so only the alpha tag is trusted. `[multispectral] bands` in the
+config names the first N non-alpha bands, in order; the duplicate and any
+untagged trailing band are dropped, never carried. Validity is the tagged
+alpha where one exists; without one it is derived from the data
+(border-connected zero = nodata, interior zero islands = data). Every writer
+tags its alpha band and names its bands, so a registered mission is
+`Red, Green, NIR, RedEdge, alpha`, never the source alpha resampled as data.
+
 ## Install
 
 ```

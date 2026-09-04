@@ -152,6 +152,7 @@ def _stitch(cfg, product):
         res = cfg.ms.resolution_m
     rep = merge.seam_merge(inputs, str(out), band_width_m=cfg.stitch.band_width_m,
                            gauge=cfg.stitch.gauge,
+                           band_names=None if product == "visible" else list(cfg.ms.bands),
                            res=res if isinstance(res, float) else None,
                            out_crs=cfg.crs, ownership_out=str(ownership),
                            report_json=str(rep_path), log=say)
@@ -232,7 +233,8 @@ def _align(cfg, product):
                 src = staged
             s = registration.register_survey_dense(
                 src, reg_ref, str(out), qa_json=str(qa),
-                resolution_m=res if isinstance(res, float) else None, log=say)
+                resolution_m=res if isinstance(res, float) else None, log=say,
+                band_names=None if product == "visible" else list(cfg.ms.bands))
             if staged:
                 Path(staged).unlink(missing_ok=True)
         s["name"] = it.name

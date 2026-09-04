@@ -33,6 +33,7 @@ from rasterio.windows import Window
 from rasterio.vrt import WarpedVRT
 from rasterio.enums import Resampling
 from rasterio.transform import rowcol
+from . import bands as _B
 
 
 # --------------------------------------------------------------------------- #
@@ -52,11 +53,12 @@ def build_pairs(drone_path, reference_path, nspec=4):
         ref_valid &= ~np.any(R == nod, axis=0)
     ref_valid &= np.all(np.isfinite(R), axis=0) & np.any(R != 0, axis=0)
 
+    law = _B.band_law(drone_path)
+    alpha_idx = law.alpha or law.count                   # tagged alpha; untagged legacy mosaics: last band
     with rasterio.open(drone_path) as d:
-        alpha_idx = d.count                              # convention: last band = alpha
         with WarpedVRT(d, crs=ref_crs, transform=rt, width=w, height=h,
                        resampling=Resampling.average) as v:
-            D = v.read(list(range(1, nspec + 1))).astype(np.float32)
+            D = v.read(list(law.spectral[:nspec])).astype(np.float32)
             A = v.read(alpha_idx)
     dr_valid = A > 200                                   # ≥~80% of native px valid in the 10 m cell
 
@@ -172,7 +174,9 @@ def apply_bilinear(drone_path, model, out, tile=2048, workers=None, log=print):
     src = rasterio.open(drone_path)
     prof = src.profile.copy()
     H, W, tr = src.height, src.width, src.transform
-    alpha_idx = src.count
+    law = _B.band_law(drone_path)
+    alpha_idx = law.alpha or law.count                   # tagged alpha; untagged legacy mosaics: last band
+    spec_idx = [b - 1 for b in law.spectral[:4]]
     prof.update(count=4, dtype="int16", nodata=0, compress="zstd", zstd_level=1,
                 predictor=2, tiled=True, blockxsize=512, blockysize=512, BIGTIFF="YES")
     for k in ("photometric", "alpha"):
@@ -181,7 +185,7 @@ def apply_bilinear(drone_path, model, out, tile=2048, workers=None, log=print):
 
     def process(r0, c0, h, w):
         arr = _worker_src(drone_path).read(window=Window(c0, r0, w, h))
-        DN = arr[:4].astype(np.float32)
+        DN = arr[spec_idx].astype(np.float32)
         al = arr[alpha_idx - 1] > 0
         if not al.any():
             return r0, c0, np.zeros((4, h, w), np.int16)

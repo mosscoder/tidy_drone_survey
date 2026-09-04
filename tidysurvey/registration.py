@@ -33,9 +33,8 @@ from rasterio.vrt import WarpedVRT as _WarpedVRT
 from rasterio.windows import Window as _Window
 from rasterio.enums import Resampling as _Resampling
 from affine import Affine as _Affine
-from scipy.ndimage import label as _ndlabel
-
 from . import fields as _F
+from . import bands as _B
 
 _TILE_H, _TILE_W = 480, 640
 _FS = 64                     # pooling cell (px)
@@ -81,6 +80,12 @@ def _prewarp_to_grid(src, out_crs, TR, W, H, bands, resampling, out_path, worker
                 blockysize=512, compress="zstd", ZSTD_LEVEL=1, BIGTIFF="IF_SAFER",
                 num_threads=str(workers))
     dst = rasterio.open(out_path, "w", **prof)
+    with rasterio.open(src) as s0:                 # carry the source's tags (alpha!) onto the stage
+        if s0.count == len(bands) and s0.colorinterp:
+            try:
+                dst.colorinterp = [s0.colorinterp[b - 1] for b in bands]
+            except Exception:
+                pass
     lock = _threading.Lock(); tls = _threading.local()
     blocks = [(r0, c0) for r0 in range(0, H, 4096) for c0 in range(0, W, 4096)]
 
@@ -193,7 +198,7 @@ def _run_reg_chunk(work_dir, chunk_idx):
         r0, c0 = int(r0), int(c0)
         win = _Window(c0, r0, tw, th)
         t = _time.time()
-        spec = vm.read(list(range(1, min(3, nspec) + 1)), window=win)
+        spec = vm.read(st["spec_bands"][:3], window=win)     # first (<=3) spectral bands
         rdm += _time.time() - t
         if not (spec != 0).any():
             continue
@@ -255,6 +260,7 @@ def register_survey_by_chips(
     output_stats_raster_path: Optional[str] = None,
     debug_output_dir_for_warped_chips: Optional[str] = None,
     engine: str = "dense",
+    band_names=None,
 ):
     """Register a survey raster to a reference. Same signature as the
     first-generation function; the INTERNALS are the audited dense engine
@@ -268,7 +274,7 @@ def register_survey_by_chips(
     return register_survey_dense(
         unreg_survey_path, reg_reference_path, output_registered_survey_path,
         device=None if device_for_loftr in (None, "cpu") else device_for_loftr,
-        workers=max_loader_workers,
+        workers=max_loader_workers, band_names=band_names,
     )
 
 
@@ -284,6 +290,7 @@ def register_survey_dense(
     workers: int = None,
     qa_json: str = None,
     log=print,
+    band_names=None,       # the config's spectral band names (first N non-alpha bands); None = all
 ):
     """Align one mission to the reference with ONE smooth correction field.
 
@@ -308,11 +315,17 @@ def register_survey_dense(
     with rasterio.open(mission) as s:
         out_crs = str(s.crs)
         res = resolution_m or round(abs(s.res[0]), 3)
-        n_bands = s.count
         mb = s.bounds
         mt = s.transform                            # native transform (same CRS as out_crs)
         mW, mH = s.width, s.height
-    nspec = max(1, n_bands - 1) if n_bands in (4, 5) else n_bands   # last band = alpha if RGBA/5-band
+    # band law (bands.py): spectral bands = the config names (first N non-alpha), validity =
+    # the tagged alpha, else derived from zeros. Never guess from the band count.
+    law = _B.band_law(mission, band_names)
+    nspec, spec_bands = law.nspec, list(law.spectral)
+    alaw = _B.band_law(anchor)
+    if alaw.alpha is None:
+        raise RuntimeError(f"register_survey_dense: reference {anchor} has no alpha/validity band")
+    a_alpha = alaw.alpha
     # snap the output origin to a global `res` lattice so every same-GSD mission
     # (and the stitch union grid, likewise snapped) shares one pixel lattice — the
     # merge then crops interiors pixel-exactly instead of re-resampling them.
@@ -328,6 +341,7 @@ def register_survey_dense(
     ax = 0.5 * sx + (TR.c - mt.c) / mt.a - 0.5
     ay = 0.5 * sy + (TR.f - mt.f) / mt.e - 0.5
     log(f"[register_dense] {os.path.basename(mission)} -> grid {W}x{H} @ {res} m")
+    log(f"    band law: {law.describe()}")
 
     # ---- coarse validity (mission) + reference coverage -------------------- #
     Wc, Hc = -(-W // _GEOM_DS), -(-H // _GEOM_DS)
@@ -335,17 +349,8 @@ def register_survey_dense(
     with rasterio.open(mission) as s:
         with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
                         resampling=_Resampling.average) as v:
-            arr = v.read()
-    data = (arr != 0).any(0)
-    del arr
-    vmask = data
-    zw = ~data
-    if zw.any():                                # fill enclosed holes (interior nodata)
-        lab, _ = _ndlabel(zw, structure=np.ones((3, 3), int))
-        border = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
-        vmask = data | ((lab > 0) & ~np.isin(lab, border[border > 0]))
+            vmask = _B.read_valid(v, law)       # exact alpha, else zeros + border flood fill
     with rasterio.open(anchor) as a:
-        a_alpha = a.count if a.count in (4, 5) else a.count
         with _WarpedVRT(a, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
                         resampling=_Resampling.average) as v:
             a_ok_c = v.read(a_alpha) > 127
@@ -382,7 +387,7 @@ def register_survey_dense(
     (work / "state.json").write_text(_json.dumps(dict(
         mission=mission, anchor=anchor, out_crs=out_crs,
         tr=[TR.a, TR.b, TR.c, TR.d, TR.e, TR.f], W=int(W), H=int(H),
-        nspec=int(nspec), a_alpha=int(a_alpha), reject_px=_REJECT_PX,
+        nspec=int(nspec), spec_bands=spec_bands, a_alpha=int(a_alpha), reject_px=_REJECT_PX,
         min_tile=_MIN_TILE, tile_h=_TILE_H, tile_w=_TILE_W)))
     n_chunks = -(-len(tiles) // _CHUNK_TILES)
     log(f"    matching {len(tiles)} tiles in {n_chunks} x {_CHUNK_TILES}-tile "
@@ -472,6 +477,7 @@ def register_survey_dense(
     vfull = cv2.resize(vc.astype(np.uint8), (bw, bh), interpolation=cv2.INTER_NEAREST)
     _Path(output_registered_survey_path).parent.mkdir(parents=True, exist_ok=True)
     dst = rasterio.open(output_registered_survey_path, "w", **prof)
+    _B.tag_output(dst, law.names)                  # names + tagged alpha: no guessing downstream
     wlock = _threading.Lock()
     tls = _threading.local()
 
@@ -498,7 +504,7 @@ def register_survey_dense(
                              np.arange(hh, dtype=np.float32))
         outb = np.zeros((nspec + 1, hh, hw), np.uint8)
         if nc1 > nc0 and nr1 > nr0:
-            native = tls.m.read(list(range(1, nspec + 1)),
+            native = tls.m.read(spec_bands,
                                 window=_Window(nc0, nr0, nc1 - nc0, nr1 - nr0)).astype(np.float32)
             # ONE resample: corrected source GRID coord -> NATIVE pixel (local to the read)
             mapx = (sx * (hc0 + gx - fxs) + ax - nc0).astype(np.float32)
@@ -522,7 +528,9 @@ def register_survey_dense(
     dst.close()
 
     summary = dict(kind="align", mission=os.path.basename(mission),
-                   reference=os.path.basename(anchor), tiles=len(tiles),
+                   reference=os.path.basename(anchor),
+                   bands=list(law.names), alpha="tagged" if law.alpha else "derived",
+                   tiles=len(tiles),
                    matches=int(len(an)), cells=int(len(pts)), rejected=n_rej,
                    failed_cells=failed_cells,
                    d_med_cm=round(d_med, 1),

@@ -32,6 +32,7 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_origin
 from rasterio.vrt import WarpedVRT
 from rasterio.windows import Window
+from . import bands as _B
 
 
 class CheckResult(dict):
@@ -67,12 +68,12 @@ def registration_r_cells(ms_path, anchor_path, out_tif, cell_px=128, res=None,
     """
     t0 = time.time()
     workers = workers or max(1, (os.cpu_count() or 4) - 1)
+    mlaw = _B.band_law(ms_path)
     with rasterio.open(ms_path) as m:
         crs_out = m.crs
         res = res or round(abs(m.res[0]), 3)
-        n_ms = m.count
-    with rasterio.open(anchor_path) as a:
-        a_alpha = a.count
+    alaw = _B.band_law(anchor_path)
+    a_alpha = alaw.alpha or alaw.count                   # tagged alpha; untagged legacy: last band
     cell_m = cell_px * res
 
     with rasterio.open(anchor_path) as a_s, rasterio.open(ms_path) as m_s, \
@@ -122,8 +123,8 @@ def registration_r_cells(ms_path, anchor_path, out_tif, cell_px=128, res=None,
             return
         g_a = vg.read(green_band, window=win).astype(np.float32)
         g_m = mg.read(green_band, window=win).astype(np.float32)
-        val_m = mv.read(n_ms, window=win) > 127 if n_ms >= 5 else \
-            (mv.read([1, 2, 3, 4], window=win) != 0).any(axis=0)
+        val_m = mv.read(mlaw.alpha, window=win) > 127 if mlaw.alpha else \
+            (mv.read(list(mlaw.spectral[:4]), window=win) != 0).any(axis=0)
         co = al_a & val_m
         out = {"anch": cellsum(al_a.astype(np.float64), bh, bw),
                "miss": cellsum((al_a & ~val_m).astype(np.float64), bh, bw)}
