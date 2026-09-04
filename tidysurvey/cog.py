@@ -10,9 +10,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from osgeo import gdal
 
-gdal.UseExceptions()
+def _gdal():
+    """The GDAL Python bindings, imported on use: the GPU registration worker installs tidysurvey
+    with rasterio only (rasterio bundles libgdal, not `osgeo`), and never finalizes a COG."""
+    try:
+        from osgeo import gdal
+    except ImportError as e:                       # pragma: no cover
+        raise ImportError("finalize_cog needs the GDAL Python bindings (conda: gdal; pip: GDAL "
+                          "matching the system libgdal)") from e
+    gdal.UseExceptions()
+    return gdal
 
 
 def finalize_cog(src, dst, lossless=True, level=9, blocksize=512,
@@ -36,6 +44,6 @@ def finalize_cog(src, dst, lossless=True, level=9, blocksize=512,
         opts += ["OVERVIEW_COMPRESS=WEBP", f"OVERVIEW_QUALITY={overview_quality}"]
     gdal.SetConfigOption("GDAL_CACHEMAX", "8192")
     log(f"[cog] {src} -> {dst} ({'lossless' if lossless else 'webp overviews'})")
-    ds = gdal.Translate(str(dst), str(src), format="COG", creationOptions=opts)
+    ds = _gdal().Translate(str(dst), str(src), format="COG", creationOptions=opts)
     ds = None
     return str(dst)

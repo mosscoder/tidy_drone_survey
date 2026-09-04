@@ -7,7 +7,14 @@ import json
 import os
 from datetime import datetime, timedelta
 
-import ee
+try:
+    import ee
+except ImportError:                       # the [sentinel] extra; the GPU registration image omits it
+    class _MissingEE:
+        def __getattr__(self, name):
+            raise ImportError("tidysurvey.sentinel needs earthengine-api "
+                              "(pip install 'tidysurvey[sentinel]')")
+    ee = _MissingEE()
 import rasterio
 import requests
 from google.oauth2 import service_account
