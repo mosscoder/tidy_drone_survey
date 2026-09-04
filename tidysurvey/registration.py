@@ -224,11 +224,13 @@ def _run_reg_chunk(work_dir, chunk_idx):
     print(f"    chunk {ci}: {n_used}/{len(sub)} · mission-read {rdm:.0f}s · "
           f"anchor-read {rda:.0f}s · infer {inf:.0f}s", flush=True)
     part = work / f"part_{ci}.npz"
+    tim = dict(t_read_m=np.float64(rdm), t_read_a=np.float64(rda), t_infer=np.float64(inf),
+               n_tiles=np.int64(len(sub)))
     if ans:
         np.savez(part, an=np.concatenate(ans), d=np.concatenate(dss),
-                 n_used=np.int64(n_used))
+                 n_used=np.int64(n_used), **tim)
     else:
-        np.savez(part, an=np.zeros((0, 2)), d=np.zeros((0, 2)), n_used=np.int64(0))
+        np.savez(part, an=np.zeros((0, 2)), d=np.zeros((0, 2)), n_used=np.int64(0), **tim)
 
 
 # --------------------------------------------------------------------------- #
@@ -309,6 +311,10 @@ def register_survey_dense(
     still climbs or throughput decays: chunk externally.
     """
     t0 = _time.time()
+    phases, _tp = {}, [_time.time()]          # per-phase seconds (geometry, match, gates, field, warp)
+
+    def _phase(name):
+        now = _time.time(); phases[name] = round(now - _tp[0], 1); _tp[0] = now
     workers = workers or max(1, (os.cpu_count() or 4) - 1)
     mission, anchor = str(unreg_survey_path), str(reg_reference_path)
 
@@ -369,6 +375,7 @@ def register_survey_dense(
                     and a_ok_c[cr:cr + ch, cc:cc + cw].mean() > 0.05):
                 tiles.append((r0, c0))
     log(f"    {len(tiles)} data tiles (bbox {r1b - r0b}x{c1b - c0b} px)")
+    _phase("geometry")
 
     # ---- dense match pass: fresh subprocess per CHUNK ----------------------- #
     # GPU work runs ONLY in short-lived chunk workers so the MPS per-process
@@ -401,11 +408,21 @@ def register_survey_dense(
                                f"{ci + 1}/{n_chunks} failed (rc={rc.returncode})")
         log(f"    [chunk {ci + 1}/{n_chunks}] done")
     buf_an, buf_d, n_used = [], [], 0
+    mt = dict(infer_s=0.0, mission_read_s=0.0, anchor_read_s=0.0, chunks=n_chunks, chunk_tiles=_CHUNK_TILES)
     for ci in range(n_chunks):
         z = np.load(work / f"part_{ci}.npz")
         if len(z["an"]):
             buf_an.append(z["an"]); buf_d.append(z["d"]); n_used += int(z["n_used"])
+        if "t_infer" in z:
+            mt["infer_s"] += float(z["t_infer"]); mt["mission_read_s"] += float(z["t_read_m"])
+            mt["anchor_read_s"] += float(z["t_read_a"])
     _shutil.rmtree(work, ignore_errors=True)
+    _phase("match")
+    mt = {k: (round(v, 1) if isinstance(v, float) else v) for k, v in mt.items()}
+    mt["tiles_per_s_infer"] = round(len(tiles) / mt["infer_s"], 2) if mt["infer_s"] else None
+    log(f"    match phase {phases['match']}s: infer {mt['infer_s']}s ({mt['tiles_per_s_infer']} t/s), "
+        f"mission reads {mt['mission_read_s']}s, anchor reads {mt['anchor_read_s']}s, "
+        f"{n_chunks} chunk process(es)")
     if not buf_an:
         raise RuntimeError("register_survey_dense: no matches")
     an = np.concatenate(buf_an); d = np.concatenate(buf_d)
@@ -457,6 +474,7 @@ def register_survey_dense(
         for _i, _n in enumerate(("|d|_cm", "dx_cm", "dy_cm"), 1):
             _dd.set_band_description(_i, _n)
     failed_cells = int((cov == 0).sum())
+    _phase("gates")
 
     # ---- one smooth field (bbox-local, FIELD_DS lattice) --------------------- #
     bh, bw = r1b - r0b, c1b - c0b
@@ -466,6 +484,7 @@ def register_survey_dense(
     Fy = _F.fill_field(pl, vy, Wg, Hg)
     maxF = float(max(np.abs(Fx).max(), np.abs(Fy).max()))
     halo = int(_math.ceil(maxF)) + 16
+    _phase("field")
 
     # ---- warp once (block-streamed, haloed) ---------------------------------- #
     tr_b = TR * _Affine.translation(c0b, r0b)
@@ -526,6 +545,8 @@ def register_survey_dense(
     with _TPE(max_workers=workers) as ex:
         list(ex.map(wone, wblocks))
     dst.close()
+    _phase("warp")
+    log("    phases: " + ", ".join(f"{k} {v}s" for k, v in phases.items()))
 
     summary = dict(kind="align", mission=os.path.basename(mission),
                    reference=os.path.basename(anchor),
@@ -538,6 +559,7 @@ def register_survey_dense(
                    maxF_cm=round(maxF * res * 100, 1),
                    out=str(output_registered_survey_path),
                    coverage=cov_out, disp=disp_out,
+                   phases=phases, match=mt,
                    seconds=round(_time.time() - t0, 1))
     if qa_json:
         _Path(qa_json).parent.mkdir(parents=True, exist_ok=True)
