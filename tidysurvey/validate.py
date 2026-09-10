@@ -53,11 +53,18 @@ class CheckResult(dict):
 # --------------------------------------------------------------------------- #
 def registration_r_cells(ms_path, anchor_path, out_tif, cell_px=128, res=None,
                          min_n=500, block=2048, green_band=2, workers=None,
-                         log=print):
+                         like=None, log=print):
     """Per-cell texture-masked Pearson r of the registered product's GREEN band
     vs the anchor's GREEN band, on gradient-above-median co-valid pixels
     (>= min_n per cell). Wall-to-wall, streamed in constant memory. Writes a
     2-band raster (r, ms-missing fraction) and returns the summary.
+
+    like : path of a raster whose grid defines the cells (typically the
+           engine's <out>.cells.tif), so the score lands on the SAME lattice
+           as the displacement diagnostics and stacks with them band for
+           band. Its cell size must be a whole number of product pixels.
+           Without it the lattice is the product/anchor overlap in cell_px
+           cells.
 
     Non-circular by construction: the LoFTR matcher consumes a 3-band
     grayscale; this scorer correlates raw green only. Pearson r is
@@ -74,20 +81,32 @@ def registration_r_cells(ms_path, anchor_path, out_tif, cell_px=128, res=None,
         res = res or round(abs(m.res[0]), 3)
     alaw = _B.band_law(anchor_path)
     a_alpha = alaw.alpha or alaw.count                   # tagged alpha; untagged legacy: last band
-    cell_m = cell_px * res
-
-    with rasterio.open(anchor_path) as a_s, rasterio.open(ms_path) as m_s, \
-            WarpedVRT(a_s, crs=crs_out) as va, WarpedVRT(m_s, crs=crs_out) as vm:
-        L = max(va.bounds.left, vm.bounds.left)
-        R = min(va.bounds.right, vm.bounds.right)
-        B = max(va.bounds.bottom, vm.bounds.bottom)
-        T = min(va.bounds.top, vm.bounds.top)
-    ncx = int((R - L) // cell_m)
-    ncy = int((T - B) // cell_m)
-    if ncx < 1 or ncy < 1:
-        raise ValueError("registration_r_cells: no overlap between product and anchor")
+    if like:
+        with rasterio.open(like) as lk:
+            crs_out = lk.crs
+            ncx, ncy = lk.width, lk.height
+            L, T, cell_m = lk.transform.c, lk.transform.f, float(abs(lk.transform.a))
+        cell_px = int(round(cell_m / res))
+        if cell_px < 1 or abs(cell_px * res - cell_m) > 1e-6:
+            raise ValueError(f"registration_r_cells: `like` cell {cell_m} m is not a whole "
+                             f"number of {res} m pixels")
+    else:
+        cell_m = cell_px * res
+        with rasterio.open(anchor_path) as a_s, rasterio.open(ms_path) as m_s, \
+                WarpedVRT(a_s, crs=crs_out) as va, WarpedVRT(m_s, crs=crs_out) as vm:
+            L = max(va.bounds.left, vm.bounds.left)
+            R = min(va.bounds.right, vm.bounds.right)
+            B = max(va.bounds.bottom, vm.bounds.bottom)
+            T = min(va.bounds.top, vm.bounds.top)
+        ncx = int((R - L) // cell_m)
+        ncy = int((T - B) // cell_m)
+        if ncx < 1 or ncy < 1:
+            raise ValueError("registration_r_cells: no overlap between product and anchor")
+        T = B + ncy * cell_m
+    block -= block % cell_px                            # blocks hold whole cells
+    if block < cell_px:
+        block = cell_px
     W, H = ncx * cell_px, ncy * cell_px
-    T = B + ncy * cell_m
     transform = from_origin(L, T, res, res)
     log(f"[reg_r_cells] grid {W}x{H} @ {res} m ({ncx}x{ncy} cells of {cell_m:.2f} m)")
 

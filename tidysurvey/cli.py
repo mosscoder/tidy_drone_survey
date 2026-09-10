@@ -150,11 +150,25 @@ def _stitch(cfg, product):
         ownership = paths.ms_mosaic_ownership
         rep_path = paths.stage_report("stitch_ms")
         res = cfg.ms.resolution_m
+    owner_in = None
+    if product != "visible" and paths.visible_ownership.exists():
+        # one set of seams per season: the visible stitch's partition is recycled
+        # into the multispectral stitch when the missions are the same flights
+        # (same names); otherwise the distance rule decides here too
+        vn = {o.name for o in cfg.visible.orthos}
+        mn = {m.name for m in cfg.ms.missions}
+        if vn == mn:
+            owner_in = str(paths.visible_ownership)
+            say(f"    recycling the visible ownership ({paths.visible_ownership.name})")
+        else:
+            say(f"    visible ownership not recycled: mission names differ "
+                f"(visible {sorted(vn - mn)}, multispectral {sorted(mn - vn)})")
     rep = merge.seam_merge(inputs, str(out), band_width_m=cfg.stitch.band_width_m,
                            gauge=cfg.stitch.gauge,
                            band_names=None if product == "visible" else list(cfg.ms.bands),
                            res=res if isinstance(res, float) else None,
                            out_crs=cfg.crs, ownership_out=str(ownership),
+                           owner_in=owner_in,
                            report_json=str(rep_path), log=say)
     validate.seam_tripwire(rep, max_cm=cfg.stitch.seam_tripwire_cm).assert_ok()
     validate.assert_interiors_unchanged(inputs, str(out), str(ownership),

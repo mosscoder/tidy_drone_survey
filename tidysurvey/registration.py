@@ -41,6 +41,8 @@ _FS = 64                     # pooling cell (px)
 _MIN_NB = 8                  # corroboration: neighbours required in the 5x5 ring
 _REJECT_PX, _MIN_TILE, _MIN_CELL = 4.0, 8, 2
 _GEOM_DS, _FIELD_DS, _BLOCK = 8, 8, 2048
+# the per-cell diagnostics raster (<out>.cells.tif): float32, NaN nodata, on the _FS lattice
+CELL_BANDS = ("d_cm", "dx_cm", "dy_cm", "n_matches", "field_x_cm", "field_y_cm", "coverage")
 
 # --------------------------------------------------------------------------- #
 # dense match pass — run as fresh subprocess CHUNKS (audit 02_registration §7).
@@ -445,34 +447,27 @@ def register_survey_dense(
         raise RuntimeError("register_survey_dense: all cells rejected by the gates")
     d_med = float(np.median(np.hypot(vx, vy)) * res * 100)
     log(f"    {len(pts)} cells after gates ({n_rej} rejected)  |d| med={d_med:.1f} cm")
-    # --- durable per-region diagnostics on the _FS-cell lattice --------------------
-    #  coverage (1=matched / 0=expected-but-failed / 255=not-expected) is the
-    #  failed-match map; disp (|d|_cm, dx, dy) are the RAW pooled displacements (not
-    #  the smooth field) — the honest per-region error signal the deferred
-    #  through-time analysis stacks across seasons. On the mission's snapped lattice
-    #  so they are cross-season stackable.
+    # --- durable per-region diagnostics on the _FS-cell lattice ------------------
+    #  ONE raster (<out>.cells.tif, CELL_BANDS) written after the field is fit, so
+    #  it carries the RAW pooled displacements (the honest per-region error signal
+    #  the through-time analysis stacks across seasons), the match count, the
+    #  smooth field the warp applied, and the coverage (1 matched / 0 expected but
+    #  failed / NaN not expected). On the mission's snapped lattice, so cells stack
+    #  across seasons by georeference.
     _celltr = _Affine.translation(TR.c, TR.f) * _Affine.scale(_FS * res, -_FS * res)
-    cov = np.where(_cok, 0, 255).astype(np.uint8)
+    cov = np.full((Hcc, Wcc), np.nan, np.float32)
+    cov[_cok] = 0.0
     cov[np.clip((_cpts[_ckeep, 1] // _FS).astype(int), 0, Hcc - 1),
-        np.clip((_cpts[_ckeep, 0] // _FS).astype(int), 0, Wcc - 1)] = 1
+        np.clip((_cpts[_ckeep, 0] // _FS).astype(int), 0, Wcc - 1)] = 1.0
     disp = np.full((3, Hcc, Wcc), np.nan, np.float32)
     _dy = np.clip((pts[:, 1] // _FS).astype(int), 0, Hcc - 1)
     _dx = np.clip((pts[:, 0] // _FS).astype(int), 0, Wcc - 1)
     disp[0, _dy, _dx] = np.hypot(vx, vy) * res * 100
     disp[1, _dy, _dx] = vx * res * 100; disp[2, _dy, _dx] = vy * res * 100
-    cov_out = str(_Path(output_registered_survey_path).with_suffix(".coverage.tif"))
-    disp_out = str(_Path(output_registered_survey_path).with_suffix(".disp.tif"))
-    with rasterio.open(cov_out, "w", driver="GTiff", width=Wcc, height=Hcc, count=1,
-                       dtype="uint8", crs=out_crs, transform=_celltr, nodata=255,
-                       tiled=True, compress="zstd") as _dc:
-        _dc.write(cov, 1)
-        _dc.set_band_description(1, "match coverage: 1=matched 0=failed-but-expected 255=not-expected")
-    with rasterio.open(disp_out, "w", driver="GTiff", width=Wcc, height=Hcc, count=3,
-                       dtype="float32", crs=out_crs, transform=_celltr, nodata=float("nan"),
-                       tiled=True, compress="zstd") as _dd:
-        _dd.write(disp)
-        for _i, _n in enumerate(("|d|_cm", "dx_cm", "dy_cm"), 1):
-            _dd.set_band_description(_i, _n)
+    nmatch = np.zeros((Hcc, Wcc), np.float32)             # raw LoFTR matches pooled per cell
+    np.add.at(nmatch, (np.clip((an[:, 1] // _FS).astype(int), 0, Hcc - 1),
+                       np.clip((an[:, 0] // _FS).astype(int), 0, Wcc - 1)), 1)
+    nmatch[np.isnan(cov)] = np.nan
     failed_cells = int((cov == 0).sum())
     _phase("gates")
 
@@ -484,6 +479,32 @@ def register_survey_dense(
     Fy = _F.fill_field(pl, vy, Wg, Hg)
     maxF = float(max(np.abs(Fx).max(), np.abs(Fy).max()))
     halo = int(_math.ceil(maxF)) + 16
+    # the field at the cell centres, sampled with the warp's own lattice convention
+    # (upsample_block = cv2.resize: native px p -> lattice (p + 0.5) / fac - 0.5)
+    CX, CY = np.meshgrid((np.arange(Wcc, dtype=np.float32) + 0.5) * _FS,
+                         (np.arange(Hcc, dtype=np.float32) + 0.5) * _FS)
+    inside = (CX >= c0b) & (CX < c1b) & (CY >= r0b) & (CY < r1b)
+    lx = ((CX - c0b + 0.5) / _FIELD_DS - 0.5).astype(np.float32)
+    ly = ((CY - r0b + 0.5) / _FIELD_DS - 0.5).astype(np.float32)
+    fld = [np.where(inside, cv2.remap(F_, lx, ly, cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_REPLICATE) * res * 100, np.nan)
+           for F_ in (Fx, Fy)]
+    cells_out = str(_Path(output_registered_survey_path).with_suffix(".cells.tif"))
+    cell_arrays = (disp[0], disp[1], disp[2], nmatch, fld[0], fld[1], cov)
+    with rasterio.open(cells_out, "w", driver="GTiff", width=Wcc, height=Hcc,
+                       count=len(CELL_BANDS), dtype="float32", crs=out_crs,
+                       transform=_celltr, nodata=float("nan"), tiled=True,
+                       compress="zstd") as _dc:
+        for _i, _n in enumerate(CELL_BANDS, 1):           # tags BEFORE pixels (bands.py)
+            _dc.set_band_description(_i, _n)
+        _dc.update_tags(cell_px=_FS, res_m=res, mission=os.path.basename(mission),
+                        reference=os.path.basename(anchor), tiles=len(tiles),
+                        matches=int(len(an)), cells=int(len(pts)), rejected=n_rej,
+                        failed_cells=failed_cells, d_med_cm=round(d_med, 1),
+                        maxF_cm=round(maxF * res * 100, 1),
+                        coverage="1 matched, 0 expected but no match, nodata not expected")
+        for _i, _a in enumerate(cell_arrays, 1):
+            _dc.write(_a.astype(np.float32), _i)
     _phase("field")
 
     # ---- warp once (block-streamed, haloed) ---------------------------------- #
@@ -558,7 +579,7 @@ def register_survey_dense(
                    d_p99_cm=round(float(np.percentile(np.hypot(vx, vy), 99)) * res * 100, 1),
                    maxF_cm=round(maxF * res * 100, 1),
                    out=str(output_registered_survey_path),
-                   coverage=cov_out, disp=disp_out,
+                   cells_tif=cells_out, cell_px=_FS, cell_bands=list(CELL_BANDS),
                    phases=phases, match=mt,
                    seconds=round(_time.time() - t0, 1))
     if qa_json:

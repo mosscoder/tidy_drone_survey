@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 
+import cv2
 import numpy as np
 from scipy import ndimage
 
@@ -495,9 +496,41 @@ def _union_grid(paths, out_crs, res):
     return tr, W, H, dict(zip(range(len(paths)), bs))
 
 
+def _recycle_owner(owner_in, names, valid_c, owner_c, out_crs, tr_c, Wc, Hc):
+    """The coarse owner from an ownership raster: its `names` tag maps values to
+    input names (every name must be an input here). Returns the owner grid with
+    the recycled owner wherever it covers the cell AND is valid there, the
+    distance-rule owner elsewhere, plus (kept, fell_back) counts."""
+    with rasterio.open(owner_in) as s:
+        tag_names = [n for n in (s.tags().get("names") or "").split(",") if n]
+        if not tag_names:
+            raise ValueError(f"seam_merge: {owner_in} has no `names` tag; not an ownership raster")
+        unknown = [n for n in tag_names if n not in names]
+        if unknown:
+            raise ValueError(f"seam_merge: ownership raster names are not inputs here: {unknown}")
+        band = 2 if s.count >= 2 else 1           # band 2 = owner everywhere; band 1 has the seam band
+        with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
+                        resampling=Resampling.nearest) as v:
+            raw = v.read(band)
+    rec = np.full((Hc, Wc), -1, np.int16)
+    for k, nm in enumerate(tag_names, 1):
+        rec[raw == k] = names.index(nm)
+    del raw
+    ok = np.zeros((Hc, Wc), bool)
+    for i in range(len(names)):
+        sel = rec == i
+        if sel.any():
+            ok[sel] = np.asarray(valid_c[i])[sel]
+    covered = owner_c >= 0
+    keep = ok & covered
+    kept, fell_back = int(keep.sum()), int((covered & ~keep).sum())
+    return np.where(keep, rec, owner_c).astype(np.int16), (kept, fell_back)
+
+
 def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=None,
                workers=None, block=2048, ownership_out=None, report_json=None,
-               nspec=None, render_chunk=None, band_names=None, log=print):
+               nspec=None, render_chunk=None, band_names=None, owner_in=None,
+               geometry_only=False, log=print):
     """Merge N overlapping orthomosaics with the 1 m seam-walk blend.
 
     inputs   : list of (name, path) pairs — every input is named; names carry
@@ -511,6 +544,20 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     band_names : the config's spectral band names — the first N non-alpha bands
                of every input are these, in order (bands.band_law). None = every
                non-alpha band. Validity = tagged alpha, else derived from zeros.
+
+    owner_in : an ownership raster written by an earlier seam_merge (its
+               `names` tag maps values to input names) whose partition is
+               REUSED instead of the distance rule — the visible stitch's
+               ownership recycled into the multispectral stitch, so both
+               products share one set of seams. Where the recycled owner
+               does not cover a cell, or is not valid there, the distance
+               rule decides (the validity fallback); the report counts both.
+    geometry_only : stop after the coarse pass and the ownership raster —
+               the seams from the alphas alone, no matching, no render.
+    ownership_out : a 2-band uint8 raster on the coarse grid: band 1 = owner
+               index (1..N) with N+1 inside the seam band (what the interiors
+               gate reads), band 2 = the owner index everywhere (what
+               owner_in reads). 0 = no input covers the cell.
 
     Geometry only — raw band values are never altered outside the seam band,
     and inside it only cross-faded between the meeting owners. Writes a stage
@@ -551,7 +598,9 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
 
     # the grid manifest — shared by the coarse-reuse sentinel and the walk/render
     # checkpoints, so any plan change invalidates all three together.
-    manifest = dict(W=OUT_W, H=OUT_H, res=round(float(res), 6), n=N, names=list(names))
+    manifest = dict(W=OUT_W, H=OUT_H, res=round(float(res), 6), n=N, names=list(names),
+                    owner_in=(str(owner_in) if owner_in else None))
+    recycled = None                                   # (kept, fell back) when owner_in
 
     # ---- coarse geometry: validity, EDT owner, faultlines (STREAMED to disk) --- #
     # ds_c (per-source EDTs, ~57 GB at N=21) and valid_c (~14 GB) are only used
@@ -635,6 +684,12 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         owner_c[ncov < 1] = np.int16(-1)                   # -1 where no source covers
         del ncov
         gc.collect()
+        if owner_in:
+            owner_c, recycled = _recycle_owner(owner_in, names, valid_c, owner_c,
+                                               out_crs, tr_c, Wc, Hc)
+            log(f"    ownership recycled from {os.path.basename(str(owner_in))}: "
+                f"{recycled[0]} cells kept, {recycled[1]} fell back to the distance rule "
+                f"(recycled owner absent or not valid there)")
         log("      all EDTs streamed; computing faultlines + coarse distance field "
             "(one final EDT) ...")
         fault_c = np.zeros((Hc, Wc), bool)
@@ -657,17 +712,38 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         _write_json_atomic(coarse_done, manifest)          # sentinel LAST -> dir now trustworthy
 
     if ownership_out:
-        cat = np.zeros((Hc, Wc), np.uint8)
+        own = np.zeros((Hc, Wc), np.uint8)
         for i in range(N):
-            cat[owner_c == i] = i + 1
+            own[owner_c == i] = i + 1
+        cat = own.copy()
         cat[(D_c <= band_width_m) & cov2_c] = N + 1
-        prof = dict(driver="GTiff", height=Hc, width=Wc, count=1, dtype="uint8",
+        prof = dict(driver="GTiff", height=Hc, width=Wc, count=2, dtype="uint8",
                     crs=out_crs, transform=tr_c, nodata=0, tiled=True,
                     compress="zstd", predictor=2, BIGTIFF="IF_SAFER")
         _Path(ownership_out).parent.mkdir(parents=True, exist_ok=True)
         with rasterio.open(ownership_out, "w", **prof) as d:
+            d.set_band_description(1, "owner index, seam band = names + 1")
+            d.set_band_description(2, "owner index everywhere")
+            d.update_tags(names=",".join(names), seam_band_value=str(N + 1),
+                          band_width_m=str(band_width_m),
+                          recycled_from=(os.path.basename(str(owner_in)) if owner_in else ""))
             d.write(cat, 1)
-            d.update_tags(names=",".join(names), seam_band_value=str(N + 1))
+            d.write(own, 2)
+        del own, cat
+    if geometry_only:
+        n_fault = int(((D_c <= 0) & cov2_c).sum())
+        ds_c = valid_c = D_c = None
+        gc.collect()
+        shutil.rmtree(mmdir, ignore_errors=True)
+        report = dict(kind="ownership", inputs=names, res_m=res, crs=out_crs,
+                      grid=[OUT_W, OUT_H], faultline_cells=n_fault,
+                      recycled=recycled, ownership=str(ownership_out) if ownership_out else None,
+                      seconds=round(_time.perf_counter() - t0, 1))
+        if report_json:
+            _Path(report_json).parent.mkdir(parents=True, exist_ok=True)
+            _Path(report_json).write_text(_json.dumps(report, indent=2))
+        log(f"[seam_merge] ownership only ({report['seconds']:.0f}s) -> {ownership_out}")
+        return report
 
     # ---- per-pair seam walk (LoFTR), CHECKPOINTED -------------------------- #
     # each pair's sparse result is persisted the moment it finishes, so a crash
@@ -786,6 +862,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     # the composite needs only ds_c/D_c/lat_c per block -> free the ~16 GB of
     # validity masks + ownership before the (never-before-reached) long render
     valid_c = owner_c = cov2_c = None
+    # with a recycled ownership the composite follows it (memmapped, not the EDT argmax)
+    owner_mm = np.load(mmdir / "owner.npy", mmap_mode="r") if owner_in else None
 
     # ---- streamed N-way composite ------------------------------------------ #
     prof = dict(driver="GTiff", height=OUT_H, width=OUT_W, count=nspec + 1, dtype="uint8",
@@ -847,7 +925,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             valids = [val[i] for i in present]
             specs = [rg[i][spec_idx[i]].astype(np.float32) for i in present]
             geom = _seam_geom_block(hr0, hc0, hh, hw, present, valids, ds_c, D_c,
-                                    res, band_width_m)
+                                    res, band_width_m, owner_c=owner_mm)
             if geom["in_band"][iy:iy + bh, ix:ix + bw].any():
                 flds = [_lat_block(lat_c[i], hr0, hc0, hh, hw) for i in present]
                 sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
@@ -918,7 +996,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                 dst = rasterio.open(out, "r+")     # reopen; update mode won't zero-fill the sparse rest
     if dst is not None and not dst.closed:
         dst.close()   # vmain was closed after the walk; the composite uses tls VRTs
-    ds_c = D_c = None                             # release the coarse memmaps
+    ds_c = D_c = owner_mm = None                  # release the coarse memmaps
     gc.collect()
     shutil.rmtree(mmdir, ignore_errors=True)      # ~74 GB of coarse scratch, done
     rckpt.unlink(missing_ok=True)                 # render finished -> drop the checkpoint
@@ -927,7 +1005,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                   gauge=gauge, band_width_m=band_width_m, res_m=res, crs=out_crs,
                   grid=[OUT_W, OUT_H], blocks=dict(counts),
                   seconds=round(_time.perf_counter() - t0, 1), out=str(out),
-                  ownership=str(ownership_out) if ownership_out else None)
+                  ownership=str(ownership_out) if ownership_out else None,
+                  recycled=recycled, owner_in=(str(owner_in) if owner_in else None))
     if report_json:
         _Path(report_json).parent.mkdir(parents=True, exist_ok=True)
         _Path(report_json).write_text(_json.dumps(report, indent=2))
@@ -935,9 +1014,12 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     return report
 
 
-def _seam_geom_block(r0, c0, bh, bw, present, valids, ds_c, D_c, res, band_m):
+def _seam_geom_block(r0, c0, bh, bw, present, valids, ds_c, D_c, res, band_m,
+                     owner_c=None):
     """Native-res seam geometry for one block, upsampled from the GLOBAL coarse
-    EDTs (so ownership is globally correct even at block edges)."""
+    EDTs (so ownership is globally correct even at block edges). With a coarse
+    `owner_c` (a recycled ownership) the owner is read from it — nearest, then
+    the distance rule only where the given owner is absent or not valid."""
     ds = np.stack([_F.upsample_block(ds_c[i], _GEOM_DS, r0, c0, bh, bw) / res
                    for i in present])
     D = _F.upsample_block(D_c, _GEOM_DS, r0, c0, bh, bw) / res
@@ -946,6 +1028,13 @@ def _seam_geom_block(r0, c0, bh, bw, present, valids, ds_c, D_c, res, band_m):
     any_valid = vstack.any(0)
     B = max(band_m / res, 1.0)
     owner = np.where(cov2, np.argmax(ds, 0).astype(np.int16), np.int16(-1))
+    if owner_c is not None:
+        og = _F.upsample_block(owner_c, _GEOM_DS, r0, c0, bh, bw,
+                               interp=cv2.INTER_NEAREST).astype(np.int16)
+        given = np.full(owner.shape, -1, np.int16)
+        for p, i in enumerate(present):
+            given[(og == i) & valids[p]] = p
+        owner = np.where(cov2 & (given >= 0), given, owner)
     single = any_valid & ~cov2
     for p in range(len(present)):
         owner = np.where(single & valids[p], np.int16(p), owner)

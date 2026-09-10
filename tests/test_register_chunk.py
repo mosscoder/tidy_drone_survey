@@ -59,6 +59,8 @@ with rasterio.open(out) as d:
     bands, ow, oh = d.count, d.width, d.height
 qa_j = json.load(open(qa))
 cleaned = not os.path.exists(out + ".regwork")
+with rasterio.open(qa_j["cells_tif"]) as c:
+    cells_ok = c.count == len(R.CELL_BANDS) and tuple(c.descriptions) == R.CELL_BANDS
 
 print(f"announce: {announce[:1]}")
 print(f"chunks run: {len(chunk_done)}  (expect 3 with 9 tiles / CHUNK=4)")
@@ -68,7 +70,7 @@ print(f"qa: tiles={qa_j['tiles']} matches={qa_j['matches']} cells={qa_j['cells']
 print(f"workdir cleaned: {cleaned}")
 
 ok = (have_out and len(chunk_done) > 1 and bands == 4 and ow == W and oh == H
-      and qa_j["matches"] > 0 and qa_j["cells"] > 0 and cleaned)
+      and qa_j["matches"] > 0 and qa_j["cells"] > 0 and cleaned and cells_ok)
 print("VERDICT:", "PASS" if ok else "FAIL",
       f"(chunked subprocess register reproduces a valid warp; {len(chunk_done)} chunks)")
 

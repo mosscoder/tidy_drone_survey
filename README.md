@@ -114,6 +114,29 @@ alpha where one exists; without one it is derived from the data
 tags its alpha band and names its bands, so a registered mission is
 `Red, Green, NIR, RedEdge, alpha`, never the source alpha resampled as data.
 
+## Per-cell evidence
+
+Every registration writes `<out>.cells.tif` beside the registered mission:
+one float32 raster on the engine's 64-pixel cell lattice (NaN = nodata),
+bands `d_cm, dx_cm, dy_cm, n_matches, field_x_cm, field_y_cm, coverage`
+(`registration.CELL_BANDS`). The first three are the RAW pooled displacements
+the matches measured, the honest error signal; `field_*` is the smooth
+correction the warp applied, sampled at the cell centres; `coverage` is 1
+where a cell matched, 0 where it was expected to and did not, NaN where no
+match was expected. `validate.registration_r_cells(..., like=<cells.tif>)`
+scores agreement with the anchor on that same lattice, so the two stack band
+for band and across seasons by georeference.
+
+Every stitch writes an ownership raster (`ownership_out`): band 1 is the
+owner index with the seam band marked `N + 1`, band 2 the owner index
+everywhere, and the `names` tag maps values to inputs. A later stitch can
+recycle it (`seam_merge(owner_in=...)`, or `geometry_only=True` for the
+seams from the alphas alone): the multispectral stitch of a season reuses
+the visible stitch's partition when the missions are the same flights, and
+falls back to the distance rule wherever the recycled owner is absent or not
+valid. `tidysurvey stitch --product multispectral` does this by itself when
+the visible ownership exists and the mission names match.
+
 ## Install
 
 ```
