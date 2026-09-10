@@ -77,7 +77,7 @@ class StitchCfg:
 
 @dataclass
 class CalibrateCfg:
-    reference: str = "sentinel-2"
+    reference: str = "sentinel-2"    # "none" = no calibration: the plan ends at the stitched mosaic
     date: str = "auto"               # "auto" = median mission date + scene menu; or 'YYYY-MM-DD'
     search_days: int = 14
     max_scene_cloud_pct: float = 20.0
@@ -235,14 +235,15 @@ class Config:
         decides pipeline shape. A borrowed anchor inserts the visible-align
         pass; a multispectral layer appends align/stitch/calibrate."""
         stages = []
-        if self.ms.missions and self.calibrate.reference:
+        calibrating = bool(self.ms.missions) and self.calibrate.reference not in (None, "", "none")
+        if calibrating:
             stages.append("scene")                       # settled before heavy work
         if self.anchor:
             stages.append("align/visible")               # borrowed truth: align first
         if self.visible.orthos:
             stages.append("stitch/visible")
         if self.ms.missions:
-            stages += ["align/ms", "stitch/ms", "calibrate"]
+            stages += ["align/ms", "stitch/ms"] + (["calibrate"] if calibrating else [])
         if self.visible.orthos and self.visible.web_map:
             stages.append("tiles")              # the web map, from the finished base
         stages.append("report")

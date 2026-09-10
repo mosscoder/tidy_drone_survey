@@ -207,3 +207,13 @@ class OwnershipRecycling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanWithoutCalibration(unittest.TestCase):
+    def test_reference_none_drops_scene_and_calibrate(self):
+        import tidysurvey.config as C
+        cfg = C.Config(survey="s", crs="EPSG:6514", run_dir=".", georeferencing="gcp")
+        cfg.visible.orthos = [C.NamedInput("a", "a.tif")]; cfg.ms.missions = [C.NamedInput("a", "m.tif")]
+        self.assertEqual(cfg.plan(), ["scene", "stitch/visible", "align/ms", "stitch/ms", "calibrate", "tiles", "report"])
+        cfg.calibrate.reference = "none"
+        self.assertEqual(cfg.plan(), ["stitch/visible", "align/ms", "stitch/ms", "tiles", "report"])
