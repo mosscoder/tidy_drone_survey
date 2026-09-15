@@ -472,12 +472,16 @@ def register_survey_dense(
     _phase("gates")
 
     # ---- one smooth field (bbox-local, FIELD_DS lattice) --------------------- #
+    # Never materialised at the FIELD_DS lattice (bbox/8 a side: 0.6 GB for a
+    # 92k x 52k map). StreamedField holds the horizontal pass of the same
+    # resize (1/8 of that) and serves column bands bit-identical to
+    # fill_field's values; the warp pulls the band under each block.
     bh, bw = r1b - r0b, c1b - c0b
     Hg, Wg = bh // _FIELD_DS + 1, bw // _FIELD_DS + 1
     pl = (pts - [c0b, r0b]) / _FIELD_DS
-    Fx = _F.fill_field(pl, vx, Wg, Hg)
-    Fy = _F.fill_field(pl, vy, Wg, Hg)
-    maxF = float(max(np.abs(Fx).max(), np.abs(Fy).max()))
+    SFx = _F.StreamedField(pl, vx, Wg, Hg)
+    SFy = _F.StreamedField(pl, vy, Wg, Hg)
+    maxF = float(max(SFx.absmax(), SFy.absmax()))
     halo = int(_math.ceil(maxF)) + 16
     # the field at the cell centres, sampled with the warp's own lattice convention
     # (upsample_block = cv2.resize: native px p -> lattice (p + 0.5) / fac - 0.5)
@@ -486,9 +490,8 @@ def register_survey_dense(
     inside = (CX >= c0b) & (CX < c1b) & (CY >= r0b) & (CY < r1b)
     lx = ((CX - c0b + 0.5) / _FIELD_DS - 0.5).astype(np.float32)
     ly = ((CY - r0b + 0.5) / _FIELD_DS - 0.5).astype(np.float32)
-    fld = [np.where(inside, cv2.remap(F_, lx, ly, cv2.INTER_LINEAR,
-                                      borderMode=cv2.BORDER_REPLICATE) * res * 100, np.nan)
-           for F_ in (Fx, Fy)]
+    fld = [np.where(inside, SF_.sample(lx, ly) * res * 100, np.nan)
+           for SF_ in (SFx, SFy)]
     cells_out = str(_Path(output_registered_survey_path).with_suffix(".cells.tif"))
     cell_arrays = (disp[0], disp[1], disp[2], nmatch, fld[0], fld[1], cov)
     with rasterio.open(cells_out, "w", driver="GTiff", width=Wcc, height=Hcc,
@@ -513,56 +516,115 @@ def register_survey_dense(
                 crs=out_crs, transform=tr_b, tiled=True, blockxsize=512, blockysize=512,
                 compress="zstd", predictor=2, ZSTD_LEVEL=3, BIGTIFF="IF_SAFER",
                 num_threads=str(workers))
-    vc = vmask[r0b // _GEOM_DS:-(-r1b // _GEOM_DS), c0b // _GEOM_DS:-(-c1b // _GEOM_DS)]
-    vfull = cv2.resize(vc.astype(np.uint8), (bw, bh), interpolation=cv2.INTER_NEAREST)
+    # Validity at native resolution is never materialised (one byte per output
+    # pixel: 4.8 GB for a 92k x 52k map). Each block gathers its window from
+    # the GEOM_DS mask through the exact nearest-neighbour offsets cv2.resize
+    # would have used, so the alpha band is byte-identical to the resized whole.
+    vc = np.ascontiguousarray(vmask[r0b // _GEOM_DS:-(-r1b // _GEOM_DS),
+                                    c0b // _GEOM_DS:-(-c1b // _GEOM_DS)].astype(np.uint8))
+    v_rows = _F.resize_nn_offsets(vc.shape[0], bh)
+    v_cols = _F.resize_nn_offsets(vc.shape[1], bw)
     _Path(output_registered_survey_path).parent.mkdir(parents=True, exist_ok=True)
     dst = rasterio.open(output_registered_survey_path, "w", **prof)
     _B.tag_output(dst, law.names)                  # names + tagged alpha: no guessing downstream
     wlock = _threading.Lock()
     tls = _threading.local()
 
-    def upf(arr, hr0, hc0, hh, hw):
-        return _F.upsample_block(arr, _FIELD_DS, hr0 - r0b, hc0 - c0b, hh, hw)
+    def upf(hr0, hc0, hh, hw):
+        """The correction field on this native block, as upsample_block gave it
+        from the full FIELD_DS array: the same FIELD_DS sub-window (served by
+        StreamedField, per column stripe, cached per worker) through the same
+        integer-factor resize and crop."""
+        r0, c0 = hr0 - r0b, hc0 - c0b
+        cr0, cc0 = r0 // _FIELD_DS, c0 // _FIELD_DS
+        cr1 = min(Hg, -(-(r0 + hh) // _FIELD_DS)); cc1 = min(Wg, -(-(c0 + hw) // _FIELD_DS))
+        if getattr(tls, "fkey", None) != (cc0, cc1):
+            tls.fkey = (cc0, cc1)
+            tls.fcols = (SFx.columns(cc0, cc1), SFy.columns(cc0, cc1))
+        return [_F.upsample_block(col[cr0:cr1], _FIELD_DS, r0 - cr0 * _FIELD_DS,
+                                  c0 - cc0 * _FIELD_DS, hh, hw, out=buf)
+                for col, buf in zip(tls.fcols, (tls.bigx, tls.bigy))]
+
+    # Every array a worker touches is allocated ONCE per worker at the largest
+    # haloed block and re-used as a contiguous view, so the warp's footprint is
+    # workers x (block + halo)^2 x a fixed number of bytes and does not churn the
+    # allocator. The arithmetic below is the same float32 sequence as the
+    # expression form it replaces (each step rounds identically), so the
+    # registered bands are byte-identical.
+    PAD = 3
+    HMAX, WMAX = min(_BLOCK, bh) + 2 * halo, min(_BLOCK, bw) + 2 * halo
+    NHMAX = int(_math.ceil(sy * HMAX)) + 2 * PAD + 2
+    NWMAX = int(_math.ceil(sx * WMAX)) + 2 * PAD + 2
+    BMAX = (HMAX + 2 * _FIELD_DS) * (WMAX + 2 * _FIELD_DS)     # upsample_block covers whole FIELD_DS cells: up to 2 extra per axis
+
+    def _buffers():
+        if not hasattr(tls, "m"):
+            tls.m = rasterio.open(mission)                  # native read, per worker
+            gy_, gx_ = np.meshgrid(np.arange(HMAX, dtype=np.float32),
+                                   np.arange(WMAX, dtype=np.float32), indexing="ij")
+            tls.gx, tls.gy = np.ascontiguousarray(gx_), np.ascontiguousarray(gy_)
+            tls.mapx = np.empty(HMAX * WMAX, np.float32); tls.mapy = np.empty(HMAX * WMAX, np.float32)
+            tls.rem = np.empty(HMAX * WMAX, np.float32); tls.a8 = np.empty(HMAX * WMAX, np.uint8)
+            tls.outb = np.empty((nspec + 1) * HMAX * WMAX, np.uint8)
+            tls.nat8 = np.empty(nspec * NHMAX * NWMAX, np.uint8)
+            tls.nat = np.empty(nspec * NHMAX * NWMAX, np.float32)
+            tls.bigx = np.empty(BMAX, np.float32); tls.bigy = np.empty(BMAX, np.float32)
+            tls.wout = np.empty((nspec + 1) * min(_BLOCK, bh) * min(_BLOCK, bw), np.uint8)
+        return tls
 
     def wone(bc):
         r0, c0 = bc
-        if not hasattr(tls, "m"):
-            tls.m = rasterio.open(mission)                  # native read, per worker
+        t = _buffers()
         bh2, bw2 = min(_BLOCK, r1b - r0), min(_BLOCK, c1b - c0)
         hr0, hc0 = max(r0b, r0 - halo), max(c0b, c0 - halo)
         hr1, hc1 = min(r1b, r0 + bh2 + halo), min(c1b, c0 + bw2 + halo)
         hh, hw = hr1 - hr0, hc1 - hc0
         iy, ix = r0 - hr0, c0 - hc0
         # native read window covering this (haloed) grid block, padded for the cubic kernel
-        PAD = 3
         nc0 = max(0, int(_math.floor(sx * hc0 + ax)) - PAD)
         nr0 = max(0, int(_math.floor(sy * hr0 + ay)) - PAD)
         nc1 = min(mW, int(_math.ceil(sx * hc1 + ax)) + PAD)
         nr1 = min(mH, int(_math.ceil(sy * hr1 + ay)) + PAD)
-        fxs = upf(Fx, hr0, hc0, hh, hw); fys = upf(Fy, hr0, hc0, hh, hw)
-        gx, gy = np.meshgrid(np.arange(hw, dtype=np.float32),
-                             np.arange(hh, dtype=np.float32))
-        outb = np.zeros((nspec + 1, hh, hw), np.uint8)
+        fxs, fys = upf(hr0, hc0, hh, hw)
+        gx, gy = t.gx[:hh, :hw], t.gy[:hh, :hw]
+        n = hh * hw
+        mapx = t.mapx[:n].reshape(hh, hw); mapy = t.mapy[:n].reshape(hh, hw)
+        rem = t.rem[:n].reshape(hh, hw)
+        outb = t.outb[:(nspec + 1) * n].reshape(nspec + 1, hh, hw)
+        outb[:] = 0
         if nc1 > nc0 and nr1 > nr0:
-            native = tls.m.read(spec_bands,
-                                window=_Window(nc0, nr0, nc1 - nc0, nr1 - nr0)).astype(np.float32)
+            nh, nw = nr1 - nr0, nc1 - nc0
+            nat8 = t.nat8[:nspec * nh * nw].reshape(nspec, nh, nw)
+            native = t.nat[:nspec * nh * nw].reshape(nspec, nh, nw)
+            tls.m.read(spec_bands, window=_Window(nc0, nr0, nw, nh), out=nat8)
+            np.copyto(native, nat8)                                   # uint8 -> float32, as astype did
             # ONE resample: corrected source GRID coord -> NATIVE pixel (local to the read)
-            mapx = (sx * (hc0 + gx - fxs) + ax - nc0).astype(np.float32)
-            mapy = (sy * (hr0 + gy - fys) + ay - nr0).astype(np.float32)
+            # == (sx * (hc0 + gx - fxs) + ax - nc0).astype(np.float32), step by step in float32
+            np.add(gx, np.float32(hc0), out=mapx); np.subtract(mapx, fxs, out=mapx)
+            np.multiply(mapx, np.float32(sx), out=mapx); np.add(mapx, np.float32(ax), out=mapx)
+            np.subtract(mapx, np.float32(nc0), out=mapx)
+            np.add(gy, np.float32(hr0), out=mapy); np.subtract(mapy, fys, out=mapy)
+            np.multiply(mapy, np.float32(sy), out=mapy); np.add(mapy, np.float32(ay), out=mapy)
+            np.subtract(mapy, np.float32(nr0), out=mapy)
             for b in range(nspec):
-                rem = cv2.remap(native[b], mapx, mapy, cv2.INTER_CUBIC,
-                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                outb[b] = np.clip(rem, 0, 255).astype(np.uint8)     # cubic can overshoot [0,255]
+                cv2.remap(native[b], mapx, mapy, cv2.INTER_CUBIC, dst=rem,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                np.clip(rem, 0, 255, out=rem)                         # cubic can overshoot [0,255]
+                np.copyto(outb[b], rem, casting="unsafe")             # float32 -> uint8, as astype did
         # alpha stays grid-space + nearest (no blur), via the grid correction map
-        val = vfull[hr0 - r0b:hr1 - r0b, hc0 - c0b:hc1 - c0b]
-        outb[nspec] = (cv2.remap(val, (gx - fxs).astype(np.float32), (gy - fys).astype(np.float32),
-                                 cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0
-                       ).astype(np.uint8) * 255
+        val = vc[np.ix_(v_rows[hr0 - r0b:hr1 - r0b], v_cols[hc0 - c0b:hc1 - c0b])]
+        np.subtract(gx, fxs, out=mapx); np.subtract(gy, fys, out=mapy)
+        a8 = t.a8[:n].reshape(hh, hw)
+        cv2.remap(val, mapx, mapy, cv2.INTER_NEAREST, dst=a8,
+                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        outb[nspec][a8 > 0] = 255
+        wout = t.wout[:(nspec + 1) * bh2 * bw2].reshape(nspec + 1, bh2, bw2)   # contiguous: no copy inside write()
+        np.copyto(wout, outb[:, iy:iy + bh2, ix:ix + bw2])
         with wlock:
-            dst.write(outb[:, iy:iy + bh2, ix:ix + bw2],
-                      window=_Window(c0 - c0b, r0 - r0b, bw2, bh2))
+            dst.write(wout, window=_Window(c0 - c0b, r0 - r0b, bw2, bh2))
 
-    wblocks = [(r0, c0) for r0 in range(r0b, r1b, _BLOCK) for c0 in range(c0b, c1b, _BLOCK)]
+    # column-major so a worker's consecutive blocks share a field column stripe
+    wblocks = [(r0, c0) for c0 in range(c0b, c1b, _BLOCK) for r0 in range(r0b, r1b, _BLOCK)]
     with _TPE(max_workers=workers) as ex:
         list(ex.map(wone, wblocks))
     dst.close()

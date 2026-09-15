@@ -137,6 +137,27 @@ falls back to the distance rule wherever the recycled owner is absent or not
 valid. `tidysurvey stitch --product multispectral` does this by itself when
 the visible ownership exists and the mission names match.
 
+## Changes
+
+- **0.3.2** — registration memory independent of map size. The dense
+  registration no longer materialises the native-resolution validity mask
+  (one byte per output pixel, 4.8 GB for a 92k × 52k ortho) or the
+  FIELD_DS correction field; each warp block gathers its validity window from
+  the coarse mask through the exact nearest-neighbour offsets `cv2.resize`
+  would have used, and pulls its field from a `fields.StreamedField` that
+  holds only the horizontal pass of the same resize and serves column bands
+  bit-for-bit. Registered map, `cells.tif` and QA are byte-identical to
+  0.3.1 (verified with the real matcher on a synthetic pair with a varying
+  field); peak memory is a function of block size, halo and worker count,
+  and every array a warp worker touches is allocated once per worker. A
+  20k × 20k synthetic mission with two workers: 2421 MiB peak on 0.3.1,
+  1420 on 0.3.2, and the same at 10k × 10k (`tests/test_field_streamed.py`,
+  `TIDYSURVEY_SLOW_TESTS=1`).
+- **0.3.1** — `calibrate.reference = "none"`: a plan that ends at the
+  stitched mosaic (no scene selection, no calibration).
+- **0.3.0** — per-cell evidence raster, the scorer on the engine lattice,
+  ownership recycling between the visible and multispectral stitches.
+
 ## Install
 
 ```

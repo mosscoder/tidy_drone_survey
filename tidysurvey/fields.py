@@ -62,17 +62,96 @@ def griddata_fill(pts, vals, EX, EY):
     return np.full(EX.shape, np.nan)
 
 
-def fill_field(pts_px, vals, out_w, out_h, sample_ds=8) -> np.ndarray:
-    """Sparse (x,y)->val samples -> dense (out_h,out_w) float32 field.
-    Evaluated on a sample_ds-decimated lattice then bilinearly resized —
-    the corrections are smooth, so sparse evaluation reconstructs them."""
-    if len(vals) < 1:
-        return np.zeros((out_h, out_w), np.float32)
+def field_lattice(pts_px, vals, out_w, out_h, sample_ds=8) -> np.ndarray:
+    """The sample_ds-decimated lattice fill_field evaluates on, as float32
+    (ceil(out_h/sample_ds), ceil(out_w/sample_ds)). fill_field(...) is exactly
+    cv2.resize(field_lattice(...), (out_w, out_h), INTER_LINEAR)."""
     ex = np.arange(0, out_w, sample_ds)
     ey = np.arange(0, out_h, sample_ds)
     EX, EY = np.meshgrid(ex, ey)
     g = np.nan_to_num(griddata_fill(np.asarray(pts_px, float), np.asarray(vals), EX, EY))
-    return cv2.resize(g.astype(np.float32), (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    return g.astype(np.float32)
+
+
+def fill_field(pts_px, vals, out_w, out_h, sample_ds=8) -> np.ndarray:
+    """Sparse (x,y)->val samples -> dense (out_h,out_w) float32 field.
+    Evaluated on a sample_ds-decimated lattice then bilinearly resized —
+    the corrections are smooth, so sparse evaluation reconstructs them.
+    For fields too large to hold, StreamedField serves the same values by
+    column band without the (out_h, out_w) array."""
+    if len(vals) < 1:
+        return np.zeros((out_h, out_w), np.float32)
+    g = field_lattice(pts_px, vals, out_w, out_h, sample_ds)
+    return cv2.resize(g, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+
+class StreamedField:
+    """fill_field(pts_px, vals, out_w, out_h) without the (out_h, out_w) array.
+
+    cv2.resize INTER_LINEAR is separable: a horizontal pass over the lattice
+    rows, then a vertical pass. This holds only the horizontal pass,
+    (lat_h, out_w) float32 — 1/sample_ds of the full field — and serves any
+    column band of the full field on demand by running the vertical pass on
+    those columns (a resize whose horizontal scale is 1 is an exact copy), so
+    every value is bit-identical to fill_field(...)[:, c0:c1]
+    (tests/test_field_streamed.py). Memory no longer scales with out_h*out_w.
+    """
+    def __init__(self, pts_px, vals, out_w, out_h, sample_ds=8):
+        self.out_w, self.out_h = int(out_w), int(out_h)
+        if len(vals) < 1:
+            self.hp = None
+        else:
+            lat = field_lattice(pts_px, vals, out_w, out_h, sample_ds)
+            self.hp = cv2.resize(lat, (self.out_w, lat.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+    def columns(self, c0, c1) -> np.ndarray:
+        """Columns [c0, c1) of the full field, all out_h rows: float32 (out_h, c1 - c0)."""
+        c0, c1 = max(0, int(c0)), min(self.out_w, int(c1))
+        if self.hp is None:
+            return np.zeros((self.out_h, c1 - c0), np.float32)
+        return cv2.resize(np.ascontiguousarray(self.hp[:, c0:c1]), (c1 - c0, self.out_h),
+                          interpolation=cv2.INTER_LINEAR)
+
+    def absmax(self, band=1024) -> float:
+        """max |field| over the whole grid, streamed by column band."""
+        if self.hp is None:
+            return 0.0
+        m = 0.0
+        for c0 in range(0, self.out_w, band):
+            m = max(m, float(np.abs(self.columns(c0, c0 + band)).max()))
+        return m
+
+    def sample(self, mapx, mapy, band=1024) -> np.ndarray:
+        """cv2.remap(field, mapx, mapy, INTER_LINEAR, BORDER_REPLICATE) for finite
+        2-D float32 maps, streamed by column band of the field: a band [c0, c1)
+        plus one overlap column serves every sample whose x lies in [c0, c1);
+        the first and last bands own everything beyond the grid, so the
+        replicate border is the grid's own. Bit-identical to the whole-array remap."""
+        mapx = np.asarray(mapx, np.float32); mapy = np.asarray(mapy, np.float32)
+        out = np.zeros(mapx.shape, np.float32)
+        if self.hp is None:
+            return out
+        for c0 in range(0, self.out_w, band):
+            c1 = min(self.out_w, c0 + band)
+            lo = -np.inf if c0 == 0 else c0
+            hi = np.inf if c1 == self.out_w else c1
+            sel = (mapx >= lo) & (mapx < hi)
+            if not sel.any():
+                continue
+            sub = self.columns(c0, min(self.out_w, c1 + 1))
+            r = cv2.remap(sub, mapx - np.float32(c0), mapy, cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+            out[sel] = r[sel]
+        return out
+
+
+def resize_nn_offsets(src_n, dst_n) -> np.ndarray:
+    """Source index of each destination index of cv2.resize(..., INTER_NEAREST)
+    along one axis, exactly as OpenCV computes it (resizeNN: floor(x * (1 / (dst/src))),
+    clipped to src_n - 1). Gathering coarse[np.ix_(rows, cols)] reproduces any
+    window of the nearest-upsampled whole without materialising it."""
+    inv = 1.0 / (np.float64(dst_n) / np.float64(src_n))
+    return np.minimum(np.floor(np.arange(dst_n, dtype=np.float64) * inv).astype(np.int64), src_n - 1)
 
 
 def sample_field_nodes(pts_px, vals, out_w, out_h, node_r, node_c, sample_ds=8):
@@ -106,14 +185,21 @@ def sample_field_nodes(pts_px, vals, out_w, out_h, node_r, node_c, sample_ds=8):
     return out
 
 
-def upsample_block(arr, fac, r0, c0, bh, bw, interp=cv2.INTER_LINEAR):
+def upsample_block(arr, fac, r0, c0, bh, bw, interp=cv2.INTER_LINEAR, out=None):
     """Upsample a factor-`fac` decimated global array to a native block,
-    grid-aligned (used to bring coarse geometry/fields to native windows)."""
+    grid-aligned (used to bring coarse geometry/fields to native windows).
+    `out`: an optional flat float32 buffer the resized sub-window is written
+    into (the returned block is a view of it), so a worker can reuse one
+    allocation across blocks; it must hold (cr1-cr0)*fac * (cc1-cc0)*fac."""
     cr0, cc0 = r0 // fac, c0 // fac
     cr1 = min(arr.shape[0], -(-(r0 + bh) // fac))
     cc1 = min(arr.shape[1], -(-(c0 + bw) // fac))
     sub = arr[cr0:cr1, cc0:cc1].astype(np.float32)
-    big = cv2.resize(sub, ((cc1 - cc0) * fac, (cr1 - cr0) * fac), interpolation=interp)
+    dh, dw = (cr1 - cr0) * fac, (cc1 - cc0) * fac
+    if out is not None:
+        big = cv2.resize(sub, (dw, dh), dst=out[:dh * dw].reshape(dh, dw), interpolation=interp)
+    else:
+        big = cv2.resize(sub, (dw, dh), interpolation=interp)
     oy, ox = r0 - cr0 * fac, c0 - cc0 * fac
     return big[oy:oy + bh, ox:ox + bw]
 
