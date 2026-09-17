@@ -139,6 +139,13 @@ the visible ownership exists and the mission names match.
 
 ## Changes
 
+- **0.3.3** (2026-09-17) — heartbeat hook: `TIDYSURVEY_HEARTBEAT=<path>` makes the scorer's block
+  loop, the match chunk's tile loop and the warp's block loop touch that file (≤ 1/s); a caller's
+  watchdog can detect a stalled loop independent of map size. Off unless the variable is set.
+  Motivation: two cloud registrations of the 2026-09-08 collaring multispectral map blocked in the
+  second scoring pass until the one-hour cap; the cause is still unknown and this makes the next
+  hang fail fast with a stack dump (the dump is the caller's job). `tidysurvey/heartbeat.py`,
+  `tests/test_heartbeat.py`.
 - **0.3.2** — registration memory independent of map size. The dense
   registration no longer materialises the native-resolution validity mask
   (one byte per output pixel, 4.8 GB for a 92k × 52k ortho) or the

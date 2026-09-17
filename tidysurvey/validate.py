@@ -31,6 +31,8 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import from_origin
 from rasterio.vrt import WarpedVRT
+
+from . import heartbeat as _HB
 from rasterio.windows import Window
 from . import bands as _B
 
@@ -129,7 +131,7 @@ def registration_r_cells(ms_path, anchor_path, out_tif, cell_px=128, res=None,
                      WarpedVRT(m, resampling=Resampling.nearest, **vrt_kw))
         return tls.v
 
-    def do_block(bc):
+    def _do_block(bc):
         r0, c0 = bc
         vg, va_, mg, mv = get_v()
         bh, bw = min(block, H - r0), min(block, W - c0)
@@ -162,6 +164,12 @@ def registration_r_cells(ms_path, anchor_path, out_tif, cell_px=128, res=None,
                        c0 // cell_px:c0 // cell_px + bw // cell_px]
             for k, v in out.items():
                 acc[k][sl] += v
+
+    def do_block(bc):                                   # one heartbeat per block, skipped or scored
+        try:
+            _do_block(bc)
+        finally:
+            _HB.beat()
 
     blocks = [(r0, c0) for r0 in range(0, H, block) for c0 in range(0, W, block)]
     with ThreadPoolExecutor(max_workers=workers) as ex:

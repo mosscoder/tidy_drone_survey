@@ -35,6 +35,7 @@ from rasterio.enums import Resampling as _Resampling
 from affine import Affine as _Affine
 from . import fields as _F
 from . import bands as _B
+from . import heartbeat as _HB
 
 _TILE_H, _TILE_W = 480, 640
 _FS = 64                     # pooling cell (px)
@@ -198,6 +199,7 @@ def _run_reg_chunk(work_dir, chunk_idx):
     ans, dss, n_used, rdm, rda, inf = [], [], 0, 0.0, 0.0, 0.0
     for (r0, c0) in sub:
         r0, c0 = int(r0), int(c0)
+        _HB.beat()                                          # one heartbeat per tile, matched or skipped
         win = _Window(c0, r0, tw, th)
         t = _time.time()
         spec = vm.read(st["spec_bands"][:3], window=win)     # first (<=3) spectral bands
@@ -622,6 +624,7 @@ def register_survey_dense(
         np.copyto(wout, outb[:, iy:iy + bh2, ix:ix + bw2])
         with wlock:
             dst.write(wout, window=_Window(c0 - c0b, r0 - r0b, bw2, bh2))
+        _HB.beat()                                              # one heartbeat per warp block
 
     # column-major so a worker's consecutive blocks share a field column stripe
     wblocks = [(r0, c0) for c0 in range(c0b, c1b, _BLOCK) for r0 in range(r0b, r1b, _BLOCK)]
