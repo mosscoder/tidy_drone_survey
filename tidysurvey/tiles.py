@@ -63,7 +63,7 @@ def build_pmtiles(src, dst, tile_px=512, quality=85, min_zoom=8, max_zoom=None,
     """
     import faulthandler
     from PIL import Image
-    from pmtiles.tile import Compression, TileType, zxy_to_tileid
+    from pmtiles.tile import Compression, TileType, tileid_to_zxy, zxy_to_tileid
     from pmtiles.writer import write as pm_write
 
     faulthandler.enable()
@@ -162,6 +162,7 @@ def build_pmtiles(src, dst, tile_px=512, quality=85, min_zoom=8, max_zoom=None,
         return tileid, buf.getvalue()
 
     written = skipped = 0
+    zooms_written = set()
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     with pm_write(dst) as w:
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -174,6 +175,7 @@ def build_pmtiles(src, dst, tile_px=512, quality=85, min_zoom=8, max_zoom=None,
                     else:
                         w.write_tile(tileid, data)
                         written += 1
+                        zooms_written.add(tileid_to_zxy(tileid)[0])
                 now = time.perf_counter()
                 done = min(i + CHUNK, len(jobs))
                 if now - t_last >= 60 or done == len(jobs):
@@ -197,13 +199,22 @@ def build_pmtiles(src, dst, tile_px=512, quality=85, min_zoom=8, max_zoom=None,
         w.finalize(header, metadata)
 
     # read the archive back like a client would — silent corruption is the
-    # failure mode a build log cannot see
+    # failure mode a build log cannot see.  The writer stamps the zoom range of
+    # the tiles it actually holds: fully transparent tiles are skipped, so a
+    # survey smaller than a pixel at the lowest zooms starts higher than asked
+    # (0.3.4: 0.3.3 compared against the range asked for and failed the build).
+    if not zooms_written:
+        raise RuntimeError(f"pmtiles: every tile of {src} was transparent; nothing to serve")
     from pmtiles.reader import MmapSource, Reader
     with open(dst, "rb") as f:
         hdr = Reader(MmapSource(f)).header()
-    if hdr["tile_type"] != TileType.WEBP or hdr["min_zoom"] != min_zoom \
-            or hdr["max_zoom"] != max_zoom:
-        raise RuntimeError(f"pmtiles read-back mismatch: {hdr}")
+    if hdr["tile_type"] != TileType.WEBP or hdr["min_zoom"] != min(zooms_written) \
+            or hdr["max_zoom"] != max(zooms_written):
+        raise RuntimeError(f"pmtiles read-back mismatch: {hdr} (tiles written at z{min(zooms_written)}..z{max(zooms_written)})")
+    if hdr["min_zoom"] != min_zoom:
+        log(f"    z{min_zoom}..z{hdr['min_zoom'] - 1} held no pixels (the survey is smaller than a pixel there); "
+            f"the archive starts at z{hdr['min_zoom']}")
+    min_zoom, max_zoom = hdr["min_zoom"], hdr["max_zoom"]
     log(f"    read-back OK: webp, z{hdr['min_zoom']}..z{hdr['max_zoom']}, "
         f"{hdr['addressed_tiles_count']} addressed tiles")
 

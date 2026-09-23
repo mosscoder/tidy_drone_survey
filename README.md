@@ -139,6 +139,13 @@ the visible ownership exists and the mission names match.
 
 ## Changes
 
+- **0.3.4** (2026-09-23) — two fixes found by the first season stitch on a cloud VM. `cog.finalize_cog`
+  fetches the GDAL bindings through the lazy import (0.3.3 still named the module-level `gdal` that
+  the lazy-import change removed, so every COG finalize raised `NameError`). `tiles.build_pmtiles`
+  checks the archive against the zooms it actually wrote: a survey smaller than a pixel at the lowest
+  zooms writes no tiles there, the pmtiles writer stamps the range it holds, and 0.3.3 failed the
+  build (the run loop logs "web map failed" and carries on without the viewer). Tests write a real
+  COG and a real archive for a 160 m survey (`tests/test_cog_tiles.py`).
 - **0.3.3** (2026-09-17) — heartbeat hook: `TIDYSURVEY_HEARTBEAT=<path>` makes the scorer's block
   loop, the match chunk's tile loop and the warp's block loop touch that file (≤ 1/s); a caller's
   watchdog can detect a stalled loop independent of map size. Off unless the variable is set.

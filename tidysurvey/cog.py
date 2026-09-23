@@ -32,6 +32,8 @@ def finalize_cog(src, dst, lossless=True, level=9, blocksize=512,
     lossless=False : ZSTD base + WEBP overviews — the visible viewing mosaic
                      (zoom-outs are for looking at; the base stays lossless).
     """
+    gdal = _gdal()                                 # 0.3.4: the bindings through the lazy import (0.3.3 named a
+                                                   #   module-level `gdal` that 404e00f had removed: NameError)
     workers = workers or max(1, (os.cpu_count() or 4) - 1)
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     opts = [
@@ -44,6 +46,6 @@ def finalize_cog(src, dst, lossless=True, level=9, blocksize=512,
         opts += ["OVERVIEW_COMPRESS=WEBP", f"OVERVIEW_QUALITY={overview_quality}"]
     gdal.SetConfigOption("GDAL_CACHEMAX", "8192")
     log(f"[cog] {src} -> {dst} ({'lossless' if lossless else 'webp overviews'})")
-    ds = _gdal().Translate(str(dst), str(src), format="COG", creationOptions=opts)
+    ds = gdal.Translate(str(dst), str(src), format="COG", creationOptions=opts)
     ds = None
     return str(dst)
