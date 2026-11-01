@@ -12,10 +12,7 @@ import rasterio
 from rasterio.transform import from_origin
 from rasterio.enums import ColorInterp
 
-os.environ.setdefault("TIDYSURVEY_REG_FAKE", "1")     # registration test: synthetic matcher
-os.environ.setdefault("TIDYSURVEY_REG_CHUNK", "4")
-
-from tidysurvey import bands as B                      # noqa: E402
+from tidysurvey import bands as B
 
 NAMES = ["Red", "Green", "NIR", "RedEdge"]
 CRS = "EPSG:32611"
@@ -135,7 +132,7 @@ class TestBandLaw(unittest.TestCase):
 
 
 class TestRegistrationBandLaw(unittest.TestCase):
-    """A 6-band DroneDeploy-shaped mission registered (fake matcher) to an RGBA anchor."""
+    """A 6-band DroneDeploy-shaped mission registered (eFOLKI) to an RGBA anchor of the same ground."""
     @classmethod
     def setUpClass(cls):
         import tidysurvey.registration as R
@@ -152,8 +149,9 @@ class TestRegistrationBandLaw(unittest.TestCase):
         alpha[700:760, 900:960] = 0                                 # alpha-only hole
         six = np.concatenate([spec, spec[2:3], alpha[None]], 0)
         cls.mission = f"{cls.tmp}/mission6.tif"; _write(cls.mission, six, tag_alpha=True)
-        rgba = np.concatenate([rng.integers(40, 210, (3, H, W)).astype(np.uint8),
+        rgba = np.concatenate([np.roll(spec[:3], (1, -1), axis=(1, 2)),            # the same ground, 1 px off
                                np.full((1, H, W), 255, np.uint8)], 0)
+        rgba[:3, :300, :300] = 40
         cls.anchor = f"{cls.tmp}/anchor.tif"; _write(cls.anchor, rgba, tag_alpha=True)
         cls.out = f"{cls.tmp}/registered.tif"; cls.qa = f"{cls.tmp}/qa.json"
         cls.summary = R.register_survey_dense(cls.mission, cls.anchor, cls.out, resolution_m=0.1,
@@ -176,7 +174,7 @@ class TestRegistrationBandLaw(unittest.TestCase):
         self.assertEqual(json.load(open(self.qa))["alpha"], "tagged")
 
     def test_spectral_content_is_the_first_four(self):
-        # the fake matcher shifts by (0.6, -0.4) px: bands correlate strongly with their source,
+        # a one-pixel move keeps every band strongly correlated with its source,
         # and band 4 (RedEdge) must NOT be the NIR duplicate
         with rasterio.open(self.out) as s:
             out = s.read([1, 2, 3, 4]).astype(np.float32)

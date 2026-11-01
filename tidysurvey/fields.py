@@ -1,44 +1,30 @@
-"""The shared correction engine: one recipe, used by stitching and alignment.
+"""The seam composite, and the small helpers the seam merge shares.
 
-    Find how two overlapping images disagree by matching many points between
-    them (LoFTR on grayscale tiles). Turn those matches into a SMOOTH
-    correction that varies gently across the map (per-tile outlier rejection
-    -> per-cell pooled medians -> corroboration against neighbours -> linear
-    field with nearest fill). Apply it only near the seam (tapered) or move
-    a whole mission toward the reference. Judge the result by agreement with
-    a trusted reference, never by the fit's own numbers.
+The seam merge (merge.seam_merge) measures each pair of flights with eFOLKI
+(efolki.py) where they meet, splits the offsets over the flights at every pixel
+of the 1 m band, and composites here: outside the band every pixel is its single
+owner's, verbatim; inside it the meeting owners are moved by their share of the
+offset, confined by a taper, and cross-faded.
 
-What changes between the callers is only *what the correction carries* and
-*what is treated as already correct*:
+The LoFTR machinery that used to live here (matching tiles, pooled and
+corroborated cells, smooth fields, the free-gauge node solve) is at tag v0.3.4.
 
-  - merge.seam_merge : per-seam-pair fields, FREE-GAUGE joint solve (no
-    flight is the reference; corrections split evenly), applied in a tapered
-    band so interiors stay byte-identical.
-  - registration.register_survey_dense : one field per mission, ANCHORED
-    (the base map is the truth; the mission moves fully).
-
-Ported from the audited implementations (01_merge/poc/seamwalk + feather_blend,
-02_registration/poc/m2_full) — the code paths that produced the audit's
-validated numbers (seam r 0.40->0.62; registration median r 0.685->0.863).
+Ported from the audited implementations (01_merge/poc/seamwalk + feather_blend).
 """
 from __future__ import annotations
 
-import math
-from collections import defaultdict
-
 import numpy as np
 import cv2
-from scipy.interpolate import griddata
 from scipy.ndimage import distance_transform_edt
 
 cv2.setNumThreads(1)   # callers parallelise at the block level; no nested pools
 
 
 # --------------------------------------------------------------------------- #
-# grayscale + fields
+# grayscale + coarse-to-native
 # --------------------------------------------------------------------------- #
 def gray_stretch(spec: np.ndarray) -> np.ndarray:
-    """[0,1] contrast-stretched grayscale for LoFTR: equal-weight mean of the
+    """[0,1] contrast-stretched grayscale (the seam measurement's input): equal-weight mean of the
     (first) bands + 2-98 percentile stretch. Handles low-contrast inputs and
     int16 sources (nodata sentinels like -32768 are zeroed before the mean —
     the robustness the first-gen chip loader gained in its final WIP fix)."""
@@ -49,140 +35,6 @@ def gray_stretch(spec: np.ndarray) -> np.ndarray:
         return np.zeros_like(g, np.float32)
     lo, hi = np.percentile(g[m], 2), np.percentile(g[m], 98)
     return np.clip((g - lo) / (hi - lo + 1e-6), 0, 1).astype(np.float32)
-
-
-def griddata_fill(pts, vals, EX, EY):
-    """Linear interpolation with nearest-neighbour fill outside the hull."""
-    if len(vals) >= 4:
-        lin = griddata(pts, vals, (EX, EY), method="linear")
-        near = griddata(pts, vals, (EX, EY), method="nearest")
-        return np.where(np.isfinite(lin), lin, near)
-    if len(vals) >= 1:
-        return griddata(pts, vals, (EX, EY), method="nearest")
-    return np.full(EX.shape, np.nan)
-
-
-def field_lattice(pts_px, vals, out_w, out_h, sample_ds=8) -> np.ndarray:
-    """The sample_ds-decimated lattice fill_field evaluates on, as float32
-    (ceil(out_h/sample_ds), ceil(out_w/sample_ds)). fill_field(...) is exactly
-    cv2.resize(field_lattice(...), (out_w, out_h), INTER_LINEAR)."""
-    ex = np.arange(0, out_w, sample_ds)
-    ey = np.arange(0, out_h, sample_ds)
-    EX, EY = np.meshgrid(ex, ey)
-    g = np.nan_to_num(griddata_fill(np.asarray(pts_px, float), np.asarray(vals), EX, EY))
-    return g.astype(np.float32)
-
-
-def fill_field(pts_px, vals, out_w, out_h, sample_ds=8) -> np.ndarray:
-    """Sparse (x,y)->val samples -> dense (out_h,out_w) float32 field.
-    Evaluated on a sample_ds-decimated lattice then bilinearly resized —
-    the corrections are smooth, so sparse evaluation reconstructs them.
-    For fields too large to hold, StreamedField serves the same values by
-    column band without the (out_h, out_w) array."""
-    if len(vals) < 1:
-        return np.zeros((out_h, out_w), np.float32)
-    g = field_lattice(pts_px, vals, out_w, out_h, sample_ds)
-    return cv2.resize(g, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-
-
-class StreamedField:
-    """fill_field(pts_px, vals, out_w, out_h) without the (out_h, out_w) array.
-
-    cv2.resize INTER_LINEAR is separable: a horizontal pass over the lattice
-    rows, then a vertical pass. This holds only the horizontal pass,
-    (lat_h, out_w) float32 — 1/sample_ds of the full field — and serves any
-    column band of the full field on demand by running the vertical pass on
-    those columns (a resize whose horizontal scale is 1 is an exact copy), so
-    every value is bit-identical to fill_field(...)[:, c0:c1]
-    (tests/test_field_streamed.py). Memory no longer scales with out_h*out_w.
-    """
-    def __init__(self, pts_px, vals, out_w, out_h, sample_ds=8):
-        self.out_w, self.out_h = int(out_w), int(out_h)
-        if len(vals) < 1:
-            self.hp = None
-        else:
-            lat = field_lattice(pts_px, vals, out_w, out_h, sample_ds)
-            self.hp = cv2.resize(lat, (self.out_w, lat.shape[0]), interpolation=cv2.INTER_LINEAR)
-
-    def columns(self, c0, c1) -> np.ndarray:
-        """Columns [c0, c1) of the full field, all out_h rows: float32 (out_h, c1 - c0)."""
-        c0, c1 = max(0, int(c0)), min(self.out_w, int(c1))
-        if self.hp is None:
-            return np.zeros((self.out_h, c1 - c0), np.float32)
-        return cv2.resize(np.ascontiguousarray(self.hp[:, c0:c1]), (c1 - c0, self.out_h),
-                          interpolation=cv2.INTER_LINEAR)
-
-    def absmax(self, band=1024) -> float:
-        """max |field| over the whole grid, streamed by column band."""
-        if self.hp is None:
-            return 0.0
-        m = 0.0
-        for c0 in range(0, self.out_w, band):
-            m = max(m, float(np.abs(self.columns(c0, c0 + band)).max()))
-        return m
-
-    def sample(self, mapx, mapy, band=1024) -> np.ndarray:
-        """cv2.remap(field, mapx, mapy, INTER_LINEAR, BORDER_REPLICATE) for finite
-        2-D float32 maps, streamed by column band of the field: a band [c0, c1)
-        plus one overlap column serves every sample whose x lies in [c0, c1);
-        the first and last bands own everything beyond the grid, so the
-        replicate border is the grid's own. Bit-identical to the whole-array remap."""
-        mapx = np.asarray(mapx, np.float32); mapy = np.asarray(mapy, np.float32)
-        out = np.zeros(mapx.shape, np.float32)
-        if self.hp is None:
-            return out
-        for c0 in range(0, self.out_w, band):
-            c1 = min(self.out_w, c0 + band)
-            lo = -np.inf if c0 == 0 else c0
-            hi = np.inf if c1 == self.out_w else c1
-            sel = (mapx >= lo) & (mapx < hi)
-            if not sel.any():
-                continue
-            sub = self.columns(c0, min(self.out_w, c1 + 1))
-            r = cv2.remap(sub, mapx - np.float32(c0), mapy, cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_REPLICATE)
-            out[sel] = r[sel]
-        return out
-
-
-def resize_nn_offsets(src_n, dst_n) -> np.ndarray:
-    """Source index of each destination index of cv2.resize(..., INTER_NEAREST)
-    along one axis, exactly as OpenCV computes it (resizeNN: floor(x * (1 / (dst/src))),
-    clipped to src_n - 1). Gathering coarse[np.ix_(rows, cols)] reproduces any
-    window of the nearest-upsampled whole without materialising it."""
-    inv = 1.0 / (np.float64(dst_n) / np.float64(src_n))
-    return np.minimum(np.floor(np.arange(dst_n, dtype=np.float64) * inv).astype(np.int64), src_n - 1)
-
-
-def sample_field_nodes(pts_px, vals, out_w, out_h, node_r, node_c, sample_ds=8):
-    """Value of fill_field(pts,vals,out_w,out_h) at the coarse nodes (node_r,
-    node_c) WITHOUT materializing the full (out_h,out_w) field — the memory
-    win for the joint solve, which only needs the field at corridor nodes.
-
-    Builds the SAME sample_ds lattice as fill_field, then samples it with the
-    same INTER_LINEAR kernel cv2.resize uses (via cv2.remap with the matching
-    (p+0.5)*scale-0.5 coordinate convention). Validated bit-close to
-    fill_field(...)[node] in the corridor regime — see the solve-equivalence
-    test (max |Δ| < 1e-3 px where the solve operates; divergence only in deep
-    extrapolation past the correspondence hull, which corridor_c excludes)."""
-    node_r = np.asarray(node_r, np.float32); node_c = np.asarray(node_c, np.float32)
-    n = len(node_r)
-    if len(vals) < 1 or n == 0:
-        return np.zeros(n, np.float32)
-    ex = np.arange(0, out_w, sample_ds); ey = np.arange(0, out_h, sample_ds)
-    EX, EY = np.meshgrid(ex, ey)
-    g = np.nan_to_num(griddata_fill(np.asarray(pts_px, float),
-                                    np.asarray(vals), EX, EY)).astype(np.float32)
-    lat_h, lat_w = g.shape
-    mapx = ((node_c + 0.5) * (lat_w / out_w) - 0.5).astype(np.float32)
-    mapy = ((node_r + 0.5) * (lat_h / out_h) - 0.5).astype(np.float32)
-    out = np.empty(n, np.float32)
-    CH = 30000                                   # cv2.remap needs each map dim < SHRT_MAX
-    for i in range(0, n, CH):
-        out[i:i + CH] = cv2.remap(g, mapx[i:i + CH].reshape(1, -1),
-                                  mapy[i:i + CH].reshape(1, -1), cv2.INTER_LINEAR,
-                                  borderMode=cv2.BORDER_REPLICATE).ravel()
-    return out
 
 
 def upsample_block(arr, fac, r0, c0, bh, bw, interp=cv2.INTER_LINEAR, out=None):
@@ -202,237 +54,6 @@ def upsample_block(arr, fac, r0, c0, bh, bw, interp=cv2.INTER_LINEAR, out=None):
         big = cv2.resize(sub, (dw, dh), interpolation=interp)
     oy, ox = r0 - cr0 * fac, c0 - cc0 * fac
     return big[oy:oy + bh, ox:ox + bw]
-
-
-# --------------------------------------------------------------------------- #
-# matching
-# --------------------------------------------------------------------------- #
-def loftr_device():
-    import torch
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def build_matcher(device=None):
-    import torch
-    import kornia.feature as KF
-    device = device or loftr_device()
-    return KF.LoFTR(pretrained="outdoor").to(device).eval(), device
-
-
-def release_matcher_cache(device):
-    """Return the accelerator's cached allocator memory to the OS. torch's
-    MPS (and CUDA) caching allocator grows across thousands of match_tile
-    calls and never shrinks on its own — on Apple Silicon unified memory
-    that growth counts against system RAM (observed ~100 GB process
-    footprint over a long seam walk). Frees only cached, unused blocks, so
-    it is always safe; the next allocations just pay to re-allocate. Call
-    every ~100 tiles and at phase boundaries (del the matcher first at a
-    boundary so its weights free too)."""
-    import gc
-    import torch
-    gc.collect()
-    dtype = getattr(device, "type", None)
-    if dtype == "mps":
-        torch.mps.empty_cache()
-    elif dtype == "cuda":
-        torch.cuda.empty_cache()
-
-
-def match_tile(matcher, device, ga, gb, reject_px=4.0, min_tile=8):
-    """LoFTR on one grayscale tile pair -> (anchors_px, deltas_px) after the
-    per-tile robust gate: keep matches within reject_px of the tile's median
-    displacement; drop the tile if fewer than min_tile survive."""
-    import torch
-    ta = torch.from_numpy(ga)[None, None].to(device)
-    tb = torch.from_numpy(gb)[None, None].to(device)
-    with torch.inference_mode():
-        out = matcher({"image0": ta, "image1": tb})
-    k0 = out["keypoints0"].cpu().numpy()
-    k1 = out["keypoints1"].cpu().numpy()
-    if len(k0) < 4:
-        return None
-    d = k1 - k0
-    med = np.median(d, axis=0)
-    keep = np.hypot(*(d - med).T) < reject_px
-    if keep.sum() < min_tile:
-        return None
-    return k0[keep], d[keep]
-
-
-def match_tile_pre(matcher, device, ta_buf, tb_buf, ga, gb, reject_px=4.0, min_tile=8):
-    """match_tile with PREALLOCATED device buffers reused across a chunk
-    (copy_ in place, no fresh per-call tensor) — the audit's low-churn config
-    that keeps MPS inference flat within a registration subprocess chunk. Same
-    result as match_tile for the same inputs."""
-    import torch
-    ta_buf.copy_(torch.from_numpy(ga)[None, None])
-    tb_buf.copy_(torch.from_numpy(gb)[None, None])
-    with torch.inference_mode():
-        out = matcher({"image0": ta_buf, "image1": tb_buf})
-    k0 = out["keypoints0"].cpu().numpy()
-    k1 = out["keypoints1"].cpu().numpy()
-    if len(k0) < 4:
-        return None
-    d = k1 - k0
-    med = np.median(d, axis=0)
-    keep = np.hypot(*(d - med).T) < reject_px
-    if keep.sum() < min_tile:
-        return None
-    return k0[keep], d[keep]
-
-
-def pool_to_cells(an, d, fs=64, min_cell=2):
-    """Pool raw matches into fs-px cells -> per-cell (mean anchor, median
-    displacement). Sparse-but-robust nodes for the smooth field."""
-    cyi = (an[:, 1] // fs).astype(np.int64)
-    cxi = (an[:, 0] // fs).astype(np.int64)
-    acc = defaultdict(list)
-    for j in range(len(an)):
-        acc[(cyi[j], cxi[j])].append((an[j, 0], an[j, 1], d[j, 0], d[j, 1]))
-    pts, vx, vy = [], [], []
-    for lst in acc.values():
-        a = np.array(lst)
-        if len(a) < min_cell:
-            continue
-        pts.append((a[:, 0].mean(), a[:, 1].mean()))
-        m = np.median(a[:, 2:4], axis=0)
-        vx.append(m[0]); vy.append(m[1])
-    if not pts:
-        return np.zeros((0, 2)), np.zeros(0), np.zeros(0)
-    return np.array(pts, float), np.array(vx), np.array(vy)
-
-
-def corroborate_cells(pts, vx, vy, fs=64, min_nb=8, reject_px=4.0):
-    """Neighbourhood-corroboration gate: a cell survives only if >= min_nb of
-    its 5x5 ring agree, and its own displacement sits within reject_px of the
-    ring median. Kills isolated hallucinated matches."""
-    if len(pts) == 0:
-        return np.zeros(0, bool)
-    cyi = (pts[:, 1] // fs).astype(np.int64)
-    cxi = (pts[:, 0] // fs).astype(np.int64)
-    idx = {(cyi[j], cxi[j]): j for j in range(len(pts))}
-    keep = np.ones(len(pts), bool)
-    for j in range(len(pts)):
-        nx, ny = [], []
-        for dy in range(-2, 3):
-            for dx in range(-2, 3):
-                if dy == 0 and dx == 0:
-                    continue
-                k = idx.get((cyi[j] + dy, cxi[j] + dx))
-                if k is not None:
-                    nx.append(vx[k]); ny.append(vy[k])
-        if len(nx) < min_nb:
-            keep[j] = False
-        elif math.hypot(vx[j] - np.median(nx), vy[j] - np.median(ny)) > reject_px:
-            keep[j] = False
-    return keep
-
-
-# --------------------------------------------------------------------------- #
-# the free-gauge joint solve (stitching)
-# --------------------------------------------------------------------------- #
-def solve_free_gauge(valid_c, efield_sp, corridor_c, spacing_c, n_sources,
-                     w_gauge=0.05, anchored_index=None, sample_ds=8):
-    """Joint solve over ALL pair edges on corridor nodes: for every node where
-    sources i and j overlap, (x_j - x_i) should equal the measured seam field;
-    a small gauge ridge (w_gauge * x = 0) pins the free translation. With
-    anchored_index set, that source's unknowns are excluded (held at zero) —
-    the 'pin everything to one reference flight' fallback.
-
-    Memory-frugal: the pair fields are SPARSE (never densified), sampled at the
-    solve nodes on the fly, and each solved per-source field is returned as its
-    sample_ds LATTICE (~Wc/8 x Hc/8, tens of MB) rather than the full 2.7 GB
-    coarse field. The composite upsamples the lattice per block. This removes
-    the ~114 GB the old dense path built at the walk->solve boundary.
-
-    valid_c   : list of n coarse validity masks (Hc,Wc)
-    efield_sp : {(i,j): (pts, vx, vy)} SPARSE seam correspondences (coarse px)
-    corridor_c: coarse mask of nodes to solve on (near-fault corridor)
-    Returns   : (lat, sol, n_nodes, n_unknowns)
-                lat[oi] = (fx_lat, fy_lat) float32 (Hc//sd, Wc//sd), or None
-                sol[oi] = (P, cx, cy) sparse solved nodes for source oi, or None
-                          (lets a caller evaluate solved values anywhere cheaply)
-    """
-    import scipy.sparse as sp
-    from scipy.sparse.linalg import lsqr
-
-    Hc, Wc = valid_c[0].shape
-    rr = list(range(spacing_c // 2, Hc, spacing_c))
-    cc = list(range(spacing_c // 2, Wc, spacing_c))
-    nodes = [(r, c) for r in rr for c in cc if corridor_c[r, c]]
-    nr = np.array([r for r, c in nodes]); nc = np.array([c for r, c in nodes])
-    var = {}
-    for oi in range(n_sources):
-        if oi == anchored_index:
-            continue
-        V = valid_c[oi]
-        for (r, c) in nodes:
-            if V[r, c]:
-                var[(oi, r, c)] = len(var)
-
-    rows, cols, data, bx, by = [], [], [], [], []
-    nrow = [0]
-
-    def add(terms, rx, ry):
-        for vi, co in terms:
-            rows.append(nrow[0]); cols.append(vi); data.append(co)
-        bx.append(rx); by.append(ry); nrow[0] += 1
-
-    pair_terms = {}                              # (oi,oj) -> [(ti,tj,fxv,fyv)] for the residual
-    for (oi, oj), (pts, vx, vy) in efield_sp.items():
-        co = valid_c[oi] & valid_c[oj]
-        # dense-equivalent field values at the nodes, without the full field
-        fxn = sample_field_nodes(pts, vx, Wc, Hc, nr, nc, sample_ds)
-        fyn = sample_field_nodes(pts, vy, Wc, Hc, nr, nc, sample_ds)
-        terms = pair_terms.setdefault((oi, oj), [])
-        for k, (r, c) in enumerate(nodes):
-            if not co[r, c]:
-                continue
-            ti = var.get((oi, r, c)); tj = var.get((oj, r, c))
-            fxv, fyv = float(fxn[k]), float(fyn[k])
-            if oi == anchored_index and tj is not None:      # x_j = f
-                add([(tj, 1.0)], fxv, fyv); terms.append((None, tj, fxv, fyv))
-            elif oj == anchored_index and ti is not None:    # -x_i = f
-                add([(ti, -1.0)], fxv, fyv); terms.append((ti, None, fxv, fyv))
-            elif ti is not None and tj is not None:          # x_j - x_i = f
-                add([(tj, 1.0), (ti, -1.0)], fxv, fyv); terms.append((ti, tj, fxv, fyv))
-    for (oi, r, c), vi in var.items():
-        add([(vi, w_gauge)], 0.0, 0.0)
-
-    if nrow[0] == 0 or len(var) == 0:
-        return [None] * n_sources, [None] * n_sources, {}, 0, 0
-    A = sp.coo_matrix((data, (rows, cols)), shape=(nrow[0], len(var))).tocsr()
-    cx = lsqr(A, np.array(bx), atol=1e-8, btol=1e-8)[0]
-    cy = lsqr(A, np.array(by), atol=1e-8, btol=1e-8)[0]
-
-    # post-solve residual per pair: median |(x_j - x_i) - f_meas| at its nodes
-    resid = {}
-    for pr, terms in pair_terms.items():
-        rr = [np.hypot((0.0 if tj is None else cx[tj]) - (0.0 if ti is None else cx[ti]) - fxv,
-                       (0.0 if tj is None else cy[tj]) - (0.0 if ti is None else cy[ti]) - fyv)
-              for ti, tj, fxv, fyv in terms]
-        resid[pr] = float(np.median(rr)) if rr else None
-
-    ex = np.arange(0, Wc, sample_ds); ey = np.arange(0, Hc, sample_ds)
-    EX, EY = np.meshgrid(ex, ey)
-    lat = [None] * n_sources; sol = [None] * n_sources
-    for oi in range(n_sources):
-        P, vxo, vyo = [], [], []
-        for (r, c) in nodes:
-            vi = var.get((oi, r, c))
-            if vi is not None:
-                P.append((c, r)); vxo.append(cx[vi]); vyo.append(cy[vi])
-        if not P:
-            continue
-        P = np.array(P, float)
-        sol[oi] = (P, np.asarray(vxo), np.asarray(vyo))
-        lat[oi] = (np.nan_to_num(griddata_fill(P, vxo, EX, EY)).astype(np.float32),
-                   np.nan_to_num(griddata_fill(P, vyo, EX, EY)).astype(np.float32))
-    return lat, sol, resid, len(nodes), len(var)
 
 
 # --------------------------------------------------------------------------- #

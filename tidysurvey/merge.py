@@ -439,9 +439,11 @@ def generate_combined_boundaries(
 """Everything below is the refactor's seam-walk engine, ported from the audited
 implementation (audit repo: 01_merge/poc/seamwalk/seamwalk_full.py) that built
 the 2024 4-batch visible base map (seam texture-r 0.40 -> 0.62, interiors
-byte-identical, blend footprint 0.10%). The legacy hull/seamline/mosaic
-functions above are retained; `find_seamlines`-style ownership is computed
-internally here on a coarse grid."""
+byte-identical, blend footprint 0.10%). Since 0.4.0 the seams are measured with
+eFOLKI instead of LoFTR (audit 01_merge/report.md section 8.5: on the 3 km seam N
+agreement in the band rose from 0.48 to 0.61 against LoFTR's 0.60, in 72 s
+against 273 s). The legacy hull/seamline/mosaic functions above are retained;
+`find_seamlines`-style ownership is computed internally here on a coarse grid."""
 
 import json as _json
 import threading as _threading
@@ -458,14 +460,10 @@ from scipy.ndimage import distance_transform_edt as _edt
 from . import fields as _F
 from . import bands as _B
 
-_TILE_H, _TILE_W = 480, 640          # LoFTR tile
-_FS = 120                            # seam pooling cell (px)
-_SOLVE_S = 120                       # solve node spacing (px)
-_W_GAUGE = 0.05                      # gauge ridge (free translation pin)
-_REJECT_PX, _MIN_TILE, _MIN_CELL = 4.0, 8, 2
-_SOLVE_CORR_M = 4.0                  # solve corridor half-width (m)
 _GEOM_DS = 8                         # coarse geometry decimation
 _HALO = 64                           # block halo so band shifts never sample off-block
+_EF_PAD = 512                        # eFOLKI's context around a faultline: twice its reach (efolki.REACH_PX)
+_STAT_EVERY = 4                      # seam statistics sample every 4th faultline pixel and band pixel
 
 
 def _write_json_atomic(path, obj):
@@ -559,10 +557,19 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                gate reads), band 2 = the owner index everywhere (what
                owner_in reads). 0 = no input covers the cell.
 
+    The seams (eFOLKI, efolki.py): in every render block that has seam band,
+    each pair of flights that meet there is measured on the merge grid in the
+    box around their faultline, padded by twice eFOLKI's reach (_EF_PAD), where
+    both have data. At each band pixel the pair offsets are split over the
+    flights covering it (minimum-norm least squares: x_j - x_i = e_ij for every
+    measured pair; with gauge="anchored" the first input stays put). Audit
+    01_merge/report.md section 8.5 and 02_registration/METHOD.md.
+
     Geometry only — raw band values are never altered outside the seam band,
     and inside it only cross-faded between the meeting owners. Writes a stage
-    report (per-seam matches, median shift, post-solve residual) for the seam
-    tripwire and the quality report.
+    report (per seam: its length, the median offset between the two flights on
+    the faultline, the metres over 50 cm, the median misfit of the split) for
+    the seam tripwire and the quality report.
     """
     t0 = _time.perf_counter()
     names = [n for n, _ in inputs]
@@ -745,125 +752,29 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         log(f"[seam_merge] ownership only ({report['seconds']:.0f}s) -> {ownership_out}")
         return report
 
-    # ---- per-pair seam walk (LoFTR), CHECKPOINTED -------------------------- #
-    # each pair's sparse result is persisted the moment it finishes, so a crash
-    # (or a jetsam kill at the solve) never re-walks a completed seam. efield is
-    # kept SPARSE in RAM (a few MB) -- never densified -- for the low-memory solve.
-    ckpt = _Path(str(out).rsplit(".", 1)[0] + "_seam_ckpt")
-    ckpt.mkdir(parents=True, exist_ok=True)
-    mpath = ckpt / "_grid.json"
-    if mpath.exists() and _json.loads(mpath.read_text()) != manifest:
-        for f in ckpt.glob("*.npz"):
-            f.unlink()
-        log("    seam checkpoint: plan changed -> stale cache cleared")
-    mpath.write_text(_json.dumps(manifest))
-
+    # ---- the seams: which flights meet (coarse ownership) ------------------- #
+    # Measured later, block by block inside the render, where the band is.
     def _adjacency(ia, ib):
         A = owner_c == ia; B = owner_c == ib
         f = np.zeros((Hc, Wc), bool)
         adj = (A[:, :-1] & B[:, 1:]) | (B[:, :-1] & A[:, 1:]); f[:, :-1] |= adj; f[:, 1:] |= adj
         adj = (A[:-1, :] & B[1:, :]) | (B[:-1, :] & A[1:, :]); f[:-1, :] |= adj; f[1:, :] |= adj
-        return f
+        return f & cov2_c
 
-    matcher = dev = vmain = None
-    efield_sp, seams = {}, []
-    all_pairs = list(_combinations(range(N), 2))
-    n_cached = sum((ckpt / f"seam_{ia}_{ib}.npz").exists() for ia, ib in all_pairs)
-    if n_cached:
-        log(f"    seam checkpoint: resuming — {n_cached}/{len(all_pairs)} pairs already on disk")
-    for ia, ib in all_pairs:
-        cf = ckpt / f"seam_{ia}_{ib}.npz"
-        if cf.exists():
-            z = np.load(cf, allow_pickle=True)
-            if bool(z["ok"]):
-                efield_sp[(ia, ib)] = (z["pts"], z["vx"], z["vy"])
-                seams.append(dict(z["rec"].item()))
-            continue
-        f_ij = _adjacency(ia, ib)
-        if not f_ij.any():
-            np.savez(cf, ok=False)
-            continue
-        ys, xs = np.where(f_ij)
-        seen, seeds = set(), []
-        for y, x in zip(ys * _GEOM_DS + _GEOM_DS // 2, xs * _GEOM_DS + _GEOM_DS // 2):
-            key = (y // _TILE_H, x // _TILE_W)
-            if key not in seen:
-                seen.add(key); seeds.append((int(y), int(x)))
-        if matcher is None:                      # build the GPU matcher + read VRTs lazily
-            matcher, dev = _F.build_matcher()
-            vmain = {i: _WarpedVRT(rasterio.open(paths[i]), crs=out_crs, transform=OUT_TR,
-                                   width=OUT_W, height=OUT_H, resampling=Resampling.bilinear)
-                     for i in range(N)}
-        log(f"    seam {names[ia]}-{names[ib]}: walking {len(seeds)} corridor tiles "
-            f"(LoFTR on {dev.type}) ...")
-        ans, dss, n_tiles = [], [], 0
-        for n_seed, (y, x) in enumerate(seeds, 1):
-            if n_seed % 100 == 0:
-                _F.release_matcher_cache(dev)   # cap MPS allocator growth
-            if n_seed % 25 == 0:
-                log(f"      [{n_seed}/{len(seeds)}] tiles read+matched, "
-                    f"{n_tiles} usable")
-            r0 = min(max(y - _TILE_H // 2, 0), OUT_H - _TILE_H)
-            c0 = min(max(x - _TILE_W // 2, 0), OUT_W - _TILE_W)
-            a = vmain[ia].read(window=Window(c0, r0, _TILE_W, _TILE_H))
-            b = vmain[ib].read(window=Window(c0, r0, _TILE_W, _TILE_H))
-            va, vb = _valid(ia, a), _valid(ib, b)
-            if va.mean() < 0.4 or vb.mean() < 0.4:
-                continue
-            m = _F.match_tile(matcher, dev,
-                              _F.gray_stretch(a[spec_idx[ia][:3]].astype(np.float32)),
-                              _F.gray_stretch(b[spec_idx[ib][:3]].astype(np.float32)),
-                              _REJECT_PX, _MIN_TILE)
-            if m is None:
-                continue
-            an, d = m
-            ans.append(an + [c0, r0]); dss.append(d); n_tiles += 1
-        if not ans:
-            np.savez(cf, ok=False)
-            log(f"    seam {names[ia]}-{names[ib]}: no usable matches (skipped)")
-            continue
-        an = np.concatenate(ans); d = np.concatenate(dss)
-        pts, vx, vy = _F.pool_to_cells(an, d, _FS, _MIN_CELL)
-        if len(pts) == 0:
-            np.savez(cf, ok=False)
-            continue
-        pts_c = np.stack([pts[:, 0] / _GEOM_DS, pts[:, 1] / _GEOM_DS], 1)   # coarse px
-        vx = np.asarray(vx); vy = np.asarray(vy)
-        med_cm = float(np.median(np.hypot(vx, vy)) * res * 100)
-        rec = dict(pair=f"{names[ia]}-{names[ib]}", ij=[ia, ib], tiles=n_tiles,
-                   matches=int(len(an)), nodes=int(len(pts)), med_shift_cm=round(med_cm, 1))
-        np.savez(cf, ok=True, pts=pts_c, vx=vx, vy=vy, rec=rec)   # <- crash-safe checkpoint
-        efield_sp[(ia, ib)] = (pts_c, vx, vy)
-        seams.append(rec)
-        log(f"    seam {names[ia]}-{names[ib]}: {n_tiles} tiles -> {len(an)} matches "
-            f"-> {len(pts)} nodes (|e|={med_cm:.1f} cm)")
-        del ans, dss, an, d; gc.collect()        # aggressive: free match buffers each pair
-    if matcher is not None:
-        del matcher
-        _F.release_matcher_cache(dev)   # GPU work is done; composite runs for hours
-    if vmain is not None:
-        for v in vmain.values():
-            v.close()
-    if not efield_sp:
-        raise RuntimeError("seam_merge: no seams matched")
+    seam_pairs = [(ia, ib) for ia, ib in _combinations(range(N), 2) if _adjacency(ia, ib).any()]
+    if not seam_pairs:
+        raise RuntimeError("seam_merge: no flight<->flight faultline — nothing to merge")
+    log(f"    {len(seam_pairs)} seams: " + ", ".join(f"{names[i]}-{names[j]}" for i, j in seam_pairs)
+        + f"; measured with eFOLKI in the render, gauge {gauge}")
 
-    # ---- joint solve (SPARSE in, LATTICE out; memory-frugal) --------------- #
-    corridor_c = (D_c <= _SOLVE_CORR_M) & cov2_c
-    anchored = 0 if gauge == "anchored" else None
-    lat_c, sol_c, resid, n_nodes, n_var = _F.solve_free_gauge(
-        valid_c, efield_sp, corridor_c, max(1, round(_SOLVE_S / _GEOM_DS)),
-        N, _W_GAUGE, anchored_index=anchored)
-    log(f"    solve: {n_nodes} corridor nodes, {n_var} unknowns "
-        f"({'anchored to ' + names[0] if anchored is not None else 'free gauge'})")
-    for s in seams:                              # post-solve residual (px -> cm)
-        rp = resid.get(tuple(s["ij"]))
-        s["residual_cm"] = round(rp * res * 100, 1) if rp is not None else None
-
-    # the composite needs only ds_c/D_c/lat_c per block -> free the ~16 GB of
-    # validity masks + ownership before the (never-before-reached) long render
+    # the composite needs only ds_c/D_c per block, and the ownership for the
+    # faultlines -> free the validity masks and read the ownership memmapped
     valid_c = owner_c = cov2_c = None
-    # with a recycled ownership the composite follows it (memmapped, not the EDT argmax)
-    owner_mm = np.load(mmdir / "owner.npy", mmap_mode="r") if owner_in else None
+    gc.collect()
+    owner_mm = np.load(mmdir / "owner.npy", mmap_mode="r")
+    cov2_mm = np.load(mmdir / "cov2.npy", mmap_mode="r")
+    stats = {pr: dict(off=[], resid=[]) for pr in seam_pairs}
+    slock = _threading.Lock()
 
     # ---- streamed N-way composite ------------------------------------------ #
     prof = dict(driver="GTiff", height=OUT_H, width=OUT_W, count=nspec + 1, dtype="uint8",
@@ -890,15 +801,106 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         l, b, r, t = bounds[i]
         return not (bx1 <= l or bx0 >= r or by1 <= b or by0 >= t)
 
-    _FIELD_UP = _GEOM_DS * 8                      # solved lattice (8 coarse-px) -> native px
-    def _lat_block(lat_i, r0, c0, bh, bw):
-        """A block of a source's solved field, upsampled from its lattice (or
-        zero where the source had no solved nodes). Bit-identical to upsampling
-        the full coarse field the old path built (validated)."""
-        if lat_i is None:
-            return (np.zeros((bh, bw), np.float32), np.zeros((bh, bw), np.float32))
-        return (_F.upsample_block(lat_i[0], _FIELD_UP, r0, c0, bh, bw),
-                _F.upsample_block(lat_i[1], _FIELD_UP, r0, c0, bh, bw))
+    def _seam_fields(r0, c0, bh, bw, hr0, hc0, hh, hw, iy, ix, present, val, geom):
+        """The shift of each present flight on the haloed block. Every pair of present
+        flights that share a faultline within _EF_PAD of the block is measured with
+        eFOLKI on the merge grid, in the box around that faultline padded by _EF_PAD,
+        where both have data (no-data filled from the nearest pixel where both do);
+        the pair offsets are then split at each band pixel (minimum-norm least
+        squares over the flights covering it). Records the seam statistics."""
+        from . import efolki as _E
+        pr0, pc0 = max(0, r0 - _EF_PAD), max(0, c0 - _EF_PAD)
+        pr1, pc1 = min(OUT_H, r0 + bh + _EF_PAD), min(OUT_W, c0 + bw + _EF_PAD)
+        cr0, cc0 = pr0 // _GEOM_DS, pc0 // _GEOM_DS
+        own_c = np.asarray(owner_mm[cr0:-(-pr1 // _GEOM_DS), cc0:-(-pc1 // _GEOM_DS)])
+        c2_c = np.asarray(cov2_mm[cr0:-(-pr1 // _GEOM_DS), cc0:-(-pc1 // _GEOM_DS)])
+        V = src_vrts()
+        pos = {i: k for k, i in enumerate(present)}
+        efield = {}
+        for ia, ib in _combinations(present, 2):
+            if (ia, ib) not in stats:
+                continue                                  # these two never share a faultline
+            A = own_c == ia; B = own_c == ib
+            f = np.zeros(own_c.shape, bool)
+            adj = (A[:, :-1] & B[:, 1:]) | (B[:, :-1] & A[:, 1:]); f[:, :-1] |= adj; f[:, 1:] |= adj
+            adj = (A[:-1, :] & B[1:, :]) | (B[:-1, :] & A[1:, :]); f[:-1, :] |= adj; f[1:, :] |= adj
+            f &= c2_c
+            if not f.any():
+                continue
+            ys, xs = np.where(f)
+            br0 = max(pr0, (cr0 + int(ys.min())) * _GEOM_DS - _EF_PAD); br1 = min(pr1, (cr0 + int(ys.max()) + 1) * _GEOM_DS + _EF_PAD)
+            bc0 = max(pc0, (cc0 + int(xs.min())) * _GEOM_DS - _EF_PAD); bc1 = min(pc1, (cc0 + int(xs.max()) + 1) * _GEOM_DS + _EF_PAD)
+            ir0, ir1 = max(br0, hr0), min(br1, hr0 + hh); ic0, ic1 = max(bc0, hc0), min(bc1, hc0 + hw)
+            if ir1 <= ir0 or ic1 <= ic0:
+                continue
+            win = Window(bc0, br0, bc1 - bc0, br1 - br0)
+            a = V[ia].read(window=win); b = V[ib].read(window=win)
+            both = _valid(ia, a) & _valid(ib, b)
+            if not both.any():
+                continue
+            ga = _E.fill_nearest(np.where(both, _F.gray_stretch(a[spec_idx[ia][:3]].astype(np.float32)), 0), both)
+            gb = _E.fill_nearest(np.where(both, _F.gray_stretch(b[spec_idx[ib][:3]].astype(np.float32)), 0), both)
+            del a, b
+            u, v = _E.flow(ga, gb)                        # b(x + e) lines up with a(x)
+            eu = np.full((hh, hw), np.nan, np.float32); ev = eu.copy()
+            sb = np.s_[ir0 - br0:ir1 - br0, ic0 - bc0:ic1 - bc0]
+            sh = np.s_[ir0 - hr0:ir1 - hr0, ic0 - hc0:ic1 - hc0]
+            eu[sh] = np.where(both[sb], u[sb], np.nan); ev[sh] = np.where(both[sb], v[sb], np.nan)
+            efield[(ia, ib)] = (eu, ev)
+            del u, v, ga, gb, both
+        n = len(present)
+        fx = [np.zeros((hh, hw), np.float32) for _ in range(n)]
+        fy = [np.zeros((hh, hw), np.float32) for _ in range(n)]
+        pairs = list(efield)
+        band = geom["in_band"]
+        if pairs:
+            rr, cc = np.where(band)
+            have = np.stack([val[i][rr, cc] for i in present], 1)
+            meas = np.stack([np.isfinite(efield[pr][0][rr, cc]) & have[:, pos[pr[0]]] & have[:, pos[pr[1]]]
+                             for pr in pairs], 1)
+            groups, inv = np.unique(np.c_[have, meas].astype(np.uint8), axis=0, return_inverse=True)
+            inv = inv.ravel()
+            pinned = pos.get(0) if gauge == "anchored" else None
+            for g, key in enumerate(groups):
+                rows = [pairs[q] for q in range(len(pairs)) if key[n + q]]
+                if not rows:
+                    continue
+                sel = np.where(inv == g)[0]
+                A = np.zeros((len(rows), n))
+                for t, (i, j) in enumerate(rows):
+                    A[t, pos[j]], A[t, pos[i]] = 1.0, -1.0
+                if pinned is not None:
+                    A[:, pinned] = 0.0                    # the first input stays put
+                Ap = np.linalg.pinv(A)
+                for comp, out_ in ((0, fx), (1, fy)):
+                    x = Ap @ np.stack([efield[pr][comp][rr[sel], cc[sel]] for pr in rows])
+                    for k in range(n):
+                        out_[k][rr[sel], cc[sel]] = x[k]
+        # seam statistics on the block's core: the offset on the faultline, the split's misfit in the band
+        own = geom["owner"]
+        core = np.zeros((hh, hw), bool); core[iy:iy + bh, ix:ix + bw] = True
+        for (ia, ib) in [pr for pr in _combinations(present, 2) if pr in stats]:
+            pa, pb = pos[ia], pos[ib]
+            A = own == pa; B = own == pb
+            line = np.zeros((hh, hw), bool)
+            line[:, :-1] |= A[:, :-1] & B[:, 1:]; line[:, 1:] |= A[:, 1:] & B[:, :-1]
+            line[:-1, :] |= A[:-1, :] & B[1:, :]; line[1:, :] |= A[1:, :] & B[:-1, :]
+            line &= band & core
+            n_line = int(line.sum())
+            if not n_line:
+                continue
+            off = resid = np.zeros(0, np.float32)
+            if (ia, ib) in efield:
+                eu, ev = efield[(ia, ib)]
+                off = np.hypot(eu[line], ev[line])
+                off = off[np.isfinite(off)][::_STAT_EVERY] * res * 100
+                m = band & core & np.isfinite(eu) & val[ia] & val[ib]
+                resid = np.hypot(fx[pb][m] - fx[pa][m] - eu[m], fy[pb][m] - fy[pa][m] - ev[m])[::_STAT_EVERY] * res * 100
+            with slock:
+                st = stats[(ia, ib)]
+                st["px"] = st.get("px", 0) + n_line
+                st["off"].append(off.astype(np.float32)); st["resid"].append(resid.astype(np.float32))
+        return list(zip(fx, fy))
 
     def process_block(r0, c0):
         bh = min(block, OUT_H - r0); bw = min(block, OUT_W - c0)
@@ -925,9 +927,9 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             valids = [val[i] for i in present]
             specs = [rg[i][spec_idx[i]].astype(np.float32) for i in present]
             geom = _seam_geom_block(hr0, hc0, hh, hw, present, valids, ds_c, D_c,
-                                    res, band_width_m, owner_c=owner_mm)
+                                    res, band_width_m, owner_c=owner_mm if owner_in else None)
             if geom["in_band"][iy:iy + bh, ix:ix + bw].any():
-                flds = [_lat_block(lat_c[i], hr0, hc0, hh, hw) for i in present]
+                flds = _seam_fields(r0, c0, bh, bw, hr0, hc0, hh, hw, iy, ix, present, val, geom)
                 sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
                                                   fields=flds, geom=geom)
                 kind = "seam"
@@ -996,12 +998,27 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                 dst = rasterio.open(out, "r+")     # reopen; update mode won't zero-fill the sparse rest
     if dst is not None and not dst.closed:
         dst.close()   # vmain was closed after the walk; the composite uses tls VRTs
-    ds_c = D_c = owner_mm = None                  # release the coarse memmaps
+    ds_c = D_c = owner_mm = cov2_mm = None        # release the coarse memmaps
     gc.collect()
     shutil.rmtree(mmdir, ignore_errors=True)      # ~74 GB of coarse scratch, done
     rckpt.unlink(missing_ok=True)                 # render finished -> drop the checkpoint
 
-    report = dict(kind="stitch", inputs=names, n_seams=len(seams), seams=seams,
+    seams = []
+    for (i, j) in seam_pairs:                     # per seam: length, offset on the faultline, misfit of the split
+        st = stats[(i, j)]
+        off = np.concatenate(st["off"]) if st["off"] else np.zeros(0)
+        rs = np.concatenate(st["resid"]) if st["resid"] else np.zeros(0)
+        seam_m = round(st.get("px", 0) * res, 1)
+        rec = dict(pair=f"{names[i]}-{names[j]}", ij=[i, j], seam_m=seam_m,
+                   med_offset_cm=round(float(np.median(off)), 1) if len(off) else None,
+                   over50_m=round(float((off > 50).mean()) * seam_m, 1) if len(off) else None,
+                   residual_cm=round(float(np.median(rs)), 1) if len(rs) else None)
+        seams.append(rec)
+        log(f"    seam {rec['pair']}: {seam_m:.0f} m, offset median {rec['med_offset_cm']} cm, "
+            f"{rec['over50_m']} m over 50 cm, split misfit {rec['residual_cm']} cm")
+
+    report = dict(kind="stitch", method="eFOLKI", inputs=names, n_seams=len(seams), seams=seams,
+                  rendered_this_run=len(todo), resumed_blocks=base,
                   gauge=gauge, band_width_m=band_width_m, res_m=res, crs=out_crs,
                   grid=[OUT_W, OUT_H], blocks=dict(counts),
                   seconds=round(_time.perf_counter() - t0, 1), out=str(out),

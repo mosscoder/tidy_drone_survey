@@ -4,7 +4,7 @@
 # machinery (per-chip registration internals, hard-cut mosaic + meta_mosaic,
 # clip-and-fill, geo neighbour helpers) lives at tag `v0.1.0-legacy` in git history.
 # One compatibility promise is kept: register_survey_by_chips retains its
-# exact signature, running the audited dense internals.
+# exact signature, running the eFOLKI engine (registration.py).
 
 # --- remote-source I/O config (audit shared/config.json gcs_env + m2_full.py) --
 # Set BEFORE any GDAL/numpy import so it takes at library init; setdefault means
@@ -34,6 +34,7 @@ for _k, _v in {
     _os.environ.setdefault(_k, _v)
 
 from . import config
+from . import efolki
 from . import fields
 from . import cog
 from . import validate
@@ -49,16 +50,16 @@ from .merge import (
     generate_combined_boundaries,
 )
 
-# align (dense corroborated field)
+# align (eFOLKI on the reference's own pixels)
 from .registration import register_survey_dense
-from .registration import register_survey_by_chips   # same signature, dense internals
+from .registration import register_survey_by_chips   # same signature, eFOLKI internals
 
 # satellite reference
 from .sentinel import download_sentinel2_bands, pick_scene
 
 __all__ = [
     # modules
-    'config', 'fields', 'cog', 'validate', 'report', 'calibrate', 'tiles',
+    'config', 'efolki', 'fields', 'cog', 'validate', 'report', 'calibrate', 'tiles',
     # stitch + boundaries
     'seam_merge', 'define_hull_tiled', 'find_seamlines',
     'generate_combined_boundaries',

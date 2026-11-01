@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tidysurvey"
-version = "0.3.4"
+version = "0.4.0"
 description = "Config-driven drone-survey pipeline: stitch, align, calibrate, report"
 readme = "README.md"
+license = {text = "GPL-3.0-only"}
 requires-python = ">=3.10"
 dependencies = [
     "rasterio",
@@ -21,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-match = ["torch", "kornia"]                                   # LoFTR: align + seam walk
+match = ["torch"]                                             # eFOLKI: align + seam merge
 sentinel = ["earthengine-api", "google-auth", "requests", "pyproj"]
 report = ["matplotlib"]
 tiles = ["pmtiles", "Pillow"]

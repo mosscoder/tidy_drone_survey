@@ -92,7 +92,9 @@ the visible layer is aligned to a previous summer's product first).
 
 Hard gates exist only where a threshold is physical (seams ≤ 20 cm, interiors
 byte-identical). Registration agreement and calibration MAE ship as evidence
-rasters beside the products — read per survey, no fixed thresholds.
+rasters beside the products — read per survey, no fixed thresholds. A
+registration is also flagged for a look when more than 0.5 percent of the map
+moved over 50 cm or when agreement did not rise. The flag does not stop a run.
 
 ## Bands and validity (the band law)
 
@@ -114,18 +116,36 @@ alpha where one exists; without one it is derived from the data
 tags its alpha band and names its bands, so a registered mission is
 `Red, Green, NIR, RedEdge, alpha`, never the source alpha resampled as data.
 
-## Per-cell evidence
+## Registration and its numbers
 
-Every registration writes `<out>.cells.tif` beside the registered mission:
-one float32 raster on the engine's 64-pixel cell lattice (NaN = nodata),
-bands `d_cm, dx_cm, dy_cm, n_matches, field_x_cm, field_y_cm, coverage`
-(`registration.CELL_BANDS`). The first three are the RAW pooled displacements
-the matches measured, the honest error signal; `field_*` is the smooth
-correction the warp applied, sampled at the cell centres; `coverage` is 1
-where a cell matched, 0 where it was expected to and did not, NaN where no
-match was expected. `validate.registration_r_cells(..., like=<cells.tif>)`
-scores agreement with the anchor on that same lattice, so the two stack band
-for band and across seasons by georeference.
+Registration uses eFOLKI, a dense optical flow, in `tidysurvey/efolki.py`. It
+measures the shift at every pixel of the reference map's own grid, with the
+mission averaged onto that grid. Nothing is measured on a coarser copy. Each
+block of the output is then warped once, cubic, from the mission's own pixels.
+The settings are window radii 32, 24, 16 and 8, eight iterations per window,
+rank radius 4 and three pyramid levels. The sources, the tests and what is our
+own choice are in the audit's `02_registration/METHOD.md`.
+
+Every registration reports three numbers, measured on the reference's pixels.
+They are agreement with the reference before and after, as Pearson r of the
+grey images, the median move, and the area that moved more than 50 cm. The
+summary returned by `register_survey_dense` and its `qa_json` carry them as
+`r_before`, `r_after`, `move_median_cm`, `moved_over_50cm_ha` and
+`moved_over_50cm_pct`, with `look` and a one-line verdict in `line`.
+
+Every registration writes `<out>.quality.tif` beside the registered mission.
+It is one float32 raster with NaN as no-data, on cells of 64 reference pixels,
+which is 2.1 m on a 3.3 cm map. Its bands are `r_before`, `r_after`, `move_cm`,
+`move_east_cm` and `move_north_cm`, named in `registration.QUALITY_BANDS`. The
+move bands say how far the mission's content moved, east and north.
+
+The seam merge measures its seams with eFOLKI too, inside the render, on the
+merge grid. Each pair of flights that meet in a render block is measured in the
+box around their faultline, padded by twice eFOLKI's reach. The offsets are
+split over the flights at every pixel of the 1 m band. Outside the band nothing
+moves or blends. The stage report lists each seam with its length, the median
+offset on the faultline, the metres of seam over 50 cm and the median misfit of
+the split.
 
 Every stitch writes an ownership raster (`ownership_out`): band 1 is the
 owner index with the seam band marked `N + 1`, band 2 the owner index
@@ -139,6 +159,22 @@ the visible ownership exists and the mission names match.
 
 ## Changes
 
+- **0.4.0** (2026-10-31). eFOLKI replaces LoFTR in registration and in the seam
+  merge, as settled in the audit's `02_registration/METHOD.md`. Registration
+  measures on the reference's own pixels in blocks of 4096 with 1024 pixels of
+  context, warps once from the mission's own pixels, and scores in the same
+  pass. It writes `<out>.quality.tif` with five bands in place of
+  `<out>.cells.tif`. Its summary carries the three numbers and `look`, and the
+  keys `d_med_cm`, `cells_tif`, `tiles` and `match` are gone. The seam merge
+  measures each seam block by block during the render and splits the offsets
+  at each band pixel. The LoFTR walk, its checkpoint and the node solve are
+  gone. The stage report's seams carry `seam_m`, `med_offset_cm`, `over50_m`
+  and `residual_cm`. The `match` extra is torch alone. The interiors gate skips
+  a sample when the clamp into one composite block moves its window off the
+  owner's clear ground. On the 2025 fall mission_11 against the 2025 summer map
+  at 3.3 cm, 0.4.0 gave r 0.44 to 0.51, a median move of 11 cm and 0.03 ha over
+  50 cm, which matches the audit, in 18 minutes on an Apple GPU. tidysurvey is
+  now GPL-3.0, because `efolki.py` ports the authors' GPL-3.0 code.
 - **0.3.4** (2026-09-23) — two fixes found by the first season stitch on a cloud VM. `cog.finalize_cog`
   fetches the GDAL bindings through the lazy import (0.3.3 still named the module-level `gdal` that
   the lazy-import change removed, so every COG finalize raised `NameError`). `tiles.build_pmtiles`
@@ -176,7 +212,7 @@ the visible ownership exists and the mission names match.
 
 ```
 pip install -e .                      # core
-pip install -e ".[match,sentinel,report,tiles]"   # LoFTR, GEE, report thumbnails, web map
+pip install -e ".[match,sentinel,report,tiles]"   # eFOLKI (torch), GEE, report thumbnails, web map
 ```
 
 Python ≥ 3.10 (`tomli` is pulled in below 3.11).
@@ -189,6 +225,12 @@ GEE service-account JSON. Export it in the shell, or put it in a `.env` file
 **beside the survey TOML** (plain `KEY=VALUE` lines); loading a config applies
 that file with setdefault semantics, so an exported variable always wins.
 
+## Licence
+
+GPL-3.0, in `LICENSE`. `tidysurvey/efolki.py` is a port of the eFOLKI reference
+code by Plyer and colleagues at github.com/aplyer/gefolki, which is GPL-3.0, so
+tidysurvey is too.
+
 ## Provenance
 
 The methods are the audited implementations from the 2024 front-country
@@ -198,4 +240,5 @@ with the 7-MAE reliability raster). Design documents: `production_refactor.md`
 and `refactor_walkthrough_2024ms.md` in the audit repository. First-generation
 machinery (per-chip registration, hard-cut mosaic, clip-and-fill) was retired
 on this branch and lives in git history; `register_survey_by_chips` keeps its
-signature and now runs the dense engine.
+signature and now runs the eFOLKI engine. Since 0.4.0 registration and the
+seams use eFOLKI, and the LoFTR engine is at tag `v0.3.4`.

@@ -61,15 +61,14 @@ def registration_r_cells(ms_path, anchor_path, out_tif, cell_px=128, res=None,
     (>= min_n per cell). Wall-to-wall, streamed in constant memory. Writes a
     2-band raster (r, ms-missing fraction) and returns the summary.
 
-    like : path of a raster whose grid defines the cells (typically the
-           engine's <out>.cells.tif), so the score lands on the SAME lattice
-           as the displacement diagnostics and stacks with them band for
-           band. Its cell size must be a whole number of product pixels.
+    like : path of a raster whose grid defines the cells, so the score
+           lands on that lattice and stacks with it band for band. Its cell
+           size must be a whole number of product pixels.
            Without it the lattice is the product/anchor overlap in cell_px
            cells.
 
-    Non-circular by construction: the LoFTR matcher consumes a 3-band
-    grayscale; this scorer correlates raw green only. Pearson r is
+    Separate from the registration's own numbers: the engine measures and
+    scores the grey mean of three bands; this scorer correlates raw green only. Pearson r is
     affine-invariant, so exposure differences don't penalise — residual
     radiometry (flight-line striping) is calibration's problem, not
     registration's. IMPORTANT for maintainers: cells align by georeferenced
@@ -281,6 +280,14 @@ def assert_interiors_unchanged(inputs, mosaic, ownership, band_width_m=1.0,
                         continue                    # edge sliver block: skip
                     r0 = int(min(max(r0, br0), br0 + bh - window_px))
                     c0 = int(min(max(c0, bc0), bc0 + bw - window_px))
+                    # the clamp can move the window off the owner's clear ground (onto
+                    # another owner or the band): then the sample is skipped (0.4.0)
+                    ox0, oy0 = ~o_tr * (m_tr * (c0, r0))
+                    ox1, oy1 = ~o_tr * (m_tr * (c0 + window_px, r0 + window_px))
+                    cells = np.s_[max(0, int(np.floor(oy0))):int(np.ceil(oy1)),
+                                  max(0, int(np.floor(ox0))):int(np.ceil(ox1))]
+                    if not ((cat[cells] == i) | (cat[cells] == 0)).all():
+                        continue
                     hr0, hc0 = max(0, br0 - halo_px), max(0, bc0 - halo_px)
                     hr1 = min(m.height, br0 + bh + halo_px)
                     hc1 = min(m.width, bc0 + bw + halo_px)

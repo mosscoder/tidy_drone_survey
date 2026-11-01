@@ -1,16 +1,20 @@
-"""Alignment: move each mission toward the ground reference with ONE smooth,
-corroborated correction field (the audited dense engine).
+"""Alignment: move each mission onto the reference by the shift eFOLKI measures at every pixel.
 
-The first-generation per-chip machinery (Chip loaders, per-chip LoFTR + GDAL
-polynomial warps, chip merging) was retired by the refactor — the audit found
-the camera-geometry model ill-posed for flat maps, independent per-chip warps
-disagreeing at their edges, and dropped chips leaving holes (production_
-refactor.md §3.2). It lives at tag `v0.1.0-legacy` in git history. The public entry
-point `register_survey_by_chips` keeps its exact signature and now runs the
-dense internals (agreement with the anchor 0.685 -> 0.863 on the 2024 survey,
-98.6% of cells improved).
+A mission (a visible or a multispectral map) registers to a reference map, in practice the same year's
+summer visible map. eFOLKI (efolki.py) measures the shift on the reference map's own pixels, with the
+mission averaged onto them, in blocks of 4096 pixels read with 1024 pixels of context on every side. Each
+block of the output is then warped once, cubic, from the mission's own pixels onto its grid. There is no
+camera model, no global transform and no feature matching. The method and its evidence are in the audit,
+02_registration/METHOD.md and matcher_ablation/report.md section "Native resolution".
 
-Ported from the audit repo: 02_registration/poc/m2_full.py.
+Every registration reports three numbers, measured on the same pixels: agreement with the reference (Pearson
+r of the grey images) before and after, the median move, and the area that moved more than 50 cm. A map is
+flagged for a look when more than 0.5 percent of it moved that far or agreement did not rise. The per-cell
+version is the quality raster beside the output (<out>.quality.tif, QUALITY_BANDS).
+
+The first-generation per-chip machinery is at tag `v0.1.0-legacy`; the LoFTR engine (matched tiles,
+corroborated 64 px cells, one smooth field) is at `v0.3.4`. The public entry point
+`register_survey_by_chips` keeps its exact signature and runs this engine.
 """
 from __future__ import annotations
 
@@ -19,9 +23,6 @@ import math as _math
 import os
 import threading as _threading
 import time as _time
-import subprocess as _subprocess
-import shutil as _shutil
-import sys as _sys
 from pathlib import Path as _Path
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor as _TPE
@@ -29,48 +30,23 @@ from concurrent.futures import ThreadPoolExecutor as _TPE
 import numpy as np
 import cv2
 import rasterio
+from rasterio.crs import CRS as _CRS
 from rasterio.vrt import WarpedVRT as _WarpedVRT
 from rasterio.windows import Window as _Window
 from rasterio.enums import Resampling as _Resampling
 from affine import Affine as _Affine
-from . import fields as _F
 from . import bands as _B
 from . import heartbeat as _HB
 
-_TILE_H, _TILE_W = 480, 640
-_FS = 64                     # pooling cell (px)
-_MIN_NB = 8                  # corroboration: neighbours required in the 5x5 ring
-_REJECT_PX, _MIN_TILE, _MIN_CELL = 4.0, 8, 2
-_GEOM_DS, _FIELD_DS, _BLOCK = 8, 8, 2048
-# the per-cell diagnostics raster (<out>.cells.tif): float32, NaN nodata, on the _FS lattice
-CELL_BANDS = ("d_cm", "dx_cm", "dy_cm", "n_matches", "field_x_cm", "field_y_cm", "coverage")
-
-# --------------------------------------------------------------------------- #
-# dense match pass — run as fresh subprocess CHUNKS (audit 02_registration §7).
-# LoFTR on MPS decays with varied-shape calls in a long-lived process
-# (496 -> 1829 ms/tile; in-loop empty_cache accelerates it). A fresh process
-# per chunk resets the allocator -> flat throughput. ONLY these workers touch
-# the GPU; register_survey_dense (the parent) stays on the CPU.
-_CHUNK_TILES = int(os.environ.get("TIDYSURVEY_REG_CHUNK", "250"))
-
-
-class _FakeMatcher:                                     # test hook only
-    """TIDYSURVEY_REG_FAKE=1: a fixed grid of correspondences with a constant
-    sub-pixel shift, to exercise chunk orchestration without loading LoFTR."""
-    def __call__(self, d):
-        import torch
-        h, w = d["image0"].shape[-2:]
-        ys, xs = np.mgrid[30:h - 30:40, 30:w - 30:40]
-        kp = np.column_stack([xs.ravel(), ys.ravel()]).astype(np.float32)
-        return {"keypoints0": torch.from_numpy(kp),
-                "keypoints1": torch.from_numpy(kp + np.float32([0.6, -0.4]))}
-
-
-def _worker_matcher():
-    if os.environ.get("TIDYSURVEY_REG_FAKE"):
-        import torch
-        return _FakeMatcher(), torch.device("cpu")
-    return _F.build_matcher()
+_GEOM_DS = 8                 # the coarse validity mask, in output pixels
+_CORE, _PAD = 4096, 1024     # a measured block and the context read around it, in reference pixels (the audit's)
+_CELL = 64                   # the quality raster's cell, in reference pixels (2.1 m on a 3.3 cm map)
+_MIN_SHARE = 0.01            # a block is measured when the mission and the reference each cover this share of it
+_MIN_CELL = 0.25             # a cell is scored when both maps cover this share of it
+_BLOCKS_AT_ONCE = 2          # blocks in flight: one measuring on the GPU while another reads or warps
+BIG_MOVE_CM = 50.0           # the size of a shadow slide: the area that moved more than this is reported
+LOOK_PCT = 0.5               # a map is flagged for a look when more than this percent of it moved over BIG_MOVE_CM
+QUALITY_BANDS = ("r_before", "r_after", "move_cm", "move_east_cm", "move_north_cm")
 
 
 def _prewarp_to_grid(src, out_crs, TR, W, H, bands, resampling, out_path, workers):
@@ -111,10 +87,9 @@ def prewarp_union_anchor(anchor, out_crs, missions, res, out_path, log=print):
     """Stage the borrowed anchor ONCE onto the UNION extent of all missions as a
     LOCAL COG, so it is not re-fetched from the NAS per tile per mission (21x
     redundant). The union grid is SNAPPED to the anchor's own pixel lattice, so
-    when the anchor's CRS matches this stage is a pixel-exact CROP (no resample):
-    the anchor is then resampled EXACTLY ONCE — at the per-mission VRT read onto
-    the mission grid — the same single warp the seam walk applies to every
-    source. Shared across the align pass; cli._align removes it afterwards."""
+    when the anchor's CRS matches this stage is a pixel-exact CROP (no resample),
+    and the registration then measures on the anchor's own pixels. Shared across
+    the align pass; cli._align removes it afterwards."""
     from rasterio.warp import transform_bounds as _tbounds
     x0 = y0 = float("inf"); x1 = y1 = float("-inf")
     for m in missions:
@@ -174,78 +149,17 @@ def stage_local(src, dst, log=print):
     return dst
 
 
-def _run_reg_chunk(work_dir, chunk_idx):
-    """Match ONE chunk of the tile list in this (fresh) process, write
-    part_<idx>.npz, exit. Invoked via `python -m tidysurvey._regchunk`. The
-    process exit is the point — it frees the MPS allocator. No in-loop
-    empty_cache; preallocated, reused device buffers."""
-    import torch
-    work = _Path(work_dir); ci = int(chunk_idx)
-    st = _json.loads((work / "state.json").read_text())
-    tiles = np.load(work / "tiles.npy")
-    sub = tiles[ci * _CHUNK_TILES:(ci + 1) * _CHUNK_TILES]
-    TR = _Affine(*st["tr"]); W, H, nspec = st["W"], st["H"], st["nspec"]
-    th, tw, a_alpha = st["tile_h"], st["tile_w"], st["a_alpha"]
-    reject, mintile = st["reject_px"], st["min_tile"]
-    matcher, dev = _worker_matcher()
-    ta = torch.empty((1, 1, th, tw), device=dev)        # preallocated, reused
-    tb = torch.empty((1, 1, th, tw), device=dev)
-    # mission read from its source (GCS) per tile; anchor read from the shared
-    # union pre-warp (local) so it is NOT re-fetched from the NAS per mission.
-    vm = _WarpedVRT(rasterio.open(st["mission"]), crs=st["out_crs"], transform=TR,
-                    width=W, height=H, resampling=_Resampling.bilinear)
-    va = _WarpedVRT(rasterio.open(st["anchor"]), crs=st["out_crs"], transform=TR,
-                    width=W, height=H, resampling=_Resampling.average)
-    ans, dss, n_used, rdm, rda, inf = [], [], 0, 0.0, 0.0, 0.0
-    for (r0, c0) in sub:
-        r0, c0 = int(r0), int(c0)
-        _HB.beat()                                          # one heartbeat per tile, matched or skipped
-        win = _Window(c0, r0, tw, th)
-        t = _time.time()
-        spec = vm.read(st["spec_bands"][:3], window=win)     # first (<=3) spectral bands
-        rdm += _time.time() - t
-        if not (spec != 0).any():
-            continue
-        t = _time.time()
-        aal = va.read(a_alpha, window=win)
-        ok = (aal > 127).any()
-        if ok:
-            argb = va.read([1, 2, 3], window=win)
-        rda += _time.time() - t
-        if not ok:
-            continue
-        t = _time.time()
-        m = _F.match_tile_pre(matcher, dev, ta, tb,
-                              _F.gray_stretch(spec.astype(np.float32)),
-                              _F.gray_stretch(argb.astype(np.float32)),
-                              reject, mintile)
-        inf += _time.time() - t
-        if m is None:
-            continue
-        k0, dd = m
-        ans.append(k0 + [c0, r0]); dss.append(dd); n_used += 1
-    vm.close(); va.close()
-    print(f"    chunk {ci}: {n_used}/{len(sub)} · mission-read {rdm:.0f}s · "
-          f"anchor-read {rda:.0f}s · infer {inf:.0f}s", flush=True)
-    part = work / f"part_{ci}.npz"
-    tim = dict(t_read_m=np.float64(rdm), t_read_a=np.float64(rda), t_infer=np.float64(inf),
-               n_tiles=np.int64(len(sub)))
-    if ans:
-        np.savez(part, an=np.concatenate(ans), d=np.concatenate(dss),
-                 n_used=np.int64(n_used), **tim)
-    else:
-        np.savez(part, an=np.zeros((0, 2)), d=np.zeros((0, 2)), n_used=np.int64(0), **tim)
 
 
 # --------------------------------------------------------------------------- #
-# the public entry point — same signature as always, dense internals
+# the public entry point — same signature as always, current internals
 # --------------------------------------------------------------------------- #
 def register_survey_by_chips(
     unreg_survey_path: str,
     reg_reference_path: str,
     output_registered_survey_path: str,
     # legacy chip parameters — accepted for compatibility, ignored by the
-    # dense engine (device_for_loftr and max_loader_workers are honoured)
+    # engine (device_for_loftr names the eFOLKI device; "cpu" or None = automatic)
     target_total_chip_width_px: int = 640,
     target_total_chip_height_px: int = 480,
     adaptive_buffer_fractions: List[float] = [0.1, 0.2, 0.3],
@@ -269,9 +183,8 @@ def register_survey_by_chips(
     band_names=None,
 ):
     """Register a survey raster to a reference. Same signature as the
-    first-generation function; the INTERNALS are the audited dense engine
-    (one smooth corroborated field per mission, warped once toward the
-    reference). engine="chips" is retired — see module docstring."""
+    first-generation function; the internals are the current engine
+    (register_survey_dense). engine="chips" is retired — see module docstring."""
     if engine != "dense":
         raise NotImplementedError(
             "the per-chip engine was retired by the refactor (ill-posed camera "
@@ -280,50 +193,84 @@ def register_survey_by_chips(
     return register_survey_dense(
         unreg_survey_path, reg_reference_path, output_registered_survey_path,
         device=None if device_for_loftr in (None, "cpu") else device_for_loftr,
-        workers=max_loader_workers, band_names=band_names,
+        band_names=band_names,
     )
 
 
+
+
 # --------------------------------------------------------------------------- #
-# the dense engine
+# the engine
 # --------------------------------------------------------------------------- #
+def _measure_grid(anchor, out_crs, bounds, pad_px):
+    """The reference's own pixel lattice over `bounds` (in out_crs) grown by pad_px pixels on every side:
+    (transform, width, height, pixel size, same_crs). In the anchor's CRS the lattice is the anchor's own, so
+    a read is a pixel-exact crop. In another CRS it is the anchor's pixel size there, on a global lattice of
+    that size, and the anchor is resampled once onto it."""
+    from rasterio.warp import transform_bounds
+    with rasterio.open(anchor) as a:
+        same = a.crs == _CRS.from_user_input(out_crs)
+        if same:
+            mres, ox, oy = abs(a.transform.a), a.transform.c, a.transform.f
+        else:
+            b = transform_bounds(a.crs, out_crs, *a.bounds, densify_pts=21)
+            mres, ox, oy = (b[2] - b[0]) / a.width, 0.0, 0.0
+    left, bottom, right, top = bounds
+    pad = pad_px * mres
+    x0 = ox + _math.floor((left - pad - ox) / mres) * mres
+    y1 = oy - _math.floor((oy - top - pad) / mres) * mres
+    W = int(_math.ceil((right + pad - x0) / mres))
+    H = int(_math.ceil((y1 - bottom + pad) / mres))
+    return _Affine.translation(x0, y1) * _Affine.scale(mres, -mres), W, H, mres, same
+
+
+def _pearson(s):
+    """Pearson r from stacked sums (n, sx, sy, sxx, syy, sxy) along axis 0; NaN where undefined."""
+    n, sx, sy, sxx, syy, sxy = s
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (n * sxy - sx * sy) / np.sqrt((n * sxx - sx ** 2) * (n * syy - sy ** 2))
+
+
 def register_survey_dense(
     unreg_survey_path: str,
     reg_reference_path: str,
     output_registered_survey_path: str,
-    resolution_m: float = None,          # None = the mission's native GSD
-    device=None,
-    workers: int = None,
+    resolution_m: float = None,          # the output grid; None = the mission's own pixel size
+    device=None,                         # the eFOLKI device (efolki.device); None = CUDA, then MPS, then the CPU
+    workers: int = None,                 # accepted for compatibility; blocks run _BLOCKS_AT_ONCE at a time
     qa_json: str = None,
     log=print,
     band_names=None,       # the config's spectral band names (first N non-alpha bands); None = all
 ):
-    """Align one mission to the reference with ONE smooth correction field.
+    """Register one mission to the reference with eFOLKI, warp it once, and score it.
 
-    Dense LoFTR pass over the mission footprint against the reference
-    (anchored gauge — the reference is the truth), per-tile robust rejection,
-    per-cell pooled medians, 5x5-ring corroboration gate + boundary-cell
-    filter, then a single smooth field warps the whole mission once. No
-    camera-geometry model, no per-chip polynomials, no dropped-chip holes.
-    Output carries the mission's bands + a real alpha band.
+    Measure: the reference's own pixel lattice over the mission (efolki.flow on the grey images: the mean of
+    the reference's first three bands, the mean of the mission's first three spectral bands averaged onto
+    that lattice, each with its no-data filled from the nearest valid pixel). Blocks of _CORE reference pixels
+    are measured with _PAD pixels of context on every side. A block is measured when the mission and the
+    reference each cover _MIN_SHARE of it; elsewhere the shift is zero.
 
-    Note: torch's MPS allocator grows across long match passes; the cache is
-    released every 100 tiles and fully at the end of the pass
-    (fields.release_matcher_cache). The audited runner's stronger remedy —
-    LoFTR in chunked subprocesses (m2_full.py telemetry, which also dodged an
-    MPS per-process slowdown) — remains the fallback if a mission's footprint
-    still climbs or throughput decays: chunk externally.
+    Warp: each output block takes the shift at its pixel centres (bilinear between reference pixels) and
+    reads the mission at its native resolution through ONE cubic remap (the native->grid scaling and the
+    shift together). The alpha comes from the coarse validity mask at the shifted position, nearest.
+
+    Score: on the reference pixels of each block, Pearson r of the grey images before (the mission as
+    averaged onto them) and after (the same image moved by the shift, bilinear), where both have data, and
+    the move: the mean shift over a cell, as the distance the mission's content moved, east and north.
+    Written per _CELL x _CELL cell to <out>.quality.tif (QUALITY_BANDS, float32, NaN = no data) and pooled over
+    the map for the three numbers. Output carries the mission's spectral bands + a tagged alpha band.
     """
+    from . import efolki as _E
     t0 = _time.time()
-    phases, _tp = {}, [_time.time()]          # per-phase seconds (geometry, match, gates, field, warp)
+    phases, _tp = {}, [_time.time()]
 
     def _phase(name):
         now = _time.time(); phases[name] = round(now - _tp[0], 1); _tp[0] = now
-    workers = workers or max(1, (os.cpu_count() or 4) - 1)
     mission, anchor = str(unreg_survey_path), str(reg_reference_path)
+    dev = device if hasattr(device, "type") else _E.device(device)
 
     with rasterio.open(mission) as s:
-        out_crs = str(s.crs)
+        out_crs = s.crs
         res = resolution_m or round(abs(s.res[0]), 3)
         mb = s.bounds
         mt = s.transform                            # native transform (same CRS as out_crs)
@@ -335,7 +282,7 @@ def register_survey_dense(
     alaw = _B.band_law(anchor)
     if alaw.alpha is None:
         raise RuntimeError(f"register_survey_dense: reference {anchor} has no alpha/validity band")
-    a_alpha = alaw.alpha
+    a_bands = list(alaw.spectral[:3]) + [alaw.alpha]
     # snap the output origin to a global `res` lattice so every same-GSD mission
     # (and the stitch union grid, likewise snapped) shares one pixel lattice — the
     # merge then crops interiors pixel-exactly instead of re-resampling them.
@@ -346,306 +293,232 @@ def register_survey_dense(
     TR = _Affine.translation(ox, oy) * _Affine.scale(res, -res)
     # grid-pixel -> native-pixel affine (axis-aligned, same CRS): n = s*g + a. Lets
     # the output warp read the mission at NATIVE res and fold the native->grid warp
-    # AND the correction field into ONE cubic remap (no intermediate grid resample).
+    # AND the shift into ONE cubic remap (no intermediate grid resample).
     sx = TR.a / mt.a; sy = TR.e / mt.e
     ax = 0.5 * sx + (TR.c - mt.c) / mt.a - 0.5
     ay = 0.5 * sy + (TR.f - mt.f) / mt.e - 0.5
-    log(f"[register_dense] {os.path.basename(mission)} -> grid {W}x{H} @ {res} m")
+    log(f"[register] {os.path.basename(mission)} -> grid {W}x{H} @ {res} m")
     log(f"    band law: {law.describe()}")
 
-    # ---- coarse validity (mission) + reference coverage -------------------- #
+    # ---- coarse validity of the mission: its bbox, and the output alpha --------------- #
     Wc, Hc = -(-W // _GEOM_DS), -(-H // _GEOM_DS)
     tr_c = TR * _Affine.scale(_GEOM_DS)
     with rasterio.open(mission) as s:
         with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
                         resampling=_Resampling.average) as v:
             vmask = _B.read_valid(v, law)       # exact alpha, else zeros + border flood fill
-    with rasterio.open(anchor) as a:
-        with _WarpedVRT(a, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
-                        resampling=_Resampling.average) as v:
-            a_ok_c = v.read(a_alpha) > 127
-
     ys, xs = np.where(vmask)
     if len(ys) == 0:
         raise RuntimeError("register_survey_dense: mission has no valid data")
     r0b = int(ys.min()) * _GEOM_DS; r1b = min(H, (int(ys.max()) + 1) * _GEOM_DS)
     c0b = int(xs.min()) * _GEOM_DS; c1b = min(W, (int(xs.max()) + 1) * _GEOM_DS)
-    tiles = []
-    for r0 in range(r0b, r1b - _TILE_H + 1, _TILE_H):
-        for c0 in range(c0b, c1b - _TILE_W + 1, _TILE_W):
-            cr, cc = r0 // _GEOM_DS, c0 // _GEOM_DS
-            ch, cw = _TILE_H // _GEOM_DS, _TILE_W // _GEOM_DS
-            if (vmask[cr:cr + ch, cc:cc + cw].mean() > 0.05
-                    and a_ok_c[cr:cr + ch, cc:cc + cw].mean() > 0.05):
-                tiles.append((r0, c0))
-    log(f"    {len(tiles)} data tiles (bbox {r1b - r0b}x{c1b - c0b} px)")
+    bh_all, bw_all = r1b - r0b, c1b - c0b
+
+    # ---- the measuring grid: the reference's own pixels over the bbox ------------------ #
+    left, top = TR * (c0b, r0b); right, bottom = TR * (c1b, r1b)
+    MTR, MW, MH, mres, same = _measure_grid(anchor, out_crs, (left, bottom, right, top), _PAD + 8)
+    k = mres / res                                # reference pixels -> output pixels
+    ex, ey = MTR.c - TR.c, TR.f - MTR.f           # the measuring origin east and south of the output origin
+    jstart = lambda c: int(_math.ceil((c * res - ex) / mres - 0.5))   # first reference column centred at or past output column edge c
+    istart = lambda r: int(_math.ceil((r * res - ey) / mres - 0.5))
+    OB = max(512, int(round(_CORE * mres / res / 512)) * 512)          # output block whose core is about _CORE reference pixels
+    mis_rs = _Resampling.average if abs(mt.a) <= mres * 1.001 else _Resampling.bilinear   # averaged down, interpolated up
+    log(f"    measuring on the reference's own pixels: {MW}x{MH} @ {mres * 100:.2f} cm"
+        f"{'' if same else ' (reprojected once)'}; eFOLKI on {dev.type}, radii "
+        f"{'-'.join(str(r) for r in _E.SETTINGS['radius'])}, {_E.SETTINGS['levels']} levels; "
+        f"output blocks {OB} px")
+    HC, WC = -(-MH // _CELL), -(-MW // _CELL)
+    acc = np.zeros((15, HC, WC), np.float64)      # before (6 sums), after (6 sums), move (n, su, sv)
+    alock, wlock = _threading.Lock(), _threading.Lock()
+    tls = _threading.local()
+    counts = dict(measured=0, unmeasured=0, empty=0)
+    secs = dict(measure=0.0, warp=0.0)
     _phase("geometry")
 
-    # ---- dense match pass: fresh subprocess per CHUNK ----------------------- #
-    # GPU work runs ONLY in short-lived chunk workers so the MPS per-process
-    # inference decay (audit 02_registration §7: 496->1829 ms/tile; in-loop
-    # empty_cache accelerates it) can't accumulate across a mission. This parent
-    # never builds a matcher — geometry, field fit and warp are all CPU. Results
-    # are identical to a single pass (same tiles, same deterministic matcher).
-    work = _Path(str(output_registered_survey_path) + ".regwork")
-    _shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True, exist_ok=True)
-    # NOTE: `anchor` is expected to be the shared UNION pre-warp (local COG) built
-    # once by cli._align for borrowed-anchor seasons — the workers read it locally
-    # instead of re-fetching the NAS anchor per tile per mission. The mission is
-    # read from its own source (GCS) per tile, NOT downloaded.
-    np.save(work / "tiles.npy", np.asarray(tiles, dtype=np.int64))
-    (work / "state.json").write_text(_json.dumps(dict(
-        mission=mission, anchor=anchor, out_crs=out_crs,
-        tr=[TR.a, TR.b, TR.c, TR.d, TR.e, TR.f], W=int(W), H=int(H),
-        nspec=int(nspec), spec_bands=spec_bands, a_alpha=int(a_alpha), reject_px=_REJECT_PX,
-        min_tile=_MIN_TILE, tile_h=_TILE_H, tile_w=_TILE_W)))
-    n_chunks = -(-len(tiles) // _CHUNK_TILES)
-    log(f"    matching {len(tiles)} tiles in {n_chunks} x {_CHUNK_TILES}-tile "
-        f"subprocess chunks (a fresh GPU process each — resets the MPS decay)")
-    for ci in range(n_chunks):
-        rc = _subprocess.run(
-            [_sys.executable, "-m", "tidysurvey._regchunk", str(work), str(ci)])
-        if rc.returncode != 0:
-            _shutil.rmtree(work, ignore_errors=True)
-            raise RuntimeError(f"register_survey_dense: match chunk "
-                               f"{ci + 1}/{n_chunks} failed (rc={rc.returncode})")
-        log(f"    [chunk {ci + 1}/{n_chunks}] done")
-    buf_an, buf_d, n_used = [], [], 0
-    mt = dict(infer_s=0.0, mission_read_s=0.0, anchor_read_s=0.0, chunks=n_chunks, chunk_tiles=_CHUNK_TILES)
-    for ci in range(n_chunks):
-        z = np.load(work / f"part_{ci}.npz")
-        if len(z["an"]):
-            buf_an.append(z["an"]); buf_d.append(z["d"]); n_used += int(z["n_used"])
-        if "t_infer" in z:
-            mt["infer_s"] += float(z["t_infer"]); mt["mission_read_s"] += float(z["t_read_m"])
-            mt["anchor_read_s"] += float(z["t_read_a"])
-    _shutil.rmtree(work, ignore_errors=True)
-    _phase("match")
-    mt = {k: (round(v, 1) if isinstance(v, float) else v) for k, v in mt.items()}
-    mt["tiles_per_s_infer"] = round(len(tiles) / mt["infer_s"], 2) if mt["infer_s"] else None
-    log(f"    match phase {phases['match']}s: infer {mt['infer_s']}s ({mt['tiles_per_s_infer']} t/s), "
-        f"mission reads {mt['mission_read_s']}s, anchor reads {mt['anchor_read_s']}s, "
-        f"{n_chunks} chunk process(es)")
-    if not buf_an:
-        raise RuntimeError("register_survey_dense: no matches")
-    an = np.concatenate(buf_an); d = np.concatenate(buf_d)
-
-    # ---- cells -> corroboration -> boundary filter -------------------------- #
-    pts, vx, vy = _F.pool_to_cells(an, d, _FS, _MIN_CELL)
-    keep = _F.corroborate_cells(pts, vx, vy, _FS, _MIN_NB, _REJECT_PX)
-    cell_f = _FS // _GEOM_DS                       # boundary: cell + ring valid in BOTH
-    Hcc, Wcc = Hc // cell_f, Wc // cell_f
-    vm = vmask[:Hcc * cell_f, :Wcc * cell_f].reshape(Hcc, cell_f, Wcc, cell_f).min(axis=(1, 3))
-    am = a_ok_c[:Hcc * cell_f, :Wcc * cell_f].reshape(Hcc, cell_f, Wcc, cell_f).min(axis=(1, 3))
-    ok = cv2.erode((vm & am).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-    ccy = np.clip((pts[:, 1] // _FS).astype(int), 0, Hcc - 1)
-    ccx = np.clip((pts[:, 0] // _FS).astype(int), 0, Wcc - 1)
-    keep &= ok[ccy, ccx]
-    n_rej = int((~keep).sum())
-    _cpts, _ckeep, _cok = pts, keep, ok            # cell-coverage inputs (pre-subset)
-    pts, vx, vy = pts[keep], vx[keep], vy[keep]
-    if len(pts) == 0:
-        raise RuntimeError("register_survey_dense: all cells rejected by the gates")
-    d_med = float(np.median(np.hypot(vx, vy)) * res * 100)
-    log(f"    {len(pts)} cells after gates ({n_rej} rejected)  |d| med={d_med:.1f} cm")
-    # --- durable per-region diagnostics on the _FS-cell lattice ------------------
-    #  ONE raster (<out>.cells.tif, CELL_BANDS) written after the field is fit, so
-    #  it carries the RAW pooled displacements (the honest per-region error signal
-    #  the through-time analysis stacks across seasons), the match count, the
-    #  smooth field the warp applied, and the coverage (1 matched / 0 expected but
-    #  failed / NaN not expected). On the mission's snapped lattice, so cells stack
-    #  across seasons by georeference.
-    _celltr = _Affine.translation(TR.c, TR.f) * _Affine.scale(_FS * res, -_FS * res)
-    cov = np.full((Hcc, Wcc), np.nan, np.float32)
-    cov[_cok] = 0.0
-    cov[np.clip((_cpts[_ckeep, 1] // _FS).astype(int), 0, Hcc - 1),
-        np.clip((_cpts[_ckeep, 0] // _FS).astype(int), 0, Wcc - 1)] = 1.0
-    disp = np.full((3, Hcc, Wcc), np.nan, np.float32)
-    _dy = np.clip((pts[:, 1] // _FS).astype(int), 0, Hcc - 1)
-    _dx = np.clip((pts[:, 0] // _FS).astype(int), 0, Wcc - 1)
-    disp[0, _dy, _dx] = np.hypot(vx, vy) * res * 100
-    disp[1, _dy, _dx] = vx * res * 100; disp[2, _dy, _dx] = vy * res * 100
-    nmatch = np.zeros((Hcc, Wcc), np.float32)             # raw LoFTR matches pooled per cell
-    np.add.at(nmatch, (np.clip((an[:, 1] // _FS).astype(int), 0, Hcc - 1),
-                       np.clip((an[:, 0] // _FS).astype(int), 0, Wcc - 1)), 1)
-    nmatch[np.isnan(cov)] = np.nan
-    failed_cells = int((cov == 0).sum())
-    _phase("gates")
-
-    # ---- one smooth field (bbox-local, FIELD_DS lattice) --------------------- #
-    # Never materialised at the FIELD_DS lattice (bbox/8 a side: 0.6 GB for a
-    # 92k x 52k map). StreamedField holds the horizontal pass of the same
-    # resize (1/8 of that) and serves column bands bit-identical to
-    # fill_field's values; the warp pulls the band under each block.
-    bh, bw = r1b - r0b, c1b - c0b
-    Hg, Wg = bh // _FIELD_DS + 1, bw // _FIELD_DS + 1
-    pl = (pts - [c0b, r0b]) / _FIELD_DS
-    SFx = _F.StreamedField(pl, vx, Wg, Hg)
-    SFy = _F.StreamedField(pl, vy, Wg, Hg)
-    maxF = float(max(SFx.absmax(), SFy.absmax()))
-    halo = int(_math.ceil(maxF)) + 16
-    # the field at the cell centres, sampled with the warp's own lattice convention
-    # (upsample_block = cv2.resize: native px p -> lattice (p + 0.5) / fac - 0.5)
-    CX, CY = np.meshgrid((np.arange(Wcc, dtype=np.float32) + 0.5) * _FS,
-                         (np.arange(Hcc, dtype=np.float32) + 0.5) * _FS)
-    inside = (CX >= c0b) & (CX < c1b) & (CY >= r0b) & (CY < r1b)
-    lx = ((CX - c0b + 0.5) / _FIELD_DS - 0.5).astype(np.float32)
-    ly = ((CY - r0b + 0.5) / _FIELD_DS - 0.5).astype(np.float32)
-    fld = [np.where(inside, SF_.sample(lx, ly) * res * 100, np.nan)
-           for SF_ in (SFx, SFy)]
-    cells_out = str(_Path(output_registered_survey_path).with_suffix(".cells.tif"))
-    cell_arrays = (disp[0], disp[1], disp[2], nmatch, fld[0], fld[1], cov)
-    with rasterio.open(cells_out, "w", driver="GTiff", width=Wcc, height=Hcc,
-                       count=len(CELL_BANDS), dtype="float32", crs=out_crs,
-                       transform=_celltr, nodata=float("nan"), tiled=True,
-                       compress="zstd") as _dc:
-        for _i, _n in enumerate(CELL_BANDS, 1):           # tags BEFORE pixels (bands.py)
-            _dc.set_band_description(_i, _n)
-        _dc.update_tags(cell_px=_FS, res_m=res, mission=os.path.basename(mission),
-                        reference=os.path.basename(anchor), tiles=len(tiles),
-                        matches=int(len(an)), cells=int(len(pts)), rejected=n_rej,
-                        failed_cells=failed_cells, d_med_cm=round(d_med, 1),
-                        maxF_cm=round(maxF * res * 100, 1),
-                        coverage="1 matched, 0 expected but no match, nodata not expected")
-        for _i, _a in enumerate(cell_arrays, 1):
-            _dc.write(_a.astype(np.float32), _i)
-    _phase("field")
-
-    # ---- warp once (block-streamed, haloed) ---------------------------------- #
     tr_b = TR * _Affine.translation(c0b, r0b)
-    prof = dict(driver="GTiff", height=bh, width=bw, count=nspec + 1, dtype="uint8",
+    prof = dict(driver="GTiff", height=bh_all, width=bw_all, count=nspec + 1, dtype="uint8",
                 crs=out_crs, transform=tr_b, tiled=True, blockxsize=512, blockysize=512,
                 compress="zstd", predictor=2, ZSTD_LEVEL=3, BIGTIFF="IF_SAFER",
-                num_threads=str(workers))
-    # Validity at native resolution is never materialised (one byte per output
-    # pixel: 4.8 GB for a 92k x 52k map). Each block gathers its window from
-    # the GEOM_DS mask through the exact nearest-neighbour offsets cv2.resize
-    # would have used, so the alpha band is byte-identical to the resized whole.
-    vc = np.ascontiguousarray(vmask[r0b // _GEOM_DS:-(-r1b // _GEOM_DS),
-                                    c0b // _GEOM_DS:-(-c1b // _GEOM_DS)].astype(np.uint8))
-    v_rows = _F.resize_nn_offsets(vc.shape[0], bh)
-    v_cols = _F.resize_nn_offsets(vc.shape[1], bw)
+                num_threads=str(workers or max(1, (os.cpu_count() or 4) - 1)))
     _Path(output_registered_survey_path).parent.mkdir(parents=True, exist_ok=True)
     dst = rasterio.open(output_registered_survey_path, "w", **prof)
     _B.tag_output(dst, law.names)                  # names + tagged alpha: no guessing downstream
-    wlock = _threading.Lock()
-    tls = _threading.local()
 
-    def upf(hr0, hc0, hh, hw):
-        """The correction field on this native block, as upsample_block gave it
-        from the full FIELD_DS array: the same FIELD_DS sub-window (served by
-        StreamedField, per column stripe, cached per worker) through the same
-        integer-factor resize and crop."""
-        r0, c0 = hr0 - r0b, hc0 - c0b
-        cr0, cc0 = r0 // _FIELD_DS, c0 // _FIELD_DS
-        cr1 = min(Hg, -(-(r0 + hh) // _FIELD_DS)); cc1 = min(Wg, -(-(c0 + hw) // _FIELD_DS))
-        if getattr(tls, "fkey", None) != (cc0, cc1):
-            tls.fkey = (cc0, cc1)
-            tls.fcols = (SFx.columns(cc0, cc1), SFy.columns(cc0, cc1))
-        return [_F.upsample_block(col[cr0:cr1], _FIELD_DS, r0 - cr0 * _FIELD_DS,
-                                  c0 - cc0 * _FIELD_DS, hh, hw, out=buf)
-                for col, buf in zip(tls.fcols, (tls.bigx, tls.bigy))]
-
-    # Every array a worker touches is allocated ONCE per worker at the largest
-    # haloed block and re-used as a contiguous view, so the warp's footprint is
-    # workers x (block + halo)^2 x a fixed number of bytes and does not churn the
-    # allocator. The arithmetic below is the same float32 sequence as the
-    # expression form it replaces (each step rounds identically), so the
-    # registered bands are byte-identical.
-    PAD = 3
-    HMAX, WMAX = min(_BLOCK, bh) + 2 * halo, min(_BLOCK, bw) + 2 * halo
-    NHMAX = int(_math.ceil(sy * HMAX)) + 2 * PAD + 2
-    NWMAX = int(_math.ceil(sx * WMAX)) + 2 * PAD + 2
-    BMAX = (HMAX + 2 * _FIELD_DS) * (WMAX + 2 * _FIELD_DS)     # upsample_block covers whole FIELD_DS cells: up to 2 extra per axis
-
-    def _buffers():
-        if not hasattr(tls, "m"):
-            tls.m = rasterio.open(mission)                  # native read, per worker
-            gy_, gx_ = np.meshgrid(np.arange(HMAX, dtype=np.float32),
-                                   np.arange(WMAX, dtype=np.float32), indexing="ij")
-            tls.gx, tls.gy = np.ascontiguousarray(gx_), np.ascontiguousarray(gy_)
-            tls.mapx = np.empty(HMAX * WMAX, np.float32); tls.mapy = np.empty(HMAX * WMAX, np.float32)
-            tls.rem = np.empty(HMAX * WMAX, np.float32); tls.a8 = np.empty(HMAX * WMAX, np.uint8)
-            tls.outb = np.empty((nspec + 1) * HMAX * WMAX, np.uint8)
-            tls.nat8 = np.empty(nspec * NHMAX * NWMAX, np.uint8)
-            tls.nat = np.empty(nspec * NHMAX * NWMAX, np.float32)
-            tls.bigx = np.empty(BMAX, np.float32); tls.bigy = np.empty(BMAX, np.float32)
-            tls.wout = np.empty((nspec + 1) * min(_BLOCK, bh) * min(_BLOCK, bw), np.uint8)
+    def _readers():
+        if not hasattr(tls, "a"):
+            tls.a = _WarpedVRT(rasterio.open(anchor), crs=out_crs, transform=MTR, width=MW, height=MH,
+                               resampling=_Resampling.average)
+            tls.m = _WarpedVRT(rasterio.open(mission), crs=out_crs, transform=MTR, width=MW, height=MH,
+                               resampling=mis_rs)
+            tls.ma = (_WarpedVRT(rasterio.open(mission), crs=out_crs, transform=MTR, width=MW, height=MH,
+                                 resampling=_Resampling.nearest) if law.alpha else None)
+            tls.n = rasterio.open(mission)                       # native read for the warp
         return tls
 
-    def wone(bc):
-        r0, c0 = bc
-        t = _buffers()
-        bh2, bw2 = min(_BLOCK, r1b - r0), min(_BLOCK, c1b - c0)
-        hr0, hc0 = max(r0b, r0 - halo), max(c0b, c0 - halo)
-        hr1, hc1 = min(r1b, r0 + bh2 + halo), min(c1b, c0 + bw2 + halo)
-        hh, hw = hr1 - hr0, hc1 - hc0
-        iy, ix = r0 - hr0, c0 - hc0
-        # native read window covering this (haloed) grid block, padded for the cubic kernel
-        nc0 = max(0, int(_math.floor(sx * hc0 + ax)) - PAD)
-        nr0 = max(0, int(_math.floor(sy * hr0 + ay)) - PAD)
-        nc1 = min(mW, int(_math.ceil(sx * hc1 + ax)) + PAD)
-        nr1 = min(mH, int(_math.ceil(sy * hr1 + ay)) + PAD)
-        fxs, fys = upf(hr0, hc0, hh, hw)
-        gx, gy = t.gx[:hh, :hw], t.gy[:hh, :hw]
-        n = hh * hw
-        mapx = t.mapx[:n].reshape(hh, hw); mapy = t.mapy[:n].reshape(hh, hw)
-        rem = t.rem[:n].reshape(hh, hw)
-        outb = t.outb[:(nspec + 1) * n].reshape(nspec + 1, hh, hw)
-        outb[:] = 0
+    def _mission_valid(rd, win, wi0, wj0, h, w):
+        """The mission's validity on the measuring window: its alpha read nearest, or (no alpha) the
+        coarse mask at each pixel's output position."""
+        if law.alpha:
+            return rd.ma.read(law.alpha, window=win) > 127
+        cy = np.floor((ey + (np.arange(wi0, wi0 + h) + 0.5) * mres) / res / _GEOM_DS).astype(np.int64)
+        cx = np.floor((ex + (np.arange(wj0, wj0 + w) + 0.5) * mres) / res / _GEOM_DS).astype(np.int64)
+        oky, okx = (cy >= 0) & (cy < Hc), (cx >= 0) & (cx < Wc)
+        return vmask[np.clip(cy, 0, Hc - 1)][:, np.clip(cx, 0, Wc - 1)] & oky[:, None] & okx[None, :]
+
+    def one(blk):
+        r0, c0 = blk
+        bh, bw = min(OB, r1b - r0), min(OB, c1b - c0)
+        out_win = _Window(c0 - c0b, r0 - r0b, bw, bh)
+        if not vmask[r0 // _GEOM_DS:-(-(r0 + bh) // _GEOM_DS), c0 // _GEOM_DS:-(-(c0 + bw) // _GEOM_DS)].any():
+            with wlock:
+                dst.write(np.zeros((nspec + 1, bh, bw), np.uint8), window=out_win)
+                counts["empty"] += 1
+            _HB.beat()
+            return
+        rd = _readers()
+        t = _time.time()
+        # the block's core on the measuring grid (the reference pixels centred in this output block) + context
+        j0, j1, i0, i1 = jstart(c0), jstart(c0 + bw), istart(r0), istart(r0 + bh)
+        wj0, wj1 = max(0, j0 - _PAD), min(MW, j1 + _PAD)
+        wi0, wi1 = max(0, i0 - _PAD), min(MH, i1 + _PAD)
+        h, w = wi1 - wi0, wj1 - wj0
+        win = _Window(wj0, wi0, w, h)
+        A = rd.a.read(a_bands, window=win)
+        gr = A[:-1].astype(np.float32).mean(0); vr = A[-1] > 127
+        del A
+        gm = rd.m.read(spec_bands[:3], window=win).astype(np.float32).mean(0)
+        vm = _mission_valid(rd, win, wi0, wj0, h, w)
+        cs = np.s_[i0 - wi0:i1 - wi0, j0 - wj0:j1 - wj0]
+        measured = vm[cs].mean() >= _MIN_SHARE and vr[cs].mean() >= _MIN_SHARE
+        if measured:
+            Gu, Gv = _E.flow(_E.fill_nearest(gr, vr), _E.fill_nearest(gm, vm), dev=dev)
+        else:
+            Gu = np.zeros((h, w), np.float32); Gv = np.zeros((h, w), np.float32)
+        t_meas = _time.time() - t; t = _time.time()
+
+        # ---- score the core: before, after, and the move, summed per cell -------------- #
+        ch, cw = i1 - i0, j1 - j0
+        if measured and ch > 0 and cw > 0:
+            yy, xx = np.mgrid[i0 - wi0:i1 - wi0, j0 - wj0:j1 - wj0].astype(np.float32)
+            gu, gv = Gu[cs], Gv[cs]
+            after = cv2.remap(gm, xx + gu, yy + gv, cv2.INTER_LINEAR)
+            v_after = cv2.remap(vm.astype(np.uint8), xx + gu, yy + gv, cv2.INTER_NEAREST) > 0
+            del xx, yy
+            ci0, cj0 = i0 // _CELL, j0 // _CELL
+            nhc, nwc = (i1 - 1) // _CELL - ci0 + 1, (j1 - 1) // _CELL - cj0 + 1
+            cid = ((np.arange(i0, i1) // _CELL - ci0)[:, None] * nwc + (np.arange(j0, j1) // _CELL - cj0)[None, :])
+            sums = np.zeros((15, nhc * nwc), np.float64)
+            g_r = gr[cs]
+            for base, x, ok in ((0, gm[cs], vm[cs] & vr[cs]), (6, after, v_after & vr[cs])):
+                ids = cid[ok]; xv = x[ok].astype(np.float64); yv = g_r[ok].astype(np.float64)
+                for q, wts in enumerate((None, xv, yv, xv * xv, yv * yv, xv * yv)):
+                    sums[base + q] = np.bincount(ids, weights=wts, minlength=nhc * nwc)
+            ok = vm[cs] & vr[cs]; ids = cid[ok]
+            sums[12] = np.bincount(ids, minlength=nhc * nwc)
+            sums[13] = np.bincount(ids, weights=gu[ok].astype(np.float64), minlength=nhc * nwc)
+            sums[14] = np.bincount(ids, weights=gv[ok].astype(np.float64), minlength=nhc * nwc)
+            with alock:
+                acc[:, ci0:ci0 + nhc, cj0:cj0 + nwc] += sums.reshape(15, nhc, nwc)
+            del after, v_after, cid, sums, g_r, gu, gv
+
+        # ---- warp the output block once: native pixels -> grid, shifted ----------------- #
+        rr = np.arange(r0, r0 + bh, dtype=np.float64); cc = np.arange(c0, c0 + bw, dtype=np.float64)
+        my = (((rr + 0.5) * res - ey) / mres - 0.5 - wi0).astype(np.float32)
+        mx = (((cc + 0.5) * res - ex) / mres - 0.5 - wj0).astype(np.float32)
+        MX, MY = np.meshgrid(mx, my)
+        fu = cv2.remap(Gu, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        fv = cv2.remap(Gv, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        del MX, MY, Gu, Gv, gr, gm, vr, vm
+        gxs = cc.astype(np.float32)[None, :] + fu * np.float32(k)   # the source position, output pixels
+        gys = rr.astype(np.float32)[:, None] + fv * np.float32(k)
+        del fu, fv
+        nx = gxs * np.float32(sx) + np.float32(ax)                  # ... and in native pixels
+        ny = gys * np.float32(sy) + np.float32(ay)
+        out = np.zeros((nspec + 1, bh, bw), np.uint8)
+        P = 3                                                        # the cubic kernel's reach, padded
+        nc0 = max(0, int(_math.floor(float(nx.min()))) - P); nc1 = min(mW, int(_math.ceil(float(nx.max()))) + P + 1)
+        nr0 = max(0, int(_math.floor(float(ny.min()))) - P); nr1 = min(mH, int(_math.ceil(float(ny.max()))) + P + 1)
         if nc1 > nc0 and nr1 > nr0:
-            nh, nw = nr1 - nr0, nc1 - nc0
-            nat8 = t.nat8[:nspec * nh * nw].reshape(nspec, nh, nw)
-            native = t.nat[:nspec * nh * nw].reshape(nspec, nh, nw)
-            tls.m.read(spec_bands, window=_Window(nc0, nr0, nw, nh), out=nat8)
-            np.copyto(native, nat8)                                   # uint8 -> float32, as astype did
-            # ONE resample: corrected source GRID coord -> NATIVE pixel (local to the read)
-            # == (sx * (hc0 + gx - fxs) + ax - nc0).astype(np.float32), step by step in float32
-            np.add(gx, np.float32(hc0), out=mapx); np.subtract(mapx, fxs, out=mapx)
-            np.multiply(mapx, np.float32(sx), out=mapx); np.add(mapx, np.float32(ax), out=mapx)
-            np.subtract(mapx, np.float32(nc0), out=mapx)
-            np.add(gy, np.float32(hr0), out=mapy); np.subtract(mapy, fys, out=mapy)
-            np.multiply(mapy, np.float32(sy), out=mapy); np.add(mapy, np.float32(ay), out=mapy)
-            np.subtract(mapy, np.float32(nr0), out=mapy)
+            nat = rd.n.read(spec_bands, window=_Window(nc0, nr0, nc1 - nc0, nr1 - nr0)).astype(np.float32)
+            nx -= np.float32(nc0); ny -= np.float32(nr0)
             for b in range(nspec):
-                cv2.remap(native[b], mapx, mapy, cv2.INTER_CUBIC, dst=rem,
-                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                np.clip(rem, 0, 255, out=rem)                         # cubic can overshoot [0,255]
-                np.copyto(outb[b], rem, casting="unsafe")             # float32 -> uint8, as astype did
-        # alpha stays grid-space + nearest (no blur), via the grid correction map
-        val = vc[np.ix_(v_rows[hr0 - r0b:hr1 - r0b], v_cols[hc0 - c0b:hc1 - c0b])]
-        np.subtract(gx, fxs, out=mapx); np.subtract(gy, fys, out=mapy)
-        a8 = t.a8[:n].reshape(hh, hw)
-        cv2.remap(val, mapx, mapy, cv2.INTER_NEAREST, dst=a8,
-                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        outb[nspec][a8 > 0] = 255
-        wout = t.wout[:(nspec + 1) * bh2 * bw2].reshape(nspec + 1, bh2, bw2)   # contiguous: no copy inside write()
-        np.copyto(wout, outb[:, iy:iy + bh2, ix:ix + bw2])
+                rem = cv2.remap(nat[b], nx, ny, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                np.clip(rem, 0, 255, out=rem)                        # cubic can overshoot [0,255]
+                out[b] = rem
+            del nat, rem
+        cy = np.floor((gys + 0.5) / _GEOM_DS).astype(np.int64); cx = np.floor((gxs + 0.5) / _GEOM_DS).astype(np.int64)
+        inside = (cy >= 0) & (cy < Hc) & (cx >= 0) & (cx < Wc)
+        out[nspec][inside & vmask[np.clip(cy, 0, Hc - 1), np.clip(cx, 0, Wc - 1)]] = 255
+        del gxs, gys, nx, ny, cy, cx, inside
         with wlock:
-            dst.write(wout, window=_Window(c0 - c0b, r0 - r0b, bw2, bh2))
-        _HB.beat()                                              # one heartbeat per warp block
+            dst.write(out, window=out_win)
+            counts["measured" if measured else "unmeasured"] += 1
+            secs["measure"] += t_meas; secs["warp"] += _time.time() - t
+        _HB.beat()                                                   # one heartbeat per block
 
-    # column-major so a worker's consecutive blocks share a field column stripe
-    wblocks = [(r0, c0) for c0 in range(c0b, c1b, _BLOCK) for r0 in range(r0b, r1b, _BLOCK)]
-    with _TPE(max_workers=workers) as ex:
-        list(ex.map(wone, wblocks))
+    blocks = [(r0, c0) for r0 in range(r0b, r1b, OB) for c0 in range(c0b, c1b, OB)]
+    log(f"    {len(blocks)} blocks")
+    t_last = [_time.time()]
+    with _TPE(max_workers=_BLOCKS_AT_ONCE) as ex_:
+        for n, _ in enumerate(ex_.map(one, blocks), 1):
+            if _time.time() - t_last[0] >= 60 or n == len(blocks):
+                t_last[0] = _time.time()
+                log(f"      [{n}/{len(blocks)}] blocks done ({_time.time() - t0:.0f}s)")
     dst.close()
-    _phase("warp")
-    log("    phases: " + ", ".join(f"{k} {v}s" for k, v in phases.items()))
+    _phase("register")
 
-    summary = dict(kind="align", mission=os.path.basename(mission),
-                   reference=os.path.basename(anchor),
+    # ---- the quality raster and the three numbers ------------------------------------ #
+    min_n = _MIN_CELL * _CELL * _CELL
+    rb_c = np.where(acc[0] >= min_n, _pearson(acc[0:6]), np.nan)
+    ra_c = np.where(acc[6] >= min_n, _pearson(acc[6:12]), np.nan)
+    mapped = acc[12] >= min_n
+    with np.errstate(invalid="ignore", divide="ignore"):
+        east = np.where(mapped, -acc[13] / acc[12] * mres * 100, np.nan)
+        north = np.where(mapped, acc[14] / acc[12] * mres * 100, np.nan)
+    move = np.hypot(east, north)
+    if not mapped.any():
+        raise RuntimeError("register_survey_dense: the reference covers none of the mission")
+    r_before = float(_pearson(acc[0:6].sum(axis=(1, 2))))
+    r_after = float(_pearson(acc[6:12].sum(axis=(1, 2))))
+    cell_ha = (_CELL * mres) ** 2 / 1e4
+    mv = move[mapped]
+    big = mv > BIG_MOVE_CM
+    moved_ha, moved_pct = float(big.sum() * cell_ha), float(100 * big.mean())
+    move_med = float(np.median(mv))
+    look = moved_pct > LOOK_PCT or not r_after > r_before
+    line = (f"{'⚠ look' if look else '✓'} r {r_before:.2f} → {r_after:.2f} · median move {move_med:.0f} cm · "
+            f">50 cm {moved_ha:.2f} ha ({moved_pct:.2f} %) · measured at {mres * 100:.1f} cm, "
+            f"the reference's pixels; registered map at {res * 100:.1f} cm")
+    quality = str(_Path(output_registered_survey_path).with_suffix(".quality.tif"))
+    with rasterio.open(quality, "w", driver="GTiff", width=WC, height=HC, count=len(QUALITY_BANDS),
+                       dtype="float32", crs=out_crs, transform=MTR * _Affine.scale(_CELL), nodata=float("nan"),
+                       tiled=True, compress="zstd") as q:
+        for i, nm in enumerate(QUALITY_BANDS, 1):          # tags BEFORE pixels (bands.py)
+            q.set_band_description(i, nm)
+        q.update_tags(method="eFOLKI", mission=os.path.basename(mission), reference=os.path.basename(anchor),
+                      measured_res_m=round(mres, 5), cell_px=_CELL, cell_m=round(_CELL * mres, 3),
+                      r_before=round(r_before, 4), r_after=round(r_after, 4), move_median_cm=round(move_med, 1),
+                      moved_over_50cm_ha=round(moved_ha, 3), moved_over_50cm_pct=round(moved_pct, 3),
+                      look=str(look).lower(),
+                      bands="r_before, r_after: Pearson r of the grey images in the cell before and after; "
+                            "move_cm, move_east_cm, move_north_cm: how far the mission's content moved")
+        for i, a in enumerate((rb_c, ra_c, move, east, north), 1):
+            q.write(a.astype(np.float32), i)
+    _phase("quality")
+    log(f"    {line}")
+    log("    phases: " + ", ".join(f"{k_} {v}s" for k_, v in phases.items())
+        + f" (eFOLKI and reads {secs['measure']:.0f}s, scoring and warp {secs['warp']:.0f}s, summed over blocks)")
+
+    summary = dict(kind="align", method="eFOLKI", settings=dict(_E.SETTINGS, block_px=_CORE, context_px=_PAD),
+                   mission=os.path.basename(mission), reference=os.path.basename(anchor),
                    bands=list(law.names), alpha="tagged" if law.alpha else "derived",
-                   tiles=len(tiles),
-                   matches=int(len(an)), cells=int(len(pts)), rejected=n_rej,
-                   failed_cells=failed_cells,
-                   d_med_cm=round(d_med, 1),
-                   d_p99_cm=round(float(np.percentile(np.hypot(vx, vy), 99)) * res * 100, 1),
-                   maxF_cm=round(maxF * res * 100, 1),
-                   out=str(output_registered_survey_path),
-                   cells_tif=cells_out, cell_px=_FS, cell_bands=list(CELL_BANDS),
-                   phases=phases, match=mt,
+                   measured_res_m=round(mres, 5), res_m=res, cell_m=round(_CELL * mres, 3),
+                   r_before=round(r_before, 4), r_after=round(r_after, 4), move_median_cm=round(move_med, 1),
+                   moved_over_50cm_ha=round(moved_ha, 3), moved_over_50cm_pct=round(moved_pct, 3),
+                   mapped_ha=round(float(mapped.sum() * cell_ha), 2), look=bool(look), line=line,
+                   out=str(output_registered_survey_path), quality_tif=quality, quality_bands=list(QUALITY_BANDS),
+                   blocks=dict(counts), device=dev.type, phases=phases,
+                   block_seconds={k_: round(v, 1) for k_, v in secs.items()},
                    seconds=round(_time.time() - t0, 1))
     if qa_json:
         _Path(qa_json).parent.mkdir(parents=True, exist_ok=True)
