@@ -460,6 +460,11 @@ from scipy.ndimage import distance_transform_edt as _edt
 from . import fields as _F
 from . import bands as _B
 
+# each source's one read onto the union grid. On the shared lattice it is an exact copy; off it, one cubic
+# resample, the kernel registration uses (2026-07-17 sharpness audit). `average` here cost an off-lattice
+# map 0.43 of its fine detail against cubic's 0.75 (0.4.1).
+STITCH_RESAMPLING = Resampling.cubic
+
 _GEOM_DS = 8                         # coarse geometry decimation
 _HALO = 64                           # block halo so band shifts never sample off-block
 _EF_PAD = 512                        # eFOLKI's context around a faultline: twice its reach (efolki.REACH_PX)
@@ -793,7 +798,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     def src_vrts():
         if not hasattr(tls, "v"):
             tls.v = {i: _WarpedVRT(rasterio.open(paths[i]), crs=out_crs, transform=OUT_TR,
-                                   width=OUT_W, height=OUT_H, resampling=Resampling.average)
+                                   width=OUT_W, height=OUT_H, resampling=STITCH_RESAMPLING)
                      for i in range(N)}
         return tls.v
 

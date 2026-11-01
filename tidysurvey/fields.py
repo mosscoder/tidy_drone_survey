@@ -60,14 +60,15 @@ def upsample_block(arr, fac, r0, c0, bh, bw, interp=cv2.INTER_LINEAR, out=None):
 # seamline geometry + tapered composite (stitching apply)
 # --------------------------------------------------------------------------- #
 def apply_field_confined(spec, valid, fx, fy, taper):
-    """Sample spec at p + taper*field. Where taper==0 the map is the identity
-    grid, so the single-source interior is returned unchanged (byte-identical
-    outside the seam band)."""
+    """Sample spec at p + taper*field, cubic (the caller rounds and clips). Where
+    taper==0 the map is the identity grid and cubic is exact at whole pixels, so
+    the single-source interior is returned unchanged (byte-identical outside the
+    seam band). Bilinear until 0.4.1: a softer second resample inside the band."""
     nb, H, W = spec.shape
     xs, ys = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
     mapx = (xs + taper * fx).astype(np.float32)
     mapy = (ys + taper * fy).astype(np.float32)
-    reg = np.stack([cv2.remap(spec[b], mapx, mapy, cv2.INTER_LINEAR, borderValue=0)
+    reg = np.stack([cv2.remap(spec[b], mapx, mapy, cv2.INTER_CUBIC, borderValue=0)
                     for b in range(nb)])
     vreg = cv2.remap(valid.astype(np.uint8), mapx, mapy, cv2.INTER_NEAREST, borderValue=0) > 0
     return reg, vreg

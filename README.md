@@ -121,7 +121,9 @@ tags its alpha band and names its bands, so a registered mission is
 Registration uses eFOLKI, a dense optical flow, in `tidysurvey/efolki.py`. It
 measures the shift at every pixel of the reference map's own grid, with the
 mission averaged onto that grid. Nothing is measured on a coarser copy. Each
-block of the output is then warped once, cubic, from the mission's own pixels.
+block of the output is then warped once, cubic, from the mission's own pixels,
+onto a grid whose corner is on the lattice of its pixel size, so the season
+stitch copies it without resampling.
 The settings are window radii 32, 24, 16 and 8, eight iterations per window,
 rank radius 4 and three pyramid levels. The sources, the tests and what is our
 own choice are in the audit's `02_registration/METHOD.md`.
@@ -159,6 +161,19 @@ the visible ownership exists and the mission names match.
 
 ## Changes
 
+- **0.4.1** (2026-11-01). One resample per pixel, cubic, everywhere it can be.
+  The season stitch reads each source onto its grid cubic instead of `average`.
+  A source on the grid's lattice is still copied exactly, and one off it, an
+  unregistered reference map, keeps more of its fine detail. The interiors gate
+  reads the same way. The seam band warps cubic instead of bilinear, and stays
+  exact where the taper is zero. Registration rounds its cubic warp to the
+  nearest DN where it used to truncate, which left every registered pixel half
+  a DN dark on average. `register_survey_dense` takes `blocks_at_once`, or
+  `TIDYSURVEY_BLOCKS_AT_ONCE`, the number of blocks it works on at once.
+  eFOLKI still runs one block at a time while the others read and warp. New
+  tests check each of these. A map registered to itself comes back byte for
+  byte, a known shift comes back as one cubic sample of the native pixels, and
+  the stitch copies on-lattice maps exactly and reads off-lattice ones cubic.
 - **0.4.0** (2026-10-31). eFOLKI replaces LoFTR in registration and in the seam
   merge, as settled in the audit's `02_registration/METHOD.md`. Registration
   measures on the reference's own pixels in blocks of 4096 with 1024 pixels of

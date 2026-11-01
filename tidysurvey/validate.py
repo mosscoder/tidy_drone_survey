@@ -240,6 +240,7 @@ def assert_interiors_unchanged(inputs, mosaic, ownership, band_width_m=1.0,
       denser than 0.1% — fail: that is blend leakage, the thing this gate
       exists to catch."""
     from scipy.ndimage import distance_transform_edt
+    from .merge import STITCH_RESAMPLING                 # read the source exactly as the stitch did
 
     rng = np.random.RandomState(seed)
     names = [n for n, _ in inputs]
@@ -263,7 +264,7 @@ def assert_interiors_unchanged(inputs, mosaic, ownership, band_width_m=1.0,
             pick = rng.choice(len(ys), size=min(samples_per_input, len(ys)), replace=False)
             with rasterio.open(paths[name]) as s, \
                     WarpedVRT(s, crs=m_crs, transform=m_tr, width=m.width,
-                              height=m.height, resampling=Resampling.average) as v:
+                              height=m.height, resampling=STITCH_RESAMPLING) as v:
                 for j in pick:
                     wx, wy = o_tr * (xs[j] + 0.5, ys[j] + 0.5)   # world centre of the cell
                     col, row = ~m_tr * (wx, wy)

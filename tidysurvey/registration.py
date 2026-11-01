@@ -43,7 +43,7 @@ _CORE, _PAD = 4096, 1024     # a measured block and the context read around it, 
 _CELL = 64                   # the quality raster's cell, in reference pixels (2.1 m on a 3.3 cm map)
 _MIN_SHARE = 0.01            # a block is measured when the mission and the reference each cover this share of it
 _MIN_CELL = 0.25             # a cell is scored when both maps cover this share of it
-_BLOCKS_AT_ONCE = 2          # blocks in flight: one measuring on the GPU while another reads or warps
+_BLOCKS_AT_ONCE = 2          # blocks in flight by default; TIDYSURVEY_BLOCKS_AT_ONCE or blocks_at_once= sets it per machine
 BIG_MOVE_CM = 50.0           # the size of a shadow slide: the area that moved more than this is reported
 LOOK_PCT = 0.5               # a map is flagged for a look when more than this percent of it moved over BIG_MOVE_CM
 QUALITY_BANDS = ("r_before", "r_after", "move_cm", "move_east_cm", "move_north_cm")
@@ -237,7 +237,8 @@ def register_survey_dense(
     output_registered_survey_path: str,
     resolution_m: float = None,          # the output grid; None = the mission's own pixel size
     device=None,                         # the eFOLKI device (efolki.device); None = CUDA, then MPS, then the CPU
-    workers: int = None,                 # accepted for compatibility; blocks run _BLOCKS_AT_ONCE at a time
+    workers: int = None,                 # GDAL threads compressing the output; None = all CPUs but one
+    blocks_at_once: int = None,          # blocks in flight; eFOLKI runs one at a time, the reads and warps in parallel
     qa_json: str = None,
     log=print,
     band_names=None,       # the config's spectral band names (first N non-alpha bands); None = all
@@ -444,7 +445,7 @@ def register_survey_dense(
             for b in range(nspec):
                 rem = cv2.remap(nat[b], nx, ny, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
                 np.clip(rem, 0, 255, out=rem)                        # cubic can overshoot [0,255]
-                out[b] = rem
+                out[b] = np.rint(rem)                                # rounded: a bare cast truncates, half a DN dark
             del nat, rem
         cy = np.floor((gys + 0.5) / _GEOM_DS).astype(np.int64); cx = np.floor((gxs + 0.5) / _GEOM_DS).astype(np.int64)
         inside = (cy >= 0) & (cy < Hc) & (cx >= 0) & (cx < Wc)
@@ -457,9 +458,10 @@ def register_survey_dense(
         _HB.beat()                                                   # one heartbeat per block
 
     blocks = [(r0, c0) for r0 in range(r0b, r1b, OB) for c0 in range(c0b, c1b, OB)]
-    log(f"    {len(blocks)} blocks")
+    at_once = max(1, int(blocks_at_once or os.environ.get("TIDYSURVEY_BLOCKS_AT_ONCE") or _BLOCKS_AT_ONCE))
+    log(f"    {len(blocks)} blocks, {at_once} at once")
     t_last = [_time.time()]
-    with _TPE(max_workers=_BLOCKS_AT_ONCE) as ex_:
+    with _TPE(max_workers=at_once) as ex_:
         for n, _ in enumerate(ex_.map(one, blocks), 1):
             if _time.time() - t_last[0] >= 60 or n == len(blocks):
                 t_last[0] = _time.time()
@@ -517,7 +519,7 @@ def register_survey_dense(
                    moved_over_50cm_ha=round(moved_ha, 3), moved_over_50cm_pct=round(moved_pct, 3),
                    mapped_ha=round(float(mapped.sum() * cell_ha), 2), look=bool(look), line=line,
                    out=str(output_registered_survey_path), quality_tif=quality, quality_bands=list(QUALITY_BANDS),
-                   blocks=dict(counts), device=dev.type, phases=phases,
+                   blocks=dict(counts), blocks_at_once=at_once, device=dev.type, phases=phases,
                    block_seconds={k_: round(v, 1) for k_, v in secs.items()},
                    seconds=round(_time.time() - t0, 1))
     if qa_json:
