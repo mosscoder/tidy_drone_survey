@@ -169,6 +169,10 @@ def _stitch(cfg, product):
                            res=res if isinstance(res, float) else None,
                            out_crs=cfg.crs, ownership_out=str(ownership),
                            owner_in=owner_in,
+                           seams=(f"{cfg.stitch.seams_work.rstrip('/')}/{'visible' if product == 'visible' else 'ms'}"
+                                  if cfg.stitch.seams_work else None),
+                           seams_local_workers=cfg.stitch.seams_local_workers,
+                           seams_local_delay_s=cfg.stitch.seams_local_delay_s,
                            report_json=str(rep_path), log=say)
     validate.seam_tripwire(rep, max_cm=cfg.stitch.seam_tripwire_cm).assert_ok()
     validate.assert_interiors_unchanged(inputs, str(out), str(ownership),

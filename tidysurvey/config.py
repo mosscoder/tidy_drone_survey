@@ -73,6 +73,9 @@ class StitchCfg:
     band_width_m: float = 1.0        # blend width; the one aesthetic knob
     gauge: str = "free"              # "free" = split evenly; "anchored" = pin to the first input
     seam_tripwire_cm: float = 20.0   # hard gate on post-stitch seams
+    seams_work: str = ""             # a work folder (local dir or gs://) to measure the seams elsewhere; "" = inline
+    seams_local_workers: int = 1     # this machine's own workers on the folder (the floor when no other shows up)
+    seams_local_delay_s: float = 0.0 # wait this long before starting them, so faster workers elsewhere go first
 
 
 @dataclass
@@ -430,7 +433,10 @@ def load(path: str, resolve_auto: bool = True) -> Config:
     s = raw.get("stitch", {})
     cfg.stitch = StitchCfg(band_width_m=s.get("band_width_m", 1.0),
                            gauge=s.get("gauge", "free"),
-                           seam_tripwire_cm=s.get("seam_tripwire_cm", 20.0))
+                           seam_tripwire_cm=s.get("seam_tripwire_cm", 20.0),
+                           seams_work=str(s.get("seams_work", "") or ""),
+                           seams_local_workers=int(s.get("seams_local_workers", 1)),
+                           seams_local_delay_s=float(s.get("seams_local_delay_s", 0.0)))
     c = raw.get("calibrate", {})
     cfg.calibrate = CalibrateCfg(
         reference=c.get("reference", "sentinel-2"),

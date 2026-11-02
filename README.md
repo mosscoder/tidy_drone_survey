@@ -159,7 +159,36 @@ falls back to the distance rule wherever the recycled owner is absent or not
 valid. `tidysurvey stitch --product multispectral` does this by itself when
 the visible ownership exists and the mission names match.
 
+### Measuring the seams elsewhere
+
+The seam measurement is the only part of a stitch that wants a GPU. With a work
+folder the stitch hands it out. After the coarse pass it exports each seam box's
+two grey images to the folder, waits until every box has a flow, and renders
+with those flows. Any machine can measure them with `python -m tidysurvey.seamstore
+measure <folder>`, a GPU elsewhere, the CPUs of another machine, or this one. A
+worker claims a box by creating its claim, which only one worker can do, and a
+claim left by a worker that died is taken over after ten minutes. The folder is
+a local directory or a gs:// prefix, and it is emptied when the stitch is done.
+
+```toml
+[stitch]
+seams_work = "gs://bucket/survey/records/seams"   # or a local directory; "" measures inline
+seams_local_workers = 2                           # this machine's own workers, the floor
+seams_local_delay_s = 600                         # give faster workers elsewhere a head start
+```
+
+The method does not change. A worker runs the same eFOLKI on the same two arrays
+the stitch would have, so on one device the split stitch is the inline stitch
+byte for byte (`tests/test_seam_split.py`). A flow measured on another device
+differs by about 1e-3 px, and the stage report counts the boxes measured on each
+device (`seams_measured_on`).
+
 ## Changes
+
+- **0.5.0** (2026-11-02). The seams can be measured elsewhere. A stitch with a
+  work folder exports its seam boxes, any worker measures them, and the stitch
+  renders with their flows (`seamstore.py`, "Measuring the seams elsewhere"
+  above). Without a folder nothing changes.
 
 - **0.4.2** (2026-11-01). The registered map's edges. DroneDeploy's no-data mask
   decides which output pixels have data, pixel by pixel at full resolution. Until

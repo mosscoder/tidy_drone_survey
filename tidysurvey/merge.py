@@ -1,6 +1,8 @@
 import gc
 import os
 import shutil
+import subprocess as _subprocess
+import sys as _sys
 import tempfile
 
 import cv2
@@ -533,7 +535,8 @@ def _recycle_owner(owner_in, names, valid_c, owner_c, out_crs, tr_c, Wc, Hc):
 def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=None,
                workers=None, block=2048, ownership_out=None, report_json=None,
                nspec=None, render_chunk=None, band_names=None, owner_in=None,
-               geometry_only=False, log=print):
+               geometry_only=False, seams=None, seams_local_workers=1, seams_local_delay_s=0.0,
+               log=print):
     """Merge N overlapping orthomosaics with the 1 m seam-walk blend.
 
     inputs   : list of (name, path) pairs — every input is named; names carry
@@ -557,6 +560,15 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                rule decides (the validity fallback); the report counts both.
     geometry_only : stop after the coarse pass and the ownership raster —
                the seams from the alphas alone, no matching, no render.
+    seams    : a work folder (a local directory or a gs:// prefix, seamstore.py) to measure
+               the seams elsewhere (0.5.0). After the coarse pass the stitch exports every
+               seam box's two grey images there, waits until each box has a flow (from any
+               worker: `python -m tidysurvey.seamstore measure <folder>` on a GPU, a CPU or
+               another machine), then renders with those flows, exactly as it would have
+               with its own. None = measure inline, as before.
+    seams_local_workers : workers this machine starts on the folder (subprocesses, one flow
+               at a time each), after `seams_local_delay_s` seconds, so a stitch finishes
+               even when no other worker shows up. 0 = rely on others entirely.
     ownership_out : a 2-band uint8 raster on the coarse grid: band 1 = owner
                index (1..N) with N+1 inside the seam band (what the interiors
                gate reads), band 2 = the owner index everywhere (what
@@ -806,22 +818,22 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         l, b, r, t = bounds[i]
         return not (bx1 <= l or bx0 >= r or by1 <= b or by0 >= t)
 
-    def _seam_fields(r0, c0, bh, bw, hr0, hc0, hh, hw, iy, ix, present, val, geom):
-        """The shift of each present flight on the haloed block. Every pair of present
-        flights that share a faultline within _EF_PAD of the block is measured with
-        eFOLKI on the merge grid, in the box around that faultline padded by _EF_PAD,
-        where both have data (no-data filled from the nearest pixel where both do);
-        the pair offsets are then split at each band pixel (minimum-norm least
-        squares over the flights covering it). Records the seam statistics."""
-        from . import efolki as _E
+    store = None
+    if seams is not None:                         # the seams measured elsewhere (seamstore.py)
+        from .seamstore import SeamStore
+        store = seams if isinstance(seams, SeamStore) else SeamStore(str(seams))
+    measured_on = _dd(int)                         # flows by device, for the report
+
+    def _pair_boxes(r0, c0, bh, bw, hr0, hc0, hh, hw, present):
+        """Every pair of present flights that share a faultline within _EF_PAD of the block,
+        with the box it is measured in (around that faultline, padded by _EF_PAD, clipped to
+        the block's search region) and the part of the box that lies on the haloed block.
+        The export and the render walk the same boxes in the same way."""
         pr0, pc0 = max(0, r0 - _EF_PAD), max(0, c0 - _EF_PAD)
         pr1, pc1 = min(OUT_H, r0 + bh + _EF_PAD), min(OUT_W, c0 + bw + _EF_PAD)
         cr0, cc0 = pr0 // _GEOM_DS, pc0 // _GEOM_DS
         own_c = np.asarray(owner_mm[cr0:-(-pr1 // _GEOM_DS), cc0:-(-pc1 // _GEOM_DS)])
         c2_c = np.asarray(cov2_mm[cr0:-(-pr1 // _GEOM_DS), cc0:-(-pc1 // _GEOM_DS)])
-        V = src_vrts()
-        pos = {i: k for k, i in enumerate(present)}
-        efield = {}
         for ia, ib in _combinations(present, 2):
             if (ia, ib) not in stats:
                 continue                                  # these two never share a faultline
@@ -838,21 +850,59 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             ir0, ir1 = max(br0, hr0), min(br1, hr0 + hh); ic0, ic1 = max(bc0, hc0), min(bc1, hc0 + hw)
             if ir1 <= ir0 or ic1 <= ic0:
                 continue
-            win = Window(bc0, br0, bc1 - bc0, br1 - br0)
-            a = V[ia].read(window=win); b = V[ib].read(window=win)
-            both = _valid(ia, a) & _valid(ib, b)
+            yield ia, ib, (br0, br1, bc0, bc1), (ir0, ir1, ic0, ic1)
+
+    def _box_read(ia, ib, box):
+        br0, br1, bc0, bc1 = box
+        V = src_vrts(); win = Window(bc0, br0, bc1 - bc0, br1 - br0)
+        a = V[ia].read(window=win); b = V[ib].read(window=win)
+        return a, b, _valid(ia, a) & _valid(ib, b)
+
+    def _box_grey(ia, ib, a, b, both):
+        """The two images eFOLKI measures: grey, stretched, no-data filled from the nearest pixel where both have data."""
+        from . import efolki as _E
+        ga = _E.fill_nearest(np.where(both, _F.gray_stretch(a[spec_idx[ia][:3]].astype(np.float32)), 0), both)
+        gb = _E.fill_nearest(np.where(both, _F.gray_stretch(b[spec_idx[ib][:3]].astype(np.float32)), 0), both)
+        return ga, gb
+
+    def _box_key(r0, c0, ia, ib):
+        return f"{r0}_{c0}_{ia}_{ib}"
+
+    def _seam_fields(r0, c0, bh, bw, hr0, hc0, hh, hw, iy, ix, present, val, geom):
+        """The shift of each present flight on the haloed block. Every pair of present
+        flights that share a faultline within _EF_PAD of the block is measured with
+        eFOLKI on the merge grid, in the box around that faultline padded by _EF_PAD,
+        where both have data (no-data filled from the nearest pixel where both do);
+        the pair offsets are then split at each band pixel (minimum-norm least
+        squares over the flights covering it). Records the seam statistics. With a
+        work folder the flow of a box is the one measured there, on the same box."""
+        from . import efolki as _E
+        pos = {i: k for k, i in enumerate(present)}
+        efield = {}
+        for ia, ib, box, (ir0, ir1, ic0, ic1) in _pair_boxes(r0, c0, bh, bw, hr0, hc0, hh, hw, present):
+            br0, br1, bc0, bc1 = box
+            a, b, both = _box_read(ia, ib, box)
             if not both.any():
                 continue
-            ga = _E.fill_nearest(np.where(both, _F.gray_stretch(a[spec_idx[ia][:3]].astype(np.float32)), 0), both)
-            gb = _E.fill_nearest(np.where(both, _F.gray_stretch(b[spec_idx[ib][:3]].astype(np.float32)), 0), both)
-            del a, b
-            u, v = _E.flow(ga, gb)                        # b(x + e) lines up with a(x)
-            eu = np.full((hh, hw), np.nan, np.float32); ev = eu.copy()
             sb = np.s_[ir0 - br0:ir1 - br0, ic0 - bc0:ic1 - bc0]
+            got = store.get_flow(_box_key(r0, c0, ia, ib)) if store is not None else None
+            if got is not None and got[2].get("box") == list(box):
+                uk, vk = got[0], got[1]                   # measured from exactly these two images elsewhere
+                with slock:
+                    measured_on[got[2].get("device", "?")] += 1
+            else:
+                ga, gb = _box_grey(ia, ib, a, b, both)
+                u, v = _E.flow(ga, gb)                    # b(x + e) lines up with a(x)
+                uk, vk = u[sb], v[sb]
+                with slock:
+                    measured_on["inline" if store is None else "inline (no flow in the folder)"] += 1
+                del u, v, ga, gb
+            del a, b
+            eu = np.full((hh, hw), np.nan, np.float32); ev = eu.copy()
             sh = np.s_[ir0 - hr0:ir1 - hr0, ic0 - hc0:ic1 - hc0]
-            eu[sh] = np.where(both[sb], u[sb], np.nan); ev[sh] = np.where(both[sb], v[sb], np.nan)
+            eu[sh] = np.where(both[sb], uk, np.nan); ev[sh] = np.where(both[sb], vk, np.nan)
             efield[(ia, ib)] = (eu, ev)
-            del u, v, ga, gb, both
+            del uk, vk, both
         n = len(present)
         fx = [np.zeros((hh, hw), np.float32) for _ in range(n)]
         fy = [np.zeros((hh, hw), np.float32) for _ in range(n)]
@@ -950,6 +1000,42 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             dst.write(outh[:, iy:iy + bh, ix:ix + bw], window=Window(c0, r0, bw, bh))
         return kind
 
+    def export_block(r0, c0, have):
+        """The work folder's half of a seam block: its boxes' grey images, exactly as the render
+        would measure them, written out; the keys of every box the block will need."""
+        bh = min(block, OUT_H - r0); bw = min(block, OUT_W - c0)
+        hr0, hc0 = max(0, r0 - _HALO), max(0, c0 - _HALO)
+        hr1, hc1 = min(OUT_H, r0 + bh + _HALO), min(OUT_W, c0 + bw + _HALO)
+        hh, hw = hr1 - hr0, hc1 - hc0
+        iy, ix = r0 - hr0, c0 - hc0
+        bx0, by0 = OUT_TR * (hc0, hr1); bx1, by1 = OUT_TR * (hc1, hr0)
+        present = [i for i in range(N) if covers(i, bx0, by0, bx1, by1)]
+        if len(present) < 2:
+            return []
+        V = src_vrts()
+        val = {i: _valid(i, V[i].read(window=Window(hc0, hr0, hw, hh))) for i in present}
+        present = [i for i in present if val[i].any()]
+        if len(present) < 2:
+            return []
+        geom = _seam_geom_block(hr0, hc0, hh, hw, present, [val[i] for i in present], ds_c, D_c,
+                                res, band_width_m, owner_c=owner_mm if owner_in else None)
+        if not geom["in_band"][iy:iy + bh, ix:ix + bw].any():
+            return []
+        keys = []
+        for ia, ib, box, (ir0, ir1, ic0, ic1) in _pair_boxes(r0, c0, bh, bw, hr0, hc0, hh, hw, present):
+            key = _box_key(r0, c0, ia, ib)
+            if key in have:                               # exported, or measured, by an earlier run
+                keys.append(key); continue
+            a, b, both = _box_read(ia, ib, box)
+            if not both.any():
+                continue
+            ga, gb = _box_grey(ia, ib, a, b, both)
+            br0, br1, bc0, bc1 = box
+            store.put_box(key, ga, gb, dict(box=list(box), keep=[ir0 - br0, ir1 - br0, ic0 - bc0, ic1 - bc0],
+                                            block=[r0, c0], pair=[names[ia], names[ib]], shape=list(ga.shape)))
+            keys.append(key)
+        return keys
+
     blocks = [(r0, c0) for r0 in range(0, OUT_H, block) for c0 in range(0, OUT_W, block)]
     # ---- render checkpoint: block-resume so a crash mid-composite never -------
     # restarts the ~183k x 237k render from block 0. Completed block indices are
@@ -967,6 +1053,36 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                 done = set(rc.get("done", []))
         except Exception:
             done = set()
+    if store is not None:                          # ---- the seams measured elsewhere ---- #
+        have = store.box_keys() | store.flow_keys()
+        log(f"    seams: exporting boxes to {store.root}")      # aerial starts its workers on this line
+        t_x = _time.perf_counter(); keys = []
+        with _TPE(max_workers=workers) as ex:
+            for ks in ex.map(lambda bi: export_block(*blocks[bi], have), [bi for bi in range(len(blocks)) if bi not in done]):
+                keys += ks
+        store.finish_export(keys, dict(stitch=str(out), names=list(names), res=float(res), grid=[OUT_W, OUT_H]))
+        log(f"    seams: {len(keys)} boxes exported in {_time.perf_counter() - t_x:.0f}s; measuring")
+        t_w = _time.perf_counter(); t_say = 0.0; procs = []
+        while True:
+            left = set(keys) - store.flow_keys()
+            now = _time.perf_counter()
+            if not left:
+                break
+            if seams_local_workers and now - t_w >= seams_local_delay_s:     # this machine's own workers, the floor
+                procs = [p_ for p_ in procs if p_.poll() is None]
+                while len(procs) < seams_local_workers:
+                    procs.append(_subprocess.Popen([_sys.executable, "-m", "tidysurvey.seamstore", "measure", store.root],
+                                                   stdout=_subprocess.DEVNULL))
+            if now - t_say >= 60:
+                log(f"    seams: {len(keys) - len(left)}/{len(keys)} measured")
+                t_say = now
+            _time.sleep(5)
+        for p_ in procs:
+            try:
+                p_.wait(timeout=120)
+            except _subprocess.TimeoutExpired:
+                p_.kill()
+        log(f"    seams: all {len(keys)} measured in {_time.perf_counter() - t_w:.0f}s")
     if done:
         dst = rasterio.open(out, "r+")
         log(f"    composite: resuming — {len(done)}/{len(blocks)} blocks already on "
@@ -1007,6 +1123,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     gc.collect()
     shutil.rmtree(mmdir, ignore_errors=True)      # ~74 GB of coarse scratch, done
     rckpt.unlink(missing_ok=True)                 # render finished -> drop the checkpoint
+    if store is not None:
+        store.clear()                             # the boxes and flows were this stitch's scratch
 
     seams = []
     for (i, j) in seam_pairs:                     # per seam: length, offset on the faultline, misfit of the split
@@ -1028,7 +1146,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                   grid=[OUT_W, OUT_H], blocks=dict(counts),
                   seconds=round(_time.perf_counter() - t0, 1), out=str(out),
                   ownership=str(ownership_out) if ownership_out else None,
-                  recycled=recycled, owner_in=(str(owner_in) if owner_in else None))
+                  recycled=recycled, owner_in=(str(owner_in) if owner_in else None),
+                  seams_measured_on=dict(measured_on), seams_work=(store.root if store is not None else None))
     if report_json:
         _Path(report_json).parent.mkdir(parents=True, exist_ok=True)
         _Path(report_json).write_text(_json.dumps(report, indent=2))
