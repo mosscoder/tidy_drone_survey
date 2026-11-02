@@ -19,7 +19,7 @@ Apple GPUs (MPS) or the CPU. It keeps the reference's behaviour, including the p
 min-max normalisation of both images; the Burt pyramid (5-tap kernel a = 0.4, zero padding, every second
 pixel kept); the rank transform counting neighbours greater than the centre, zeros outside the image;
 np.gradient (central differences, one-sided at the edges); window averages with zero padding, divided by
-the full window size; the bilinear warp with edge replication; the flow passed to the next level by pixel
+the full window size (by cumulative sums on a CPU, _box); the bilinear warp with edge replication; the flow passed to the next level by pixel
 repetition, times 2; NaN and Inf flow set to 0. It differs in float32 (MPS has no float64) and the order of
 floating-point sums. Checked against the reference in the audit (02_registration/matcher_ablation/poc/
 check_port.py, cuda_check_synth.py): at most 0.05 px apart on three 1024 px crops, 0.003 px or less at the
@@ -78,9 +78,19 @@ def _sep(I, k):
 
 
 def _box(I, rad):
-    """Mean over a (2 rad + 1)^2 window with zeros outside the image."""
+    """Mean over a (2 rad + 1)^2 window with zeros outside the image. On a GPU, the separable correlation of the
+    reference code. On a CPU, the same sums by cumulative sums (summed in float64), which the season VM's cores do
+    twice as fast as the 65-tap convolutions (24.5 s against 47.7 s per seam box, 2026-11-01); the two agree to
+    3e-5 on window means of rank values, and GPUs run the convolution faster."""
     import torch
-    return _sep(I, torch.full((2 * rad + 1,), 1.0 / (2 * rad + 1)))
+    if I.device.type != "cpu":
+        return _sep(I, torch.full((2 * rad + 1,), 1.0 / (2 * rad + 1)))
+    import torch.nn.functional as Fn
+    k = 2 * rad + 1
+    c = Fn.pad(torch.cumsum(Fn.pad(I, (rad, rad, 0, 0)).to(torch.float64), -1), (1, 0, 0, 0))
+    J = c[..., k:] - c[..., :-k]
+    c = Fn.pad(torch.cumsum(Fn.pad(J, (0, 0, rad, rad)), -2), (0, 0, 1, 0))
+    return ((c[..., k:, :] - c[..., :-k, :]) / (k * k)).to(I.dtype)
 
 
 def _pyr_up(I):

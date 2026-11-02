@@ -114,9 +114,10 @@ class KnownMove(unittest.TestCase):
         self.assertLess(float(np.median(resid[inner][m])), 4.0)
 
 
-class CoarserMissionWithoutAlpha(unittest.TestCase):
-    """A 5-band 2024-law mission at 8.3 cm (no alpha, border zeros) registered to a 5 cm reference: measured
-    on the reference's 5 cm pixels, written on the mission's own 8.3 cm grid with a tagged alpha."""
+class CoarserMultispectralMission(unittest.TestCase):
+    """A 6-band multispectral mission laid out as DroneDeploy exports it (band 5 a copy of NIR, band 6 a tagged
+    alpha) at 8.3 cm, registered to a 5 cm reference: measured on the reference's 5 cm pixels, written on the
+    mission's own 8.3 cm grid with its four spectral bands and the alpha."""
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(prefix="reg_efolki_ms_"))
@@ -128,12 +129,18 @@ class CoarserMissionWithoutAlpha(unittest.TestCase):
         mov = np.stack([cv2.remap(ref[b].astype(np.float32), xx + 6.0, yy - 3.5, cv2.INTER_CUBIC) for b in (0, 1, 2)])
         res = 0.083; tr = from_origin(500000.0 + 0.091, 5170000.0 - 0.021, res, res)
         h, w = int(H * RES / res) - 2, int(W * RES / res) - 2
-        ms = np.zeros((5, h, w), np.float32)
+        ms = np.zeros((6, h, w), np.float32)
         for b, src in enumerate((0, 1, 2, 2, 2)):
             reproject(mov[src], ms[b], src_transform=rtr, src_crs=CRS, dst_transform=tr, dst_crs=CRS,
                       resampling=Resampling.average)
-        ms = np.clip(ms, 1, 255).astype(np.uint8); ms[:, :, :40] = 0; ms[:, -30:, :] = 0
-        cls.mission = _write(cls.tmp / "ms.tif", ms, tr, tag_alpha=False)
+        ms = np.clip(ms, 1, 255).astype(np.uint8); ms[5] = 255
+        ms[:, :, :40] = 0; ms[:, -30:, :] = 0                              # no data: alpha 0, every band 0
+        cls.mission = str(cls.tmp / "ms.tif")
+        with rasterio.open(cls.mission, "w", driver="GTiff", width=w, height=h, count=6, dtype="uint8", crs=CRS,
+                           transform=tr, tiled=True, blockxsize=256, blockysize=256, compress="zstd") as d:
+            d.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.undefined,
+                             ColorInterp.undefined, ColorInterp.alpha]
+            d.write(ms)
         cls.out = str(cls.tmp / "ms_out.tif")
         cls.s = R.register_survey_dense(cls.mission, cls.anchor, cls.out, log=lambda m: None,
                                         band_names=["Red", "Green", "NIR", "RedEdge"])
@@ -141,7 +148,7 @@ class CoarserMissionWithoutAlpha(unittest.TestCase):
     def test_measured_on_the_reference_written_on_its_own_grid(self):
         s = self.s
         self.assertEqual(s["measured_res_m"], RES); self.assertEqual(s["res_m"], 0.083)
-        self.assertEqual(s["alpha"], "derived"); self.assertEqual(s["bands"], ["Red", "Green", "NIR", "RedEdge"])
+        self.assertEqual(s["alpha"], "tagged"); self.assertEqual(s["bands"], ["Red", "Green", "NIR", "RedEdge"])
         self.assertGreater(s["r_after"], s["r_before"] + 0.2)
         with rasterio.open(s["quality_tif"]) as q:
             east, north = q.read(4), q.read(5)
@@ -154,9 +161,10 @@ class CoarserMissionWithoutAlpha(unittest.TestCase):
             self.assertEqual(o.descriptions, ("Red", "Green", "NIR", "RedEdge", "alpha"))
             law = B.band_law(self.out, ["Red", "Green", "NIR", "RedEdge"])
             self.assertEqual(law.alpha, 5)
-            self.assertGreater(o.transform.c, strip_x - 8 * 0.083)       # no-data is not carried as data
             a = o.read(5)
-            self.assertGreater(float((a == 255).mean()), 0.95)
+            first = o.transform.c + int(np.nonzero((a == 255).any(0))[0].min()) * o.res[0]
+            self.assertGreater(first, strip_x - 0.5)                      # no-data is not carried as data (the move is 0.3 m)
+            self.assertGreater(float((a == 255).mean()), 0.9)
 
 
 class Refusals(unittest.TestCase):
@@ -166,6 +174,14 @@ class Refusals(unittest.TestCase):
         img = np.stack([g * 200, g * 200, g * 200, np.full_like(g, 255)]).astype(np.uint8)
         a = _write(tmp / "a.tif", img, from_origin(600000.0, 5170000.0, RES, RES))
         m = _write(tmp / "m.tif", img, from_origin(500000.0, 5170000.0, RES, RES))
+        with self.assertRaises(RuntimeError):
+            R.register_survey_dense(m, a, str(tmp / "o.tif"), log=lambda s: None)
+
+    def test_mission_without_alpha(self):
+        tmp = Path(tempfile.mkdtemp(prefix="reg_efolki_noalpha_m_"))
+        g = (texture(300, 300, seed=4) * 200 + 20).astype(np.uint8)
+        a = _write(tmp / "a.tif", np.stack([g, g, g, np.full_like(g, 255)]), from_origin(500000.0, 5170000.0, RES, RES))
+        m = _write(tmp / "m.tif", np.stack([g, g, g]), from_origin(500000.0, 5170000.0, RES, RES), tag_alpha=False)
         with self.assertRaises(RuntimeError):
             R.register_survey_dense(m, a, str(tmp / "o.tif"), log=lambda s: None)
 

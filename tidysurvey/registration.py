@@ -32,6 +32,7 @@ import cv2
 import rasterio
 from rasterio.crs import CRS as _CRS
 from rasterio.vrt import WarpedVRT as _WarpedVRT
+import scipy.ndimage as _ndi
 from rasterio.windows import Window as _Window
 from rasterio.enums import Resampling as _Resampling
 from affine import Affine as _Affine
@@ -39,7 +40,9 @@ from . import bands as _B
 from . import heartbeat as _HB
 
 _GEOM_DS = 8                 # the coarse validity mask, in output pixels
-_CORE, _PAD = 4096, 1024     # a measured block and the context read around it, in reference pixels (the audit's)
+_CORE, _PAD = 4096, 512      # a measured block and the context read around it, in reference pixels. The settings need
+                             # about 350 px (reach 256, pyramid, rank, the shift); 1024 until 0.4.2 cost 31 % more eFOLKI
+                             # work for the same result to within floating-point noise (spring 00, 2026-11-01)
 _CELL = 64                   # the quality raster's cell, in reference pixels (2.1 m on a 3.3 cm map)
 _MIN_SHARE = 0.01            # a block is measured when the mission and the reference each cover this share of it
 _MIN_CELL = 0.25             # a cell is scored when both maps cover this share of it
@@ -279,6 +282,8 @@ def register_survey_dense(
     # band law (bands.py): spectral bands = the config names (first N non-alpha), validity =
     # the tagged alpha, else derived from zeros. Never guess from the band count.
     law = _B.band_law(mission, band_names)
+    if law.alpha is None:                           # DroneDeploy's exports have one; its no-data mask decides data
+        raise RuntimeError(f"register_survey_dense: {mission} has no alpha band")
     nspec, spec_bands = law.nspec, list(law.spectral)
     alaw = _B.band_law(anchor)
     if alaw.alpha is None:
@@ -301,14 +306,28 @@ def register_survey_dense(
     log(f"[register] {os.path.basename(mission)} -> grid {W}x{H} @ {res} m")
     log(f"    band law: {law.describe()}")
 
-    # ---- coarse validity of the mission: its bbox, and the output alpha --------------- #
+    # ---- where the mission has data, on a coarse grid: its bbox and which blocks are empty ---- #
     Wc, Hc = -(-W // _GEOM_DS), -(-H // _GEOM_DS)
     tr_c = TR * _Affine.scale(_GEOM_DS)
+    # DroneDeploy's no-data mask, the alpha band, decides: an output pixel has data only where the native pixel it
+    # samples has data (the warp below). On the coarse grid only a bound is kept, every cell holding any native
+    # data pixel, read at full resolution, so skipping empty ground can never drop one.
+    f = _GEOM_DS
+    anyb = np.zeros((-(-mH // f), -(-mW // f)), bool)              # any data in each native f x f block
     with rasterio.open(mission) as s:
-        with _WarpedVRT(s, crs=out_crs, transform=tr_c, width=Wc, height=Hc,
-                        resampling=_Resampling.average) as v:
-            vmask = _B.read_valid(v, law)       # exact alpha, else zeros + border flood fill
-    ys, xs = np.where(vmask)
+        for q0 in range(0, mH, 256 * f):
+            hq = min(256 * f, mH - q0)
+            al = np.pad(s.read(law.alpha, window=_Window(0, q0, mW, hq)) > 127, ((0, -hq % f), (0, -mW % f)))
+            anyb[q0 // f:q0 // f + al.shape[0] // f] = al.reshape(al.shape[0] // f, f, -1, f).any((1, 3))
+            del al
+    qr, qc = np.nonzero(anyb); del anyb
+    bx = mt.c + (qc + 0.5) * f * mt.a; by = mt.f + (qr + 0.5) * f * mt.e      # block centres
+    ci = np.floor((bx - TR.c) / (res * f)).astype(np.int64); ri = np.floor((TR.f - by) / (res * f)).astype(np.int64)
+    okb = (ri >= 0) & (ri < Hc) & (ci >= 0) & (ci < Wc)
+    vbound = np.zeros((Hc, Wc), bool); vbound[ri[okb], ci[okb]] = True
+    vbound = _ndi.binary_dilation(vbound, iterations=max(1, int(np.ceil(abs(mt.a) / res))))   # a block spans <= 2 cells a side
+    del qr, qc, bx, by, ci, ri, okb
+    ys, xs = np.where(vbound)
     if len(ys) == 0:
         raise RuntimeError("register_survey_dense: mission has no valid data")
     r0b = int(ys.min()) * _GEOM_DS; r1b = min(H, (int(ys.max()) + 1) * _GEOM_DS)
@@ -351,26 +370,20 @@ def register_survey_dense(
                                resampling=_Resampling.average)
             tls.m = _WarpedVRT(rasterio.open(mission), crs=out_crs, transform=MTR, width=MW, height=MH,
                                resampling=mis_rs)
-            tls.ma = (_WarpedVRT(rasterio.open(mission), crs=out_crs, transform=MTR, width=MW, height=MH,
-                                 resampling=_Resampling.nearest) if law.alpha else None)
+            tls.ma = _WarpedVRT(rasterio.open(mission), crs=out_crs, transform=MTR, width=MW, height=MH,
+                                resampling=_Resampling.nearest)
             tls.n = rasterio.open(mission)                       # native read for the warp
         return tls
 
     def _mission_valid(rd, win, wi0, wj0, h, w):
-        """The mission's validity on the measuring window: its alpha read nearest, or (no alpha) the
-        coarse mask at each pixel's output position."""
-        if law.alpha:
-            return rd.ma.read(law.alpha, window=win) > 127
-        cy = np.floor((ey + (np.arange(wi0, wi0 + h) + 0.5) * mres) / res / _GEOM_DS).astype(np.int64)
-        cx = np.floor((ex + (np.arange(wj0, wj0 + w) + 0.5) * mres) / res / _GEOM_DS).astype(np.int64)
-        oky, okx = (cy >= 0) & (cy < Hc), (cx >= 0) & (cx < Wc)
-        return vmask[np.clip(cy, 0, Hc - 1)][:, np.clip(cx, 0, Wc - 1)] & oky[:, None] & okx[None, :]
+        """The mission's validity on the measuring window: its alpha, read nearest."""
+        return rd.ma.read(law.alpha, window=win) > 127
 
     def one(blk):
         r0, c0 = blk
         bh, bw = min(OB, r1b - r0), min(OB, c1b - c0)
         out_win = _Window(c0 - c0b, r0 - r0b, bw, bh)
-        if not vmask[r0 // _GEOM_DS:-(-(r0 + bh) // _GEOM_DS), c0 // _GEOM_DS:-(-(c0 + bw) // _GEOM_DS)].any():
+        if not vbound[r0 // _GEOM_DS:-(-(r0 + bh) // _GEOM_DS), c0 // _GEOM_DS:-(-(c0 + bw) // _GEOM_DS)].any():
             with wlock:
                 dst.write(np.zeros((nspec + 1, bh, bw), np.uint8), window=out_win)
                 counts["empty"] += 1
@@ -393,6 +406,20 @@ def register_survey_dense(
         measured = vm[cs].mean() >= _MIN_SHARE and vr[cs].mean() >= _MIN_SHARE
         if measured:
             Gu, Gv = _E.flow(_E.fill_nearest(gr, vr), _E.fill_nearest(gm, vm), dev=dev)
+            # a shift is measured only where eFOLKI's largest window lies on ground in both maps: the intersection
+            # of the two data masks with a negative buffer of the largest radius (32 px, 1 m on a 3.2 cm map).
+            # Every other pixel takes the nearest measured shift, so a map's edge moves as one piece with the
+            # ground beside it. Beyond the edge the solve matched fill, not ground, and placed the edge about
+            # 4 px wrong (02_registration/matcher_ablation/poc/edge_known_warp.py, 2026-11-01). 0.4.2.
+            trusted = _ndi.distance_transform_edt(vr & vm) > max(_E.SETTINGS["radius"])
+            if trusted.any():
+                if not trusted.all():
+                    near = _ndi.distance_transform_edt(~trusted, return_distances=False, return_indices=True)
+                    Gu = Gu[near[0], near[1]]; Gv = Gv[near[0], near[1]]
+                    del near
+            else:                                                    # the maps share less than one window: no measurement
+                Gu = np.zeros((h, w), np.float32); Gv = np.zeros((h, w), np.float32)
+            del trusted
         else:
             Gu = np.zeros((h, w), np.float32); Gv = np.zeros((h, w), np.float32)
         t_meas = _time.time() - t; t = _time.time()
@@ -432,25 +459,45 @@ def register_survey_dense(
         del MX, MY, Gu, Gv, gr, gm, vr, vm
         gxs = cc.astype(np.float32)[None, :] + fu * np.float32(k)   # the source position, output pixels
         gys = rr.astype(np.float32)[:, None] + fv * np.float32(k)
+        measured_px = fu * fu + fv * fv <= np.float32(_E.REACH_PX) ** 2   # no shift past eFOLKI's reach was measured
         del fu, fv
         nx = gxs * np.float32(sx) + np.float32(ax)                  # ... and in native pixels
         ny = gys * np.float32(sy) + np.float32(ay)
+        # the pixels the output keeps: a shift within eFOLKI's reach, to a position on the mission. The rest are
+        # transparent. Where the mission has no data eFOLKI's shift means nothing (it reached ±30000 px on 2025 spring
+        # mission 00, and a few such pixels landed on the mission and pulled in ground from up to 22 m away), so they
+        # neither size the native read nor get sampled. Sized by them, the read passed cv2.remap's 32767 px limit and
+        # the job died on SIGSEGV (0.4.2).
+        cy = np.floor((gys + 0.5) / _GEOM_DS).astype(np.int64); cx = np.floor((gxs + 0.5) / _GEOM_DS).astype(np.int64)
+        keep = measured_px & (cy >= 0) & (cy < Hc) & (cx >= 0) & (cx < Wc)
+        keep &= vbound[np.clip(cy, 0, Hc - 1), np.clip(cx, 0, Wc - 1)]                # the bound; with alpha, below decides
+        del cy, cx, measured_px
         out = np.zeros((nspec + 1, bh, bw), np.uint8)
         P = 3                                                        # the cubic kernel's reach, padded
-        nc0 = max(0, int(_math.floor(float(nx.min()))) - P); nc1 = min(mW, int(_math.ceil(float(nx.max()))) + P + 1)
-        nr0 = max(0, int(_math.floor(float(ny.min()))) - P); nr1 = min(mH, int(_math.ceil(float(ny.max()))) + P + 1)
+        if keep.any():
+            kx, ky = nx[keep], ny[keep]
+            nc0 = max(0, int(_math.floor(float(kx.min()))) - P); nc1 = min(mW, int(_math.ceil(float(kx.max()))) + P + 1)
+            nr0 = max(0, int(_math.floor(float(ky.min()))) - P); nr1 = min(mH, int(_math.ceil(float(ky.max()))) + P + 1)
+            del kx, ky
+        else:
+            nc0 = nc1 = nr0 = nr1 = 0
         if nc1 > nc0 and nr1 > nr0:
-            nat = rd.n.read(spec_bands, window=_Window(nc0, nr0, nc1 - nc0, nr1 - nr0)).astype(np.float32)
+            nwin = _Window(nc0, nr0, nc1 - nc0, nr1 - nr0)
+            nat = rd.n.read(spec_bands, window=nwin).astype(np.float32)
             nx -= np.float32(nc0); ny -= np.float32(nr0)
+            na = rd.n.read(law.alpha, window=nwin)                   # data where the sampled native pixel has data
+            keep &= cv2.remap(na, nx, ny, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 127
+            del na
+            nx[~keep] = np.float32(-2 * P); ny[~keep] = np.float32(-2 * P)   # off the source: the border value, 0
             for b in range(nspec):
                 rem = cv2.remap(nat[b], nx, ny, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
                 np.clip(rem, 0, 255, out=rem)                        # cubic can overshoot [0,255]
                 out[b] = np.rint(rem)                                # rounded: a bare cast truncates, half a DN dark
             del nat, rem
-        cy = np.floor((gys + 0.5) / _GEOM_DS).astype(np.int64); cx = np.floor((gxs + 0.5) / _GEOM_DS).astype(np.int64)
-        inside = (cy >= 0) & (cy < Hc) & (cx >= 0) & (cx < Wc)
-        out[nspec][inside & vmask[np.clip(cy, 0, Hc - 1), np.clip(cx, 0, Wc - 1)]] = 255
-        del gxs, gys, nx, ny, cy, cx, inside
+        else:
+            keep[:] = False                                          # nothing of the mission to sample
+        out[nspec][keep] = 255
+        del gxs, gys, nx, ny, keep
         with wlock:
             dst.write(out, window=out_win)
             counts["measured" if measured else "unmeasured"] += 1
@@ -513,7 +560,7 @@ def register_survey_dense(
 
     summary = dict(kind="align", method="eFOLKI", settings=dict(_E.SETTINGS, block_px=_CORE, context_px=_PAD),
                    mission=os.path.basename(mission), reference=os.path.basename(anchor),
-                   bands=list(law.names), alpha="tagged" if law.alpha else "derived",
+                   bands=list(law.names), alpha="tagged",
                    measured_res_m=round(mres, 5), res_m=res, cell_m=round(_CELL * mres, 3),
                    r_before=round(r_before, 4), r_after=round(r_after, 4), move_median_cm=round(move_med, 1),
                    moved_over_50cm_ha=round(moved_ha, 3), moved_over_50cm_pct=round(moved_pct, 3),

@@ -161,6 +161,25 @@ the visible ownership exists and the mission names match.
 
 ## Changes
 
+- **0.4.2** (2026-11-01). The registered map's edges. DroneDeploy's no-data mask
+  decides which output pixels have data, pixel by pixel at full resolution. Until
+  now the decision was made on squares of 8 by 8 output pixels, so a square more
+  than half data was all data, and its empty pixels came out as black data along
+  every edge. A shift counts as measured only on the intersection of the two maps'
+  data masks with a negative buffer of eFOLKI's largest window, 32 px. Every other
+  pixel takes the nearest measured shift, so an edge moves as one piece with the
+  ground beside it. Beyond an edge eFOLKI matched fill, not ground, and placed the
+  edge about 4 px wrong, with junk shifts of thousands of pixels in the corners
+  where neither map has data. One of those sized the warp's read of the native
+  pixels past OpenCV's limit, and the register job died on a segmentation fault
+  five times out of five on the 2025 spring mission 00. The read is now sized only
+  by the pixels the output keeps, and a shift past eFOLKI's reach is dropped. The
+  context read around each block is 512 px instead of 1024, which the settings
+  allow and which cuts eFOLKI's work by a third for the same result to within
+  floating-point noise. On a CPU eFOLKI's window sums are cumulative sums instead
+  of convolutions, the same sums in another order, which halves a seam block on
+  the season VM. Evidence for the edge rule is the audit's known-warp test,
+  `02_registration/matcher_ablation/poc/edge_known_warp.py`. Four new tests.
 - **0.4.1** (2026-11-01). One resample per pixel, cubic, everywhere it can be.
   The season stitch reads each source onto its grid cubic instead of `average`.
   A source on the grid's lattice is still copied exactly, and one off it, an
