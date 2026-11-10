@@ -5,6 +5,7 @@ images there (Lucas-Kanade), on rank transforms of the images, so brightness and
 dates matter little, coarse to fine on an image pyramid. The result is a shift at every pixel.
 
     u, v = flow(reference, moving)       # moving(x + u, y + v) lines up with reference(x, y), in pixels
+    fields = flows(reference, [a, b])    # several moving images against one reference: [(u, v), (u, v)]
 
 Sources, read in full:
   - Brigot, Colin-Koeniguer, Plyer and Janez 2016, IEEE J. Sel. Topics Appl. Earth Obs. Remote Sens. 9(7),
@@ -31,6 +32,12 @@ eFOLKI example), 8 iterations per window and rank radius 4 (Haynes et al.), and 
 parameter is published, the value is not; the coarsest copy of a 3.3 cm map then has 26 cm pixels, which
 keeps the ground's grain and stops the shadow slides seen at about 50 cm). Measure on the reference map's
 own pixels; never on a coarser copy.
+
+EFOLKI_VERSION names the numbers this module gives, apart from the package's version (efolki.py did not change
+between tidysurvey 0.4.2 and 0.5.0, so the package's version does not say whether the flow did). Raise it when a
+change can alter a flow: the settings, the pyramid, the rank transform, the window sums, the warp, the solve.
+Leave it for changes that keep the numbers, like flows(), which gives flow()'s numbers faster. Callers that keep
+results write it beside them (the ODM fork's registration records do).
 """
 from __future__ import annotations
 
@@ -40,6 +47,7 @@ import threading
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
+EFOLKI_VERSION = 1                                               # the flow's numbers as of tidysurvey 0.4.0 to 0.5.0; see above
 SETTINGS = dict(iteration=8, radius=(32, 24, 16, 8), rank=4, levels=3)
 REACH_PX = max(SETTINGS["radius"]) * 2 ** SETTINGS["levels"]   # the coarsest window's half-width, in full-resolution pixels
 TALON = 1.0e-8
@@ -201,6 +209,110 @@ def flow(reference: np.ndarray, moving: np.ndarray, dev=None, iteration=None, ra
                 u = 2 * _pyr_down(u, shape); v = 2 * _pyr_down(v, shape)
         out = (u[0, 0].float().cpu().numpy(), v[0, 0].float().cpu().numpy())
         del P0, P1, u, v, I0, I1
+        if dev.type == "mps":
+            torch.mps.empty_cache()
+        elif dev.type == "cuda":
+            torch.cuda.empty_cache()
+    return out
+
+
+def _warp_many(I, u, v, base):
+    """_warp for several images at once: each sampled bilinearly at its own (x + u, y + v), edge replicated outside.
+    (_warp takes one image: it builds the sampling grid from the first image's flow alone.)"""
+    import torch
+    import torch.nn.functional as Fn
+    H, W = I.shape[-2:]
+    x = (base[0] + u).clamp(0, W - 1)
+    y = (base[1] + v).clamp(0, H - 1)
+    gx = x * (2.0 / max(W - 1, 1)) - 1.0
+    gy = y * (2.0 / max(H - 1, 1)) - 1.0
+    grid = torch.stack([gx[:, 0], gy[:, 0]], dim=-1)
+    return Fn.grid_sample(I, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+
+
+def _pyr_down_many(I, shape):
+    """_pyr_down for several images at once: every pixel repeated 2 x 2, cropped (or zero-filled) to shape."""
+    import torch
+    J = I.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
+    out = torch.zeros(tuple(I.shape[:2]) + tuple(shape), device=I.device, dtype=I.dtype)
+    r, c = min(shape[0], J.shape[-2]), min(shape[1], J.shape[-1])
+    out[..., :r, :c] = J[..., :r, :c]
+    return out
+
+
+def flows(reference: np.ndarray, movings: list, dev=None, batch: int | None = None, iteration=None, radius=None, rank=None,
+          levels=None) -> list:
+    """The flows of several moving images against one reference, all on one grid: [(u, v), ...], each the numbers
+    flow(reference, moving) gives (tests/test_efolki.py holds them equal on the CPU, bit for bit).
+
+    flow() takes one pair and works both sides of it. When several images share a reference (a multispectral
+    capture's bands against its green band, in the ODM fork's registration) the work is shared here:
+    1. The reference's side is worked once: its pyramid, rank transforms, gradients and the window means of their
+       products.
+    2. The moving images go through the iterations together, `batch` at a time: by default all of them at once on a
+       GPU, which does that faster than one after another, and one at a time on the CPU.
+    It follows flow() and _efolki_iter line for line, with the same functions in the same order, except _warp and
+    _pyr_down, which take one image and are written for several above. Written for the ODM fork's registration
+    (aerial/odm_fork/ms_register.py, 2026-11-09), where it was one of three changes that together made a capture
+    2.1 times faster on an M1 Max and 1.36 times on an NVIDIA L4 with the same output bit for bit, and moved here
+    2026-11-10 so eFOLKI has one home."""
+    import torch
+    _tf32_off()
+    s = dict(SETTINGS)
+    s.update({k: v for k, v in dict(iteration=iteration, radius=radius, rank=rank, levels=levels).items() if v is not None})
+    dev = dev if dev is not None and not isinstance(dev, str) else device(dev)
+    n_levels, rk = s["levels"], s["rank"]
+    ranked = lambda I: _rank_sup(I, rk) if rk > 0 else I                             # noqa: E731
+    batch = int(batch or (len(movings) if dev.type != "cpu" else 1))
+
+    def pyramid(images):
+        I = torch.cat([torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))[None, None] for a in images]).to(dev)
+        lo, hi = I.amin((-2, -1), keepdim=True), I.amax((-2, -1), keepdim=True)     # each image by its own range
+        P = [(I - lo) / (hi - lo)]
+        for _ in range(n_levels):
+            P.append(_pyr_up(P[-1]))
+        return P
+
+    out = []
+    with _LOCK, torch.inference_mode():
+        P0 = pyramid([reference])
+        side = []                                             # per pyramid level, all that depends on the reference alone
+        for I0 in P0:
+            R0 = ranked(I0)
+            Iy, Ix = _gradient(R0)
+            H, W = R0.shape[-2:]
+            yy, xx = torch.meshgrid(torch.arange(H, device=R0.device, dtype=R0.dtype),
+                                    torch.arange(W, device=R0.device, dtype=R0.dtype), indexing="ij")
+            windows = []
+            for rad in s["radius"]:
+                Ixx = _box(Ix * Ix, rad) + TALON
+                Iyy = _box(Iy * Iy, rad) + TALON
+                Ixy = _box(Ix * Iy, rad)
+                windows.append((rad, Ixx, Iyy, Ixy, Ixx * Iyy - Ixy ** 2))
+            side.append((R0, Iy, Ix, (xx[None, None], yy[None, None]), windows))
+        for k in range(0, len(movings), batch):
+            P1 = pyramid(movings[k:k + batch])
+            u = torch.zeros_like(P1[-1]); v = torch.zeros_like(P1[-1])
+            for i in range(n_levels, -1, -1):
+                R0, Iy, Ix, base, windows = side[i]
+                R1 = ranked(P1[i])
+                for rad, Ixx, Iyy, Ixy, D in windows:
+                    for _ in range(s["iteration"]):
+                        it = R0 - _warp_many(R1, u, v, base) + u * Ix + v * Iy
+                        Ixt = _box(Ix * it, rad)
+                        Iyt = _box(Iy * it, rad)
+                        un = (Iyy * Ixt - Ixy * Iyt) / D
+                        vn = (Ixx * Iyt - Ixy * Ixt) / D
+                        bad = ~torch.isfinite(un) | ~torch.isfinite(vn)
+                        u = torch.where(bad, torch.zeros_like(un), un)
+                        v = torch.where(bad, torch.zeros_like(vn), vn)
+                if i > 0:
+                    shape = P0[i - 1].shape[-2:]
+                    u = 2 * _pyr_down_many(u, shape); v = 2 * _pyr_down_many(v, shape)
+            U, V = u[:, 0].float().cpu().numpy(), v[:, 0].float().cpu().numpy()
+            out.extend((U[j], V[j]) for j in range(len(U)))
+            del P1, R1, u, v
+        del P0, side
         if dev.type == "mps":
             torch.mps.empty_cache()
         elif dev.type == "cuda":

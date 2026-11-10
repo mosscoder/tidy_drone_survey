@@ -1,4 +1,5 @@
-"""0.4.0: eFOLKI (tidysurvey/efolki.py), the flow registration and the seam merge measure with.
+"""0.4.0: eFOLKI (tidysurvey/efolki.py), the flow registration and the seam merge measure with. flows() and
+EFOLKI_VERSION were added on the odm-fork branch (2026-11-10).
 
 The port itself was checked against the authors' code in the audit (02_registration/matcher_ablation/poc/
 check_port.py, cuda_check_synth.py); these tests pin what the engine relies on: a known shift is recovered to
@@ -43,6 +44,44 @@ class Flow(unittest.TestCase):
         ref = texture(512, 512, seed=2)
         u, v = E.flow(ref, np.sqrt(ref) * 9.0 + 5.0)
         self.assertLess(float(np.percentile(np.hypot(u, v)[32:-32, 32:-32], 99)), 0.05)
+
+    def test_version_is_named(self):
+        """Raise EFOLKI_VERSION when a change can alter a flow (see efolki.py); callers write it beside their results."""
+        self.assertEqual(E.EFOLKI_VERSION, 1)
+
+    def test_several_moving_images_give_flows_numbers(self):
+        """flows() shares the reference's side between several moving images; each field is flow()'s, bit for bit on
+        the CPU, whether the images go through one at a time or together."""
+        import torch
+        cpu = torch.device("cpu")
+        ref = texture(224, 256, seed=3)
+        yy, xx = np.mgrid[0:224, 0:256].astype(np.float32)
+        movs = [cv2.remap(ref, xx - dx, yy - dy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT) * gain
+                for dx, dy, gain in ((1.6, -0.8, 1.0), (-2.2, 1.1, 0.7), (0.4, 2.5, 1.3))]
+        stock = [E.flow(ref, m, cpu) for m in movs]
+        self.assertGreater(float(np.abs(stock[0][0]).max()), 0.5)               # real fields, not zeros
+        for batch in (1, 2, 3):
+            ours = E.flows(ref, movs, cpu, batch)
+            self.assertEqual(len(ours), 3)
+            for (u, v), (u0, v0) in zip(ours, stock):
+                self.assertTrue(np.array_equal(u, u0) and np.array_equal(v, v0), f"batch {batch}")
+        self.assertEqual(E.flows(ref, [], cpu), [])
+
+    def test_many_at_once_helpers_are_the_one_image_ones(self):
+        import torch
+        g = torch.Generator().manual_seed(0)
+        I = torch.rand((3, 1, 20, 24), generator=g)
+        u = torch.rand((3, 1, 20, 24), generator=g) * 4 - 2
+        v = torch.rand((3, 1, 20, 24), generator=g) * 4 - 2
+        yy, xx = torch.meshgrid(torch.arange(20, dtype=I.dtype), torch.arange(24, dtype=I.dtype), indexing="ij")
+        base = (xx[None, None], yy[None, None])
+        warped = E._warp_many(I, u, v, base)
+        for shape in ((40, 48), (39, 47), (41, 50)):
+            down = E._pyr_down_many(u, shape)
+            for k in range(3):
+                self.assertTrue(torch.equal(down[k:k + 1], E._pyr_down(u[k:k + 1], shape)))
+        for k in range(3):
+            self.assertTrue(torch.equal(warped[k:k + 1], E._warp(I[k:k + 1], u[k:k + 1], v[k:k + 1], base)))
 
     def test_fill_nearest(self):
         g = np.arange(12, dtype=np.float32).reshape(3, 4)
