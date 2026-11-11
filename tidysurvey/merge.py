@@ -624,6 +624,20 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     # checkpoints, so any plan change invalidates all three together.
     manifest = dict(W=OUT_W, H=OUT_H, res=round(float(res), 6), n=N, names=list(names),
                     owner_in=(str(owner_in) if owner_in else None))
+    # The mosaic keeps its inputs' number type: 8-bit maps give the 8-bit mosaic they always did, 16-bit
+    # maps (the ODM fork's multispectral maps) a 16-bit one. Until this, every mosaic was written 8-bit,
+    # which wrapped 16-bit values. One type for all inputs; the alpha band stays 0/255 either way.
+    kinds = set()
+    for i, p_ in enumerate(paths):
+        with rasterio.open(p_) as s:
+            kinds.add(str(s.dtypes[laws[i].spectral[0] - 1]))
+    if len(kinds) != 1 or not kinds <= {"uint8", "uint16"}:
+        raise ValueError(f"seam_merge: the inputs must all be 8-bit or all be 16-bit unsigned maps; got {sorted(kinds)}")
+    out_dtype = np.dtype(kinds.pop())
+    out_max = int(np.iinfo(out_dtype).max)
+    if out_dtype != np.uint8:
+        manifest["dtype"] = out_dtype.name            # a resume never mixes blocks of two number types
+        log(f"    {out_dtype.name} inputs: the mosaic is written {out_dtype.name}")
     recycled = None                                   # (kept, fell back) when owner_in
 
     # ---- coarse geometry: validity, EDT owner, faultlines (STREAMED to disk) --- #
@@ -794,7 +808,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     slock = _threading.Lock()
 
     # ---- streamed N-way composite ------------------------------------------ #
-    prof = dict(driver="GTiff", height=OUT_H, width=OUT_W, count=nspec + 1, dtype="uint8",
+    prof = dict(driver="GTiff", height=OUT_H, width=OUT_W, count=nspec + 1, dtype=out_dtype.name,
                 crs=out_crs, transform=OUT_TR, tiled=True, blockxsize=512, blockysize=512,
                 compress="zstd", predictor=2, ZSTD_LEVEL=3, BIGTIFF="YES",
                 num_threads=str(workers), SPARSE_OK="TRUE")
@@ -976,7 +990,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         if len(present) == 1:
             i = present[0]
             outh = np.concatenate([rg[i][spec_idx[i]],
-                                   np.where(val[i], 255, 0)[None].astype(np.uint8)], 0)
+                                   np.where(val[i], 255, 0)[None].astype(out_dtype)], 0)
             kind = "copy"
         else:
             valids = [val[i] for i in present]
@@ -986,16 +1000,16 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             if geom["in_band"][iy:iy + bh, ix:ix + bw].any():
                 flds = _seam_fields(r0, c0, bh, bw, hr0, hc0, hh, hw, iy, ix, present, val, geom)
                 sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
-                                                  fields=flds, geom=geom)
+                                                  fields=flds, geom=geom, vmax=out_max)
                 kind = "seam"
             else:
                 sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
-                                                  fields=None, geom=geom)
+                                                  fields=None, geom=geom, vmax=out_max)
                 kind = "own"
             # rint, not truncate: on the band fringe the blend is the owner value
             # ± sub-LSB float dust; truncation would turn that into a 1-DN error
-            outh = np.concatenate([np.clip(np.rint(sf), 0, 255).astype(np.uint8),
-                                   al[None]], 0)
+            outh = np.concatenate([np.clip(np.rint(sf), 0, out_max).astype(out_dtype),
+                                   al[None].astype(out_dtype)], 0)
         with wlock:
             dst.write(outh[:, iy:iy + bh, ix:ix + bw], window=Window(c0, r0, bw, bh))
         return kind

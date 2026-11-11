@@ -101,11 +101,13 @@ def seamline_geometry(valids, res, band_m):
                 in_band=in_band, taper=taper, edt_max=ds.max(0))
 
 
-def seamline_composite(specs, valids, res, band_m, fields=None, geom=None):
+def seamline_composite(specs, valids, res, band_m, fields=None, geom=None, vmax=255):
     """N-way seam composite: outside the band every pixel is the single owner
     VERBATIM; within band_m of a fault the meeting owners are cross-faded and
     (if fields are given) each source's shift is applied, confined by the
-    taper. Triple-junction safe. Returns (out float32, alpha uint8, diag)."""
+    taper. Triple-junction safe. Returns (out float32, alpha uint8, diag).
+    vmax: the top of the inputs' number range (255 for 8-bit maps, 65535 for
+    16-bit); the blend is kept within 0..vmax."""
     n = len(specs); ns = specs[0].shape[0]; H, W = valids[0].shape
     g = geom if geom is not None else seamline_geometry(valids, res, band_m)
     B, ds, any_valid = g["B"], g["ds"], g["any_valid"]
@@ -129,5 +131,5 @@ def seamline_composite(specs, valids, res, band_m, fields=None, geom=None):
     for c in range(ns):
         out[c][nz] = acc[c][nz] / wsum[nz]
 
-    return np.clip(out, 0, 255), np.where(any_valid, 255, 0).astype(np.uint8), \
+    return np.clip(out, 0, vmax), np.where(any_valid, 255, 0).astype(np.uint8), \
         dict(owner=owner, in_band=in_band, taper=taper, band_frac=float(in_band.mean()))
