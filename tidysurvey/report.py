@@ -169,6 +169,33 @@ def _row(cells, tag="td"):
                             f"{c}</{tag}>" for c in cells) + "</tr>"
 
 
+def _align_section(name: str, rep: dict) -> str:
+    """The align stage's tables. A mission registered to the anchor has a row of
+    what the registration did: the match before and after, and how far the map
+    was moved. A mission that arrives with its own check (`check == "offset"`:
+    its multispectral map was drawn from the same camera solve as its visible
+    map, so nothing is moved) has a row of what that check measured instead."""
+    missions = rep.get("missions", [])
+    mark = lambda m: "⚠ look" if m.get("look") else "✓"
+    who = lambda m: m.get("name") or m.get("mission")
+    moved = [m for m in missions if m.get("check") != "offset"]
+    measured = [m for m in missions if m.get("check") == "offset"]
+    out = f"<section><h2>{name}</h2>"
+    if moved or not measured:
+        out += ("<table>" + _row(["", "mission", "r before → after", "median move (cm)", "moved > 50 cm (ha)"], "th")
+                + "".join(_row([mark(m), who(m), f"{m.get('r_before', '')} → {m.get('r_after', '')}",
+                                m.get("move_median_cm", ""), m.get("moved_over_50cm_ha", "")]) for m in moved)
+                + "</table>")
+    if measured:
+        out += ("<p>Not moved. Each of these multispectral maps was drawn from the same camera solve as its visible "
+                "map, so there is no registration step. The offset between the two maps was measured instead.</p>"
+                "<table>" + _row(["", "mission", "offset, median (cm)", "offset, 90th percentile (cm)", "tiles measured"], "th")
+                + "".join(_row([mark(m), who(m), m.get("offset_median_cm", "not measured"), m.get("offset_p90_cm", ""),
+                                f"{m['tiles']:,}" if isinstance(m.get("tiles"), int) else ""]) for m in measured)
+                + "</table>")
+    return out + "</section>"
+
+
 def build(cfg, failed_stage=None, log=print):
     """Assemble quality_report.html + quality_report.json for this run from
     the stage reports and shipped rasters. Safe to call on partial runs."""
@@ -258,14 +285,7 @@ def build(cfg, failed_stage=None, log=print):
     detail = []
     for name, rep in stages.items():
         if rep.get("kind") == "align":
-            rows = "".join(_row(["⚠ look" if m.get("look") else "✓", m.get("name") or m.get("mission"),
-                                 f"{m.get('r_before', '')} → {m.get('r_after', '')}",
-                                 m.get("move_median_cm", ""), m.get("moved_over_50cm_ha", "")])
-                           for m in rep.get("missions", []))
-            detail.append(
-                f"<section><h2>{name}</h2><table>"
-                + _row(["", "mission", "r before → after", "median move (cm)", "moved > 50 cm (ha)"], "th")
-                + rows + "</table></section>")
+            detail.append(_align_section(name, rep))
         if rep.get("kind") == "calibrate":
             oof = rep.get("pooled_oof", {})
             mae = rep.get("qa_summary", {})
