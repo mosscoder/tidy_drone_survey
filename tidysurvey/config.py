@@ -70,7 +70,7 @@ class MultispectralCfg:
 
 @dataclass
 class StitchCfg:
-    band_width_m: float = 1.0        # blend width; the one aesthetic knob
+    band_width_m: float = 1.0        # the width two flights are mixed over at a seam, in all: half either side of the seam line
     gauge: str = "free"              # "free" = split evenly; "anchored" = pin to the first input
     seam_tripwire_cm: float = 20.0   # hard gate on post-stitch seams
     seams_work: str = ""             # a work folder (local dir or gs://) to measure the seams elsewhere; "" = inline
