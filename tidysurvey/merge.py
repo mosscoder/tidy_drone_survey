@@ -469,7 +469,9 @@ STITCH_RESAMPLING = Resampling.cubic
 
 _GEOM_DS = 8                         # coarse geometry decimation
 _HALO = 64                           # block halo so band shifts never sample off-block
-_EF_PAD = 512                        # eFOLKI's context around a faultline: twice its reach (efolki.REACH_PX)
+_EF_PAD = 512                        # eFOLKI's context around a faultline: twice its reach (efolki.REACH_PX); a band wider
+                                     #   than this is measured across its whole width (seam_merge's ef_pad)
+_MIX_WARN = 0.3                      # a seam whose two flights mix less than this on the line is reported: it has no fade
 _STAT_EVERY = 4                      # seam statistics sample every 4th faultline pixel and band pixel
 
 
@@ -537,7 +539,12 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                nspec=None, render_chunk=None, band_names=None, owner_in=None,
                geometry_only=False, seams=None, seams_local_workers=1, seams_local_delay_s=0.0,
                log=print):
-    """Merge N overlapping orthomosaics with the 1 m seam-walk blend.
+    """Merge N overlapping orthomosaics with the seam-walk blend.
+
+    band_width_m : the width over which two flights are mixed at a seam, in all: half of it either side of
+               the seam line, half and half on the line (1 m until 2026-11-16; the fade follows the line,
+               fields.seamline_composite). The flights are moved into line over twice that: in full on the
+               line, fading to nothing at band_width_m from it.
 
     inputs   : list of (name, path) pairs — every input is named; names carry
                into the seam table and the stage report.
@@ -586,7 +593,10 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     and inside it only cross-faded between the meeting owners. Writes a stage
     report (per seam: its length, the median offset between the two flights on
     the faultline, the metres over 50 cm, the median misfit of the split) for
-    the seam tripwire and the quality report.
+    the seam tripwire and the quality report. Each seam also gets `mix_on_line`: the
+    smaller of its two flights' shares on the seam line, from the weights the
+    composite used (0.5 = half and half; near 0 = one flight alone, so no fade:
+    logged as a warning below 0.3).
     """
     t0 = _time.perf_counter()
     names = [n for n, _ in inputs]
@@ -623,7 +633,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     # the grid manifest — shared by the coarse-reuse sentinel and the walk/render
     # checkpoints, so any plan change invalidates all three together.
     manifest = dict(W=OUT_W, H=OUT_H, res=round(float(res), 6), n=N, names=list(names),
-                    owner_in=(str(owner_in) if owner_in else None))
+                    owner_in=(str(owner_in) if owner_in else None), band=round(float(band_width_m), 4))
+    ef_pad = max(_EF_PAD, int(np.ceil(band_width_m / res)) + _HALO)   # the flights are measured across the whole band
     # The mosaic keeps its inputs' number type: 8-bit maps give the 8-bit mosaic they always did, 16-bit
     # maps (the ODM fork's multispectral maps) a 16-bit one. Until this, every mosaic was written 8-bit,
     # which wrapped 16-bit values. One type for all inputs; the alpha band stays 0/255 either way.
@@ -843,8 +854,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         with the box it is measured in (around that faultline, padded by _EF_PAD, clipped to
         the block's search region) and the part of the box that lies on the haloed block.
         The export and the render walk the same boxes in the same way."""
-        pr0, pc0 = max(0, r0 - _EF_PAD), max(0, c0 - _EF_PAD)
-        pr1, pc1 = min(OUT_H, r0 + bh + _EF_PAD), min(OUT_W, c0 + bw + _EF_PAD)
+        pr0, pc0 = max(0, r0 - ef_pad), max(0, c0 - ef_pad)
+        pr1, pc1 = min(OUT_H, r0 + bh + ef_pad), min(OUT_W, c0 + bw + ef_pad)
         cr0, cc0 = pr0 // _GEOM_DS, pc0 // _GEOM_DS
         own_c = np.asarray(owner_mm[cr0:-(-pr1 // _GEOM_DS), cc0:-(-pc1 // _GEOM_DS)])
         c2_c = np.asarray(cov2_mm[cr0:-(-pr1 // _GEOM_DS), cc0:-(-pc1 // _GEOM_DS)])
@@ -859,8 +870,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             if not f.any():
                 continue
             ys, xs = np.where(f)
-            br0 = max(pr0, (cr0 + int(ys.min())) * _GEOM_DS - _EF_PAD); br1 = min(pr1, (cr0 + int(ys.max()) + 1) * _GEOM_DS + _EF_PAD)
-            bc0 = max(pc0, (cc0 + int(xs.min())) * _GEOM_DS - _EF_PAD); bc1 = min(pc1, (cc0 + int(xs.max()) + 1) * _GEOM_DS + _EF_PAD)
+            br0 = max(pr0, (cr0 + int(ys.min())) * _GEOM_DS - ef_pad); br1 = min(pr1, (cr0 + int(ys.max()) + 1) * _GEOM_DS + ef_pad)
+            bc0 = max(pc0, (cc0 + int(xs.min())) * _GEOM_DS - ef_pad); bc1 = min(pc1, (cc0 + int(xs.max()) + 1) * _GEOM_DS + ef_pad)
             ir0, ir1 = max(br0, hr0), min(br1, hr0 + hh); ic0, ic1 = max(bc0, hc0), min(bc1, hc0 + hw)
             if ir1 <= ir0 or ic1 <= ic0:
                 continue
@@ -971,6 +982,24 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                 st["off"].append(off.astype(np.float32)); st["resid"].append(resid.astype(np.float32))
         return list(zip(fx, fy))
 
+    def _mix_stats(present, geom, weights, iy, ix, bh, bw):
+        """How each seam's two flights are mixed ON its line, from the weights the composite used: the smaller of the
+        two shares at the pixels within one pixel of the boundary between the ground the two own, in the block's core."""
+        ps = geom.get("ps")
+        if ps is None:
+            return
+        pos = {i: k for k, i in enumerate(present)}
+        core = np.zeros(geom["in_band"].shape, bool); core[iy:iy + bh, ix:ix + bw] = True
+        near = geom["in_band"] & core
+        for (ia, ib) in [pr for pr in _combinations(present, 2) if pr in stats]:
+            pa, pb = pos[ia], pos[ib]
+            line = near & (np.abs(ps[pa]) <= 1.0) & (np.abs(ps[pb]) <= 1.0)
+            if not line.any():
+                continue
+            mix = np.minimum(weights[pa][line], weights[pb][line])[::_STAT_EVERY]
+            with slock:
+                stats[(ia, ib)].setdefault("mix", []).append(mix.astype(np.float32))
+
     def process_block(r0, c0):
         bh = min(block, OUT_H - r0); bw = min(block, OUT_W - c0)
         hr0, hc0 = max(0, r0 - _HALO), max(0, c0 - _HALO)
@@ -996,11 +1025,13 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             valids = [val[i] for i in present]
             specs = [rg[i][spec_idx[i]].astype(np.float32) for i in present]
             geom = _seam_geom_block(hr0, hc0, hh, hw, present, valids, ds_c, D_c,
-                                    res, band_width_m, owner_c=owner_mm if owner_in else None)
+                                    res, band_width_m, owner_c=owner_mm if owner_in else None, part_c=owner_mm)
             if geom["in_band"][iy:iy + bh, ix:ix + bw].any():
                 flds = _seam_fields(r0, c0, bh, bw, hr0, hc0, hh, hw, iy, ix, present, val, geom)
-                sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
-                                                  fields=flds, geom=geom, vmax=out_max)
+                sf, al, dg = _F.seamline_composite(specs, valids, res, band_width_m,
+                                                   fields=flds, geom=geom, vmax=out_max)
+                _mix_stats(present, geom, dg["weights"], iy, ix, bh, bw)
+                del dg
                 kind = "seam"
             else:
                 sf, al, _ = _F.seamline_composite(specs, valids, res, band_width_m,
@@ -1146,13 +1177,19 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         off = np.concatenate(st["off"]) if st["off"] else np.zeros(0)
         rs = np.concatenate(st["resid"]) if st["resid"] else np.zeros(0)
         seam_m = round(st.get("px", 0) * res, 1)
+        mix = np.concatenate(st["mix"]) if st.get("mix") else np.zeros(0)
         rec = dict(pair=f"{names[i]}-{names[j]}", ij=[i, j], seam_m=seam_m,
                    med_offset_cm=round(float(np.median(off)), 1) if len(off) else None,
                    over50_m=round(float((off > 50).mean()) * seam_m, 1) if len(off) else None,
-                   residual_cm=round(float(np.median(rs)), 1) if len(rs) else None)
+                   residual_cm=round(float(np.median(rs)), 1) if len(rs) else None,
+                   mix_on_line=round(float(np.median(mix)), 2) if len(mix) else None)
         seams.append(rec)
         log(f"    seam {rec['pair']}: {seam_m:.0f} m, offset median {rec['med_offset_cm']} cm, "
-            f"{rec['over50_m']} m over 50 cm, split misfit {rec['residual_cm']} cm")
+            f"{rec['over50_m']} m over 50 cm, split misfit {rec['residual_cm']} cm, "
+            f"mix on the line {rec['mix_on_line']}")
+        if rec["mix_on_line"] is not None and rec["mix_on_line"] < _MIX_WARN:
+            log(f"    WARNING seam {rec['pair']}: its two flights are not mixed on the seam line "
+                f"(the smaller share is {rec['mix_on_line']}; 0.5 is half and half), so it has no fade")
 
     report = dict(kind="stitch", method="eFOLKI", inputs=names, n_seams=len(seams), seams=seams,
                   rendered_this_run=len(todo), resumed_blocks=base,
@@ -1169,12 +1206,30 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     return report
 
 
+def _partition_depth_block(part_c, present, r0, c0, bh, bw, res, band_m):
+    """For each present source, how far every pixel of the block is inside (+) or outside (-) the ground that source
+    owns, in pixels, from the GLOBAL coarse ownership `part_c` read a band's width beyond the block, so the answer
+    does not depend on where the blocks are cut. Exact to a band's width; beyond it the value only needs to be large."""
+    fac = _GEOM_DS
+    pad = int(np.ceil(band_m / (res * fac))) + 2
+    Hc, Wc = part_c.shape
+    cr0, cc0 = max(0, r0 // fac - pad), max(0, c0 // fac - pad)
+    cr1, cc1 = min(Hc, -(-(r0 + bh) // fac) + pad), min(Wc, -(-(c0 + bw) // fac) + pad)
+    depth = _F.partition_depth(np.asarray(part_c[cr0:cr1, cc0:cc1]), present)      # in coarse cells
+    np.clip(depth, -2.0 * pad, 2.0 * pad, out=depth)
+    return np.stack([_F.upsample_block(depth[k], fac, r0 - cr0 * fac, c0 - cc0 * fac, bh, bw)
+                     for k in range(len(present))]) * fac
+
+
 def _seam_geom_block(r0, c0, bh, bw, present, valids, ds_c, D_c, res, band_m,
-                     owner_c=None):
+                     owner_c=None, part_c=None):
     """Native-res seam geometry for one block, upsampled from the GLOBAL coarse
     EDTs (so ownership is globally correct even at block edges). With a coarse
     `owner_c` (a recycled ownership) the owner is read from it — nearest, then
-    the distance rule only where the given owner is absent or not valid."""
+    the distance rule only where the given owner is absent or not valid. With
+    `part_c` (the coarse ownership the faultlines were drawn from) the geometry
+    carries `ps`, each source's depth inside the ground it owns, which the fade's
+    weights follow (fields.seamline_composite)."""
     ds = np.stack([_F.upsample_block(ds_c[i], _GEOM_DS, r0, c0, bh, bw) / res
                    for i in present])
     D = _F.upsample_block(D_c, _GEOM_DS, r0, c0, bh, bw) / res
@@ -1195,5 +1250,8 @@ def _seam_geom_block(r0, c0, bh, bw, present, valids, ds_c, D_c, res, band_m,
         owner = np.where(single & valids[p], np.int16(p), owner)
     in_band = (D <= B) & cov2
     taper = (np.clip(1.0 - D / B, 0.0, 1.0) * in_band).astype(np.float32)
-    return dict(B=B, ds=ds, any_valid=any_valid, owner=owner, D=D,
-                in_band=in_band, taper=taper, edt_max=ds.max(0))
+    g = dict(B=B, ds=ds, any_valid=any_valid, owner=owner, D=D,
+             in_band=in_band, taper=taper, edt_max=ds.max(0))
+    if part_c is not None and in_band.any():
+        g["ps"] = _partition_depth_block(part_c, present, r0, c0, bh, bw, res, band_m)
+    return g

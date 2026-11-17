@@ -2,9 +2,17 @@
 
 The seam merge (merge.seam_merge) measures each pair of flights with eFOLKI
 (efolki.py) where they meet, splits the offsets over the flights at every pixel
-of the 1 m band, and composites here: outside the band every pixel is its single
+of the band, and composites here: outside the band every pixel is its single
 owner's, verbatim; inside it the meeting owners are moved by their share of the
 offset, confined by a taper, and cross-faded.
+
+The fade follows the seam line (2026-11-16). A flight's weight comes from how far a
+pixel is inside or outside the ground that flight OWNS (partition_depth), so two
+flights are half and half on the line and the fade is `band_m` wide in all, half of
+it on either side, wherever the line came from. Until then the weights came from
+each flight's own data edges, which put the fade on the line only when the line was
+those same footprints' middle: a stitch that reused another product's line
+(owner_in) got a hard edge at the band's rim instead.
 
 The LoFTR machinery that used to live here (matching tiles, pooled and
 corroborated cells, smooth fields, the free-gauge node solve) is at tag v0.3.4.
@@ -74,6 +82,24 @@ def apply_field_confined(spec, valid, fx, fy, taper):
     return reg, vreg
 
 
+def partition_depth(owner, sources):
+    """For each source index in `sources`, how far every cell is inside (+) or outside (-) the ground that source
+    owns, in cells, measured to the boundary between cells (so the two cells either side of a boundary are +0.5 and
+    -0.5). `owner` is the owner index per cell. A source that owns nothing here is far outside everywhere; one that
+    owns everything is far inside."""
+    far = np.float32(owner.shape[0] + owner.shape[1])
+    out = np.empty((len(sources),) + owner.shape, np.float32)
+    for k, i in enumerate(sources):
+        m = owner == i
+        if m.all():
+            out[k] = far
+        elif not m.any():
+            out[k] = -far
+        else:
+            out[k] = np.where(m, distance_transform_edt(m) - 0.5, 0.5 - distance_transform_edt(~m))
+    return out
+
+
 def seamline_geometry(valids, res, band_m):
     """Field-independent seam geometry from the validity masks alone:
     owner = most-interior source (argmax EDT); faultline = owner change with
@@ -98,7 +124,8 @@ def seamline_geometry(valids, res, band_m):
     in_band = (D <= B) & cov2
     taper = (np.clip(1.0 - D / B, 0.0, 1.0) * in_band).astype(np.float32)
     return dict(B=B, ds=ds, any_valid=any_valid, owner=owner, D=D,
-                in_band=in_band, taper=taper, edt_max=ds.max(0))
+                in_band=in_band, taper=taper, edt_max=ds.max(0),
+                ps=partition_depth(owner, range(len(valids))))
 
 
 def seamline_composite(specs, valids, res, band_m, fields=None, geom=None, vmax=255):
@@ -107,7 +134,19 @@ def seamline_composite(specs, valids, res, band_m, fields=None, geom=None, vmax=
     (if fields are given) each source's shift is applied, confined by the
     taper. Triple-junction safe. Returns (out float32, alpha uint8, diag).
     vmax: the top of the inputs' number range (255 for 8-bit maps, 65535 for
-    16-bit); the blend is kept within 0..vmax."""
+    16-bit); the blend is kept within 0..vmax.
+
+    The weights. With `ps` in the geometry (each source's depth inside the ground
+    it owns, in pixels: partition_depth), u = 1 - (deepest source's depth - its
+    own) / B is 1 for the owner and, for the source on the other side of a seam
+    line, falls from 1 on the line to 0 at B/2 from it. The weight is u / (2 - u),
+    which makes the two sources' SHARES change in a straight line: half and half
+    on the line, the other source's share 0.5 - distance / B, the fade B wide in
+    all (0.8 B between a 10% and a 90% share). The weight also fades to 0 over B/2
+    towards the source's own data edge, so a hole in one source inside the fade
+    is filled by the other without a hard rim. Without `ps`
+    (a geometry made before 2026-11-16) the weights come from the data edges alone,
+    as they did. diag["weights"] has every source's share of each band pixel."""
     n = len(specs); ns = specs[0].shape[0]; H, W = valids[0].shape
     g = geom if geom is not None else seamline_geometry(valids, res, band_m)
     B, ds, any_valid = g["B"], g["ds"], g["any_valid"]
@@ -123,13 +162,36 @@ def seamline_composite(specs, valids, res, band_m, fields=None, geom=None, vmax=
         out[:, sel] = specs[i][:, sel]                       # verbatim: no shift, no blend
     acc = np.zeros((ns, H, W), np.float32)
     wsum = np.zeros((H, W), np.float32)
+    ps = g.get("ps")
+    ps_max = ps.max(0) if ps is not None else None
+    edge = max(B / 2.0, 1.0)                                 # a source reaches full weight this far inside its own data
+    weights = []
     for i in range(n):
         si, vi = shifted[i]
-        w = (np.clip(1.0 - (edt_max - ds[i]) / B, 0.0, 1.0) * vi * in_band).astype(np.float32)
+        if ps is not None:
+            u = np.clip(1.0 - (ps_max - ps[i]) / B, 0.0, 1.0)
+            w = u / (2.0 - u) * np.clip(ds[i] / edge, 0.0, 1.0)   # u / (2 - u): shares that change in a straight line
+        else:
+            w = np.clip(1.0 - (edt_max - ds[i]) / B, 0.0, 1.0)
+        w = (w * vi * in_band).astype(np.float32)
         acc += w[None] * si; wsum += w
+        weights.append(w)
     nz = in_band & (wsum > 0)
     for c in range(ns):
         out[c][nz] = acc[c][nz] / wsum[nz]
+    for w in weights:
+        w[nz] /= wsum[nz]
+    # a band pixel no weight reached (its owner has no data at this very pixel, and it is past the fade of the
+    # others): the first source that has data there, moved as the band moves it, so the map has no gap
+    left = in_band & ~nz & any_valid
+    if left.any():
+        for i in range(n):
+            si, vi = shifted[i]
+            take = left & vi
+            if take.any():
+                out[:, take] = si[:, take]
+                weights[i][take] = 1.0
+                left &= ~take
 
     return np.clip(out, 0, vmax), np.where(any_valid, 255, 0).astype(np.uint8), \
-        dict(owner=owner, in_band=in_band, taper=taper, band_frac=float(in_band.mean()))
+        dict(owner=owner, in_band=in_band, taper=taper, band_frac=float(in_band.mean()), weights=weights)
