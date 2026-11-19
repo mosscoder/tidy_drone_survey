@@ -163,6 +163,14 @@ def _stitch(cfg, product):
         else:
             say(f"    visible ownership not recycled: mission names differ "
                 f"(visible {sorted(vn - mn)}, multispectral {sorted(mn - vn)})")
+    photos = None
+    if cfg.stitch.owner_photos:
+        # each spot to the input whose photos it sits deepest inside (merge.photo_owner); the
+        # multispectral stitch still reuses the visible seams when it recycles their ownership
+        photos = merge.read_photo_positions(cfg.stitch.owner_photos, cfg.crs)
+        missing = sorted({n for n, _ in inputs} - set(photos))
+        say(f"    ownership by photo positions: {sum(len(v) for v in photos.values())} photos for "
+            f"{len(photos)} inputs" + (f"; none for {missing} (the distance rule decides there)" if missing else ""))
     rep = merge.seam_merge(inputs, str(out), band_width_m=cfg.stitch.band_width_m,
                            gauge=cfg.stitch.gauge,
                            band_names=None if product == "visible" else list(cfg.ms.bands),
@@ -173,6 +181,8 @@ def _stitch(cfg, product):
                                   if cfg.stitch.seams_work else None),
                            seams_local_workers=cfg.stitch.seams_local_workers,
                            seams_local_delay_s=cfg.stitch.seams_local_delay_s,
+                           photos=photos, owner_buffer_m=cfg.stitch.owner_buffer_m,
+                           owner_smooth_m=cfg.stitch.owner_smooth_m,
                            report_json=str(rep_path), log=say)
     validate.seam_tripwire(rep, max_cm=cfg.stitch.seam_tripwire_cm).assert_ok()
     validate.assert_interiors_unchanged(inputs, str(out), str(ownership),

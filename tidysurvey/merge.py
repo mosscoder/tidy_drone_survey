@@ -534,11 +534,101 @@ def _recycle_owner(owner_in, names, valid_c, owner_c, out_crs, tr_c, Wc, Hc):
     return np.where(keep, rec, owner_c).astype(np.int16), (kept, fell_back)
 
 
+def read_photo_positions(path, out_crs):
+    """A photo-positions CSV (columns name, lon, lat in WGS84: one row per photo, `name` the input it belongs to) as
+    {name: (n, 2) array of x, y in out_crs}. The positions are where the photos were taken (the RTK antenna at each
+    shot), which is what `photo_owner` reads."""
+    import csv
+    from pyproj import Transformer
+    t = Transformer.from_crs("EPSG:4326", out_crs, always_xy=True)
+    rows = {}
+    with open(path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            rows.setdefault(r["name"], []).append((float(r["lon"]), float(r["lat"])))
+    out = {}
+    for name, ll in rows.items():
+        x, y = t.transform([p[0] for p in ll], [p[1] for p in ll])     # lists: one photo is still a list, not a point
+        out[name] = np.c_[np.asarray(x, np.float64), np.asarray(y, np.float64)]
+    return out
+
+
+def photo_owner(names, photos, valid_c, owner_c, tr_c, Wc, Hc, buffer_m=60.0, smooth_m=20.0, step_m=2.0, log=print):
+    """The coarse owner by photo positions (Kyle, 2026-11-19; mpg-aerial-pipeline issue 39): each cell goes to the
+    input whose photos, each buffered by `buffer_m`, it sits deepest inside, and outside every buffer to the input
+    with the nearest photo. Each input's depth is smoothed over `smooth_m` (Gaussian sigma) before the choice, so
+    close contests where three or four inputs meet leave no slivers. Only inputs with data at a cell compete.
+
+    Why: an input's map reaches past where its photos were taken, and out there tall trees smear, being seen only
+    at a slant from one side. The distance rule (deepest inside each map's own data) cannot tell that margin from
+    the input's well-photographed middle, so a margin that runs deep beats a neighbour's clean view. Photo positions
+    say where each input saw the ground from overhead: a photo at 120 m above ground covers about 170 by 125 m, so
+    ground within ~60 m of a photo position is inside that photo, at most ~27 degrees off vertical.
+
+    Worked on a grid of about `step_m` (a whole number of coarse cells), then read back onto the coarse grid. Where
+    the chosen input has no data at a coarse cell, the distance rule's owner stays (the same fallback as a recycled
+    ownership). Inputs with no photos given do not compete; where none of the covering inputs has photos the
+    distance rule decides. Returns the owner grid and (kept, fell_back) counts of covered cells."""
+    from scipy.ndimage import gaussian_filter
+    cres = abs(tr_c.a)
+    f = max(1, int(round(step_m / cres)))
+    rp = cres * f
+    Hp, Wp = -(-Hc // f), -(-Wc // f)
+    ox, oy = tr_c.c, tr_c.f
+    best = np.full((Hp, Wp), -np.inf, np.float32)
+    own = np.full((Hp, Wp), -1, np.int16)
+    used = {}
+    for i, nm in enumerate(names):
+        xy = photos.get(nm)
+        if xy is None or len(xy) == 0:
+            continue
+        cov = np.zeros((Hp, Wp), bool)                  # the input has data on half a cell or more
+        for r0 in range(0, Hp, 256):
+            r1 = min(Hp, r0 + 256)
+            blk = np.asarray(valid_c[i, r0 * f:min(Hc, r1 * f), :])
+            blk = np.pad(blk, ((0, (r1 - r0) * f - blk.shape[0]), (0, Wp * f - Wc)))
+            cov[r0:r1] = blk.reshape(r1 - r0, f, Wp, f).sum((1, 3), dtype=np.uint16) * 2 >= f * f
+        if not cov.any():
+            continue
+        col = np.floor((xy[:, 0] - ox) / rp).astype(np.int64); row = np.floor((oy - xy[:, 1]) / rp).astype(np.int64)
+        ok = (col >= 0) & (col < Wp) & (row >= 0) & (row < Hp)
+        used[nm] = int(ok.sum())
+        if not ok.any():
+            continue
+        free = np.ones((Hp, Wp), bool); free[row[ok], col[ok]] = False
+        near = (_edt(free) * rp).astype(np.float32); del free
+        inside = near <= buffer_m
+        score = np.where(inside, (_edt(inside) * rp).astype(np.float32), np.float32(buffer_m) - near)
+        del near, inside
+        if smooth_m > 0:
+            score = gaussian_filter(score, smooth_m / rp)
+        score[~cov] = -np.inf
+        take = score > best
+        best[take] = score[take]; own[take] = i
+        del score, cov, take
+    out = owner_c                                       # changed in place, a slab at a time (the grid is large)
+    kept = fell_back = 0
+    ci = np.arange(Wc) // f
+    for r0 in range(0, Hc, 1024):
+        r1 = min(Hc, r0 + 1024)
+        o = own[np.arange(r0, r1) // f][:, ci]
+        v = np.asarray(valid_c[:, r0:r1, :])
+        chosen = np.take_along_axis(v, np.clip(o, 0, None)[None].astype(np.intp), 0)[0] & (o >= 0)
+        covered = out[r0:r1] >= 0
+        keep = chosen & covered
+        out[r0:r1] = np.where(keep, o, out[r0:r1])
+        kept += int(keep.sum()); fell_back += int((covered & ~keep).sum())
+        del o, v, chosen
+    log(f"    ownership by photo positions ({buffer_m:g} m around each photo, depth smoothed {smooth_m:g} m, "
+        f"worked at {rp:.2f} m): {sum(used.values())} photos of {len(used)} inputs; "
+        f"{kept} cells kept, {fell_back} fell back to the distance rule")
+    return out.astype(np.int16), (kept, fell_back)
+
+
 def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=None,
                workers=None, block=2048, ownership_out=None, report_json=None,
                nspec=None, render_chunk=None, band_names=None, owner_in=None,
                geometry_only=False, seams=None, seams_local_workers=1, seams_local_delay_s=0.0,
-               log=print):
+               photos=None, owner_buffer_m=60.0, owner_smooth_m=20.0, log=print):
     """Merge N overlapping orthomosaics with the seam-walk blend.
 
     band_width_m : the width over which two flights are mixed at a seam, in all: half of it either side of
@@ -565,6 +655,11 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                products share one set of seams. Where the recycled owner
                does not cover a cell, or is not valid there, the distance
                rule decides (the validity fallback); the report counts both.
+    photos   : {input name: (n, 2) array of photo positions in out_crs} (read_photo_positions). Given, the
+               ownership is by photo positions (photo_owner, with owner_buffer_m and owner_smooth_m) instead of the
+               distance rule; where the chosen input has no data the distance rule decides. owner_in, when given
+               too, wins: the multispectral stitch reuses the visible stitch's seams. None = the distance rule,
+               as before.
     geometry_only : stop after the coarse pass and the ownership raster —
                the seams from the alphas alone, no matching, no render.
     seams    : a work folder (a local directory or a gs:// prefix, seamstore.py) to measure
@@ -634,6 +729,15 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
     # checkpoints, so any plan change invalidates all three together.
     manifest = dict(W=OUT_W, H=OUT_H, res=round(float(res), 6), n=N, names=list(names),
                     owner_in=(str(owner_in) if owner_in else None), band=round(float(band_width_m), 4))
+    by_photos = photos is not None and not owner_in            # owner_in, when given, wins (one set of seams)
+    if by_photos:                                              # a change of positions or numbers invalidates a resume
+        import hashlib
+        h = hashlib.sha256()
+        for nm in sorted(photos):
+            h.update(nm.encode()); h.update(np.ascontiguousarray(np.round(photos[nm], 2)).tobytes())
+        manifest["photo_owner"] = dict(buffer_m=float(owner_buffer_m), smooth_m=float(owner_smooth_m),
+                                       positions=h.hexdigest()[:16])
+    photo_counts = None
     ef_pad = max(_EF_PAD, int(np.ceil(band_width_m / res)) + _HALO)   # the flights are measured across the whole band
     # The mosaic keeps its inputs' number type: 8-bit maps give the 8-bit mosaic they always did, 16-bit
     # maps (the ODM fork's multispectral maps) a 16-bit one. Until this, every mosaic was written 8-bit,
@@ -733,6 +837,9 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         owner_c[ncov < 1] = np.int16(-1)                   # -1 where no source covers
         del ncov
         gc.collect()
+        if by_photos:
+            owner_c, photo_counts = photo_owner(names, photos, valid_c, owner_c, tr_c, Wc, Hc,
+                                                buffer_m=owner_buffer_m, smooth_m=owner_smooth_m, log=log)
         if owner_in:
             owner_c, recycled = _recycle_owner(owner_in, names, valid_c, owner_c,
                                                out_crs, tr_c, Wc, Hc)
@@ -787,6 +894,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         report = dict(kind="ownership", inputs=names, res_m=res, crs=out_crs,
                       grid=[OUT_W, OUT_H], faultline_cells=n_fault,
                       recycled=recycled, ownership=str(ownership_out) if ownership_out else None,
+                      photo_owner=(dict(manifest["photo_owner"], kept=photo_counts[0] if photo_counts else None,
+                                        fell_back=photo_counts[1] if photo_counts else None) if by_photos else None),
                       seconds=round(_time.perf_counter() - t0, 1))
         if report_json:
             _Path(report_json).parent.mkdir(parents=True, exist_ok=True)
@@ -1025,7 +1134,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
             valids = [val[i] for i in present]
             specs = [rg[i][spec_idx[i]].astype(np.float32) for i in present]
             geom = _seam_geom_block(hr0, hc0, hh, hw, present, valids, ds_c, D_c,
-                                    res, band_width_m, owner_c=owner_mm if owner_in else None, part_c=owner_mm)
+                                    res, band_width_m, owner_c=owner_mm if (owner_in or by_photos) else None, part_c=owner_mm)
             if geom["in_band"][iy:iy + bh, ix:ix + bw].any():
                 flds = _seam_fields(r0, c0, bh, bw, hr0, hc0, hh, hw, iy, ix, present, val, geom)
                 sf, al, dg = _F.seamline_composite(specs, valids, res, band_width_m,
@@ -1063,7 +1172,7 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
         if len(present) < 2:
             return []
         geom = _seam_geom_block(hr0, hc0, hh, hw, present, [val[i] for i in present], ds_c, D_c,
-                                res, band_width_m, owner_c=owner_mm if owner_in else None)
+                                res, band_width_m, owner_c=owner_mm if (owner_in or by_photos) else None)
         if not geom["in_band"][iy:iy + bh, ix:ix + bw].any():
             return []
         keys = []
@@ -1198,6 +1307,8 @@ def seam_merge(inputs, out, band_width_m=1.0, gauge="free", res=None, out_crs=No
                   seconds=round(_time.perf_counter() - t0, 1), out=str(out),
                   ownership=str(ownership_out) if ownership_out else None,
                   recycled=recycled, owner_in=(str(owner_in) if owner_in else None),
+                  photo_owner=(dict(manifest["photo_owner"], kept=photo_counts[0] if photo_counts else None,
+                                    fell_back=photo_counts[1] if photo_counts else None) if by_photos else None),
                   seams_measured_on=dict(measured_on), seams_work=(store.root if store is not None else None))
     if report_json:
         _Path(report_json).parent.mkdir(parents=True, exist_ok=True)

@@ -76,6 +76,9 @@ class StitchCfg:
     seams_work: str = ""             # a work folder (local dir or gs://) to measure the seams elsewhere; "" = inline
     seams_local_workers: int = 1     # this machine's own workers on the folder (the floor when no other shows up)
     seams_local_delay_s: float = 0.0 # wait this long before starting them, so faster workers elsewhere go first
+    owner_photos: str = ""           # a CSV of photo positions (name, lon, lat): each spot goes to the input whose photos it sits deepest inside (merge.photo_owner); "" = the distance rule
+    owner_buffer_m: float = 60.0     # with owner_photos: the buffer around each photo position
+    owner_smooth_m: float = 20.0     # with owner_photos: the smoothing of each input's depth before the choice
 
 
 @dataclass
@@ -436,7 +439,10 @@ def load(path: str, resolve_auto: bool = True) -> Config:
                            seam_tripwire_cm=s.get("seam_tripwire_cm", 20.0),
                            seams_work=str(s.get("seams_work", "") or ""),
                            seams_local_workers=int(s.get("seams_local_workers", 1)),
-                           seams_local_delay_s=float(s.get("seams_local_delay_s", 0.0)))
+                           seams_local_delay_s=float(s.get("seams_local_delay_s", 0.0)),
+                           owner_photos=str(s.get("owner_photos", "") or ""),
+                           owner_buffer_m=float(s.get("owner_buffer_m", 60.0)),
+                           owner_smooth_m=float(s.get("owner_smooth_m", 20.0)))
     c = raw.get("calibrate", {})
     cfg.calibrate = CalibrateCfg(
         reference=c.get("reference", "sentinel-2"),
